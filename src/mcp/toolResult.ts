@@ -18,3 +18,10 @@ export function conflictResult(details: {
     isError: true,
   };
 }
+
+export function verificationFailedResult(details: { message: string; reason: string }): CallToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify({ error: "verification_failed", ...details }) }],
+    isError: true,
+  };
+}

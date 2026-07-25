@@ -146,4 +146,35 @@ describe("MCP server smoke test", () => {
     });
     expect(payload.lock_expires_at).toBeTruthy();
   });
+
+  it("returns a distinct verification_failed shape when complete_task's checks don't pass, and force skips them", async () => {
+    const client = await connectedClient(db);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      const content = result.content as Array<{ type: string; text: string }>;
+      return { isError: result.isError, payload: JSON.parse(content[0].text) };
+    };
+
+    const { payload: project } = await call("create_project", { name: "Demo", root_path: "/tmp/demo" });
+    const { payload: created } = await call("create_task", {
+      project_id: project.project_id,
+      title: "Has declared files that never changed",
+      file_paths: ["never-touched.txt"],
+    });
+    await call("get_next_task", { project_id: project.project_id });
+    await call("claim_task", { task_id: created.task_id, session_id: "session-1" });
+
+    const failed = await call("complete_task", { task_id: created.task_id, summary: "done" });
+    expect(failed.isError).toBe(true);
+    expect(failed.payload.error).toBe("verification_failed");
+    expect(failed.payload.reason).toBeTruthy();
+
+    const forced = await call("complete_task", {
+      task_id: created.task_id,
+      summary: "done",
+      force: true,
+    });
+    expect(forced.isError).toBeFalsy();
+    expect(forced.payload.ok).toBe(true);
+  });
 });
