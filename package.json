@@ -5,10 +5,14 @@
   "type": "module",
   "private": true,
   "main": "dist/index.js",
+  "bin": {
+    "task-tracker-status": "dist/cli/status.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
+    "status": "node dist/cli/status.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },

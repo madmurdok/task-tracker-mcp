@@ -35,6 +35,17 @@ export function hashDesignDoc(rootPath: string, designDocPath: string): string |
   }
 }
 
+export function listProjects(db: DatabaseInstance): Project[] {
+  return db.prepare(`SELECT * FROM projects ORDER BY created_at ASC`).all() as Project[];
+}
+
+export function getProject(db: DatabaseInstance, idOrName: string): Project | undefined {
+  return (
+    (db.prepare(`SELECT * FROM projects WHERE id = ?`).get(idOrName) as Project | undefined) ??
+    (db.prepare(`SELECT * FROM projects WHERE name = ?`).get(idOrName) as Project | undefined)
+  );
+}
+
 export function createProject(db: DatabaseInstance, input: CreateProjectInput): Project {
   const designDocHash = input.design_doc_path
     ? hashDesignDoc(input.root_path, input.design_doc_path)
