@@ -44,7 +44,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 9 registered tools over the same transport", async () => {
+  it("exercises all 10 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -64,6 +64,7 @@ describe("MCP server smoke test", () => {
         "list_tasks",
         "get_project_status",
         "claim_task",
+        "release_task",
         "add_handoff_note",
         "complete_task",
       ].sort(),
@@ -97,6 +98,14 @@ describe("MCP server smoke test", () => {
     expect(next.task.id).toBe(prereqId);
 
     await call("claim_task", { task_id: prereqId, session_id: "session-1" });
+
+    // release_task: giving it up puts it straight back to pending, no need to
+    // wait out the lease, and a different session can then claim it.
+    await call("release_task", { task_id: prereqId, session_id: "session-1" });
+    const reclaimed = await call("get_next_task", { project_id });
+    expect(reclaimed.task.id).toBe(prereqId);
+    await call("claim_task", { task_id: prereqId, session_id: "session-1" });
+
     await call("add_handoff_note", {
       task_id: prereqId,
       session_id: "session-1",
@@ -107,5 +116,34 @@ describe("MCP server smoke test", () => {
       summary: "done",
     });
     expect(unblocked_task_ids.sort()).toEqual([...new_task_ids].sort());
+  });
+
+  it("returns a distinct conflict shape for claim_task ownership contention", async () => {
+    const client = await connectedClient(db);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      const content = result.content as Array<{ type: string; text: string }>;
+      return { isError: result.isError, payload: JSON.parse(content[0].text) };
+    };
+
+    const { payload: project } = await call("create_project", { name: "Demo", root_path: "/tmp/demo" });
+    const { payload: created } = await call("create_task", {
+      project_id: project.project_id,
+      title: "Solo task",
+    });
+    await call("get_next_task", { project_id: project.project_id });
+    await call("claim_task", { task_id: created.task_id, session_id: "session-1" });
+
+    const { isError, payload } = await call("claim_task", {
+      task_id: created.task_id,
+      session_id: "session-2",
+    });
+
+    expect(isError).toBe(true);
+    expect(payload).toMatchObject({
+      error: "conflict",
+      current_owner_session_id: "session-1",
+    });
+    expect(payload.lock_expires_at).toBeTruthy();
   });
 });

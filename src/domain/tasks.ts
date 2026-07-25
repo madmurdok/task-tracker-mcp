@@ -14,6 +14,7 @@ export interface Task {
   status: TaskStatus;
   estimated_tokens: number;
   owner_session_id: string | null;
+  lock_expires_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -57,13 +58,14 @@ export function createTask(
     status: "pending",
     estimated_tokens: estimatedTokens,
     owner_session_id: null,
+    lock_expires_at: null,
     created_at: now,
     updated_at: now,
   };
 
   const insertTask = db.prepare(
-    `INSERT INTO tasks (id, project_id, title, description, acceptance_criteria, status, estimated_tokens, owner_session_id, created_at, updated_at)
-     VALUES (@id, @project_id, @title, @description, @acceptance_criteria, @status, @estimated_tokens, @owner_session_id, @created_at, @updated_at)`,
+    `INSERT INTO tasks (id, project_id, title, description, acceptance_criteria, status, estimated_tokens, owner_session_id, lock_expires_at, created_at, updated_at)
+     VALUES (@id, @project_id, @title, @description, @acceptance_criteria, @status, @estimated_tokens, @owner_session_id, @lock_expires_at, @created_at, @updated_at)`,
   );
   const insertFile = db.prepare(`INSERT INTO task_files (task_id, file_path) VALUES (?, ?)`);
 

@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SCHEMA_SQL } from "./schema.js";
+import { SCHEMA_SQL, runMigrations } from "./schema.js";
 
 export function defaultDbPath(): string {
   return (
@@ -22,6 +22,7 @@ export function openDatabase(dbPath: string = defaultDbPath()): Database.Databas
     db.pragma("journal_mode = WAL");
   }
   db.exec(SCHEMA_SQL);
+  runMigrations(db);
   return db;
 }
 

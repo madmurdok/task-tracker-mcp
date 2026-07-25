@@ -67,6 +67,41 @@ describe("getNextTask", () => {
       expect(result.reason).toBe("all_done");
     }
   });
+
+  it("does not reclaim an in_progress task before its lock expires", () => {
+    const { db, project, makeTask } = setup();
+    makeTask("A");
+
+    getNextTask(db, project.id); // hand out A, lock ~30min out
+
+    const second = getNextTask(db, project.id);
+    expect(second.task).toBeNull();
+    if (second.task === null) {
+      expect(second.reason).toBe("all_blocked");
+    }
+  });
+
+  it("reclaims an in_progress task once its lock has expired, clearing the old owner", () => {
+    const { db, project, makeTask } = setup();
+    const a = makeTask("A");
+
+    getNextTask(db, project.id);
+    db.prepare(`UPDATE tasks SET owner_session_id = ?, lock_expires_at = ? WHERE id = ?`).run(
+      "stale-session",
+      new Date(Date.now() - 1000).toISOString(),
+      a.id,
+    );
+
+    const reclaimed = getNextTask(db, project.id);
+    expect(reclaimed.task?.id).toBe(a.id);
+    expect(reclaimed.task?.status).toBe("in_progress");
+    expect(reclaimed.task?.owner_session_id).toBeNull();
+
+    const row = db
+      .prepare(`SELECT lock_expires_at FROM tasks WHERE id = ?`)
+      .get(a.id) as { lock_expires_at: string };
+    expect(new Date(row.lock_expires_at).getTime()).toBeGreaterThan(Date.now());
+  });
 });
 
 describe("listTasks / getProjectStatus", () => {
