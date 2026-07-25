@@ -26,7 +26,7 @@ export interface CreateProjectInput {
  * throwing, so a bad path doesn't block creating the project - it just means
  * nothing is being tracked yet.
  */
-function hashDesignDoc(rootPath: string, designDocPath: string): string | null {
+export function hashDesignDoc(rootPath: string, designDocPath: string): string | null {
   try {
     const content = fs.readFileSync(path.resolve(rootPath, designDocPath), "utf8");
     return createHash("sha256").update(content).digest("hex");
@@ -55,4 +55,52 @@ export function createProject(db: DatabaseInstance, input: CreateProjectInput): 
   ).run(project);
 
   return project;
+}
+
+export interface DocSyncResult {
+  tracked: boolean;
+  in_sync: boolean;
+  design_doc_path: string | null;
+  stored_hash: string | null;
+  current_hash: string | null;
+}
+
+/**
+ * Compares a project's design doc against the hash captured when it was last
+ * tracked (create_project's design_doc_path). `tracked: false` means no doc
+ * was ever registered - there's nothing to compare, so nothing to flag.
+ * A missing/unreadable doc (current_hash null) always counts as *not*
+ * in sync rather than silently passing, matching the "fail closed" approach
+ * CompletionVerifier already takes for a similar problem (see verification.ts).
+ */
+export function checkDocSync(db: DatabaseInstance, projectId: string): DocSyncResult {
+  const project = db
+    .prepare(`SELECT root_path, design_doc_path, design_doc_hash FROM projects WHERE id = ?`)
+    .get(projectId) as
+    | { root_path: string; design_doc_path: string | null; design_doc_hash: string | null }
+    | undefined;
+
+  if (!project) {
+    throw new Error(`Unknown project_id: ${projectId}`);
+  }
+
+  if (!project.design_doc_path) {
+    return {
+      tracked: false,
+      in_sync: true,
+      design_doc_path: null,
+      stored_hash: null,
+      current_hash: null,
+    };
+  }
+
+  const currentHash = hashDesignDoc(project.root_path, project.design_doc_path);
+
+  return {
+    tracked: true,
+    in_sync: currentHash !== null && currentHash === project.design_doc_hash,
+    design_doc_path: project.design_doc_path,
+    stored_hash: project.design_doc_hash,
+    current_hash: currentHash,
+  };
 }

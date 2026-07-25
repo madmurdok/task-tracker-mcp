@@ -44,7 +44,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 10 registered tools over the same transport", async () => {
+  it("exercises all 11 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -57,6 +57,7 @@ describe("MCP server smoke test", () => {
     expect(tools.map((t) => t.name).sort()).toEqual(
       [
         "create_project",
+        "check_doc_sync",
         "create_task",
         "add_dependency",
         "split_task",
@@ -71,6 +72,14 @@ describe("MCP server smoke test", () => {
     );
 
     const { project_id } = await call("create_project", { name: "Demo", root_path: "/tmp/demo" });
+    const syncBeforeDoc = await call("check_doc_sync", { project_id });
+    expect(syncBeforeDoc).toEqual({
+      tracked: false,
+      in_sync: true,
+      design_doc_path: null,
+      stored_hash: null,
+      current_hash: null,
+    });
 
     const { task_id: prereqId } = await call("create_task", {
       project_id,
