@@ -2,10 +2,21 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DatabaseInstance } from "../../db/connection.js";
 import { addHandoffNote } from "../../domain/handoffNotes.js";
-import { claimTask, completeTask, releaseTask, TaskConflictError } from "../../domain/lifecycle.js";
-import { conflictResult, jsonResult } from "../toolResult.js";
+import {
+  claimTask,
+  completeTask,
+  CompletionVerificationError,
+  releaseTask,
+  TaskConflictError,
+} from "../../domain/lifecycle.js";
+import type { CompletionVerifier } from "../../domain/verification.js";
+import { conflictResult, jsonResult, verificationFailedResult } from "../toolResult.js";
 
-export function registerLifecycleTools(server: McpServer, db: DatabaseInstance): void {
+export function registerLifecycleTools(
+  server: McpServer,
+  db: DatabaseInstance,
+  verifier: CompletionVerifier,
+): void {
   server.registerTool(
     "claim_task",
     {
@@ -82,14 +93,25 @@ export function registerLifecycleTools(server: McpServer, db: DatabaseInstance):
   server.registerTool(
     "complete_task",
     {
-      description: "Mark a task done and report which dependent tasks are now unblocked.",
+      description:
+        "Mark a task done and report which dependent tasks are now unblocked. Verifies the task's declared files actually changed (and runs test_command, if given) before accepting the completion; pass force to skip verification.",
       inputSchema: {
         task_id: z.string().min(1),
         summary: z.string().optional(),
+        test_command: z.string().optional(),
+        force: z.boolean().optional(),
       },
     },
-    async ({ task_id }) => {
-      const result = completeTask(db, task_id);
+    async ({ task_id, test_command, force }) => {
+      let result;
+      try {
+        result = completeTask(db, verifier, { task_id, test_command, force });
+      } catch (error) {
+        if (error instanceof CompletionVerificationError) {
+          return verificationFailedResult({ message: error.message, reason: error.reason });
+        }
+        throw error;
+      }
       return jsonResult({ ok: true, ...result });
     },
   );

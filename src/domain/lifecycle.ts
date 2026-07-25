@@ -1,5 +1,6 @@
 import type { DatabaseInstance } from "../db/connection.js";
 import { hasUnmetDependencies, LOCK_LEASE_MS } from "./status.js";
+import type { CompletionVerifier } from "./verification.js";
 
 /**
  * Raised when a caller tries to claim or release a task whose lock is
@@ -116,13 +117,62 @@ export interface CompleteTaskResult {
   unblocked_task_ids: string[];
 }
 
-export function completeTask(db: DatabaseInstance, taskId: string): CompleteTaskResult {
-  const run = db.transaction((): CompleteTaskResult => {
-    const task = db.prepare(`SELECT id FROM tasks WHERE id = ?`).get(taskId);
-    if (!task) {
-      throw new Error(`Unknown task_id: ${taskId}`);
-    }
+export interface CompleteTaskInput {
+  task_id: string;
+  test_command?: string;
+  force?: boolean;
+}
 
+/**
+ * Raised when a task's declared completion doesn't check out - the file
+ * check and/or test command from CompletionVerifier failed. Pass `force` to
+ * skip verification for a task that was legitimately finished some other way
+ * (e.g. it turned out no code change was needed).
+ */
+export class CompletionVerificationError extends Error {
+  constructor(
+    message: string,
+    public readonly reason: string,
+  ) {
+    super(message);
+    this.name = "CompletionVerificationError";
+  }
+}
+
+export function completeTask(
+  db: DatabaseInstance,
+  verifier: CompletionVerifier,
+  input: CompleteTaskInput,
+): CompleteTaskResult {
+  const { task_id: taskId, test_command: testCommand, force = false } = input;
+
+  const task = db.prepare(`SELECT project_id FROM tasks WHERE id = ?`).get(taskId) as
+    | { project_id: string }
+    | undefined;
+  if (!task) {
+    throw new Error(`Unknown task_id: ${taskId}`);
+  }
+
+  if (!force) {
+    const project = db
+      .prepare(`SELECT root_path FROM projects WHERE id = ?`)
+      .get(task.project_id) as { root_path: string };
+    const filePaths = (
+      db.prepare(`SELECT file_path FROM task_files WHERE task_id = ?`).all(taskId) as Array<{
+        file_path: string;
+      }>
+    ).map((row) => row.file_path);
+
+    const result = verifier.verify({ rootPath: project.root_path, filePaths, testCommand });
+    if (!result.passed) {
+      throw new CompletionVerificationError(
+        `Verification failed for task ${taskId}: ${result.reason}`,
+        result.reason,
+      );
+    }
+  }
+
+  const run = db.transaction((): CompleteTaskResult => {
     db.prepare(`UPDATE tasks SET status = 'done', updated_at = ? WHERE id = ?`).run(
       new Date().toISOString(),
       taskId,

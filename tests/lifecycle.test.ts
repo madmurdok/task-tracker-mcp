@@ -4,11 +4,19 @@ import { createProject } from "../src/domain/projects.js";
 import { createTask } from "../src/domain/tasks.js";
 import { addDependency } from "../src/domain/dependencies.js";
 import { getNextTask } from "../src/domain/status.js";
-import { claimTask, completeTask, releaseTask, TaskConflictError } from "../src/domain/lifecycle.js";
+import {
+  claimTask,
+  completeTask,
+  CompletionVerificationError,
+  releaseTask,
+  TaskConflictError,
+} from "../src/domain/lifecycle.js";
 import { addHandoffNote } from "../src/domain/handoffNotes.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
+import type { CompletionVerifier } from "../src/domain/verification.js";
 
 const noopEstimator: BudgetEstimator = { estimateTokens: () => 0 };
+const noopVerifier: CompletionVerifier = { verify: () => ({ passed: true, reason: "noop" }) };
 
 describe("full task lifecycle (matches the doc's sequence diagram)", () => {
   it("create -> depend -> get_next -> claim -> handoff note -> complete -> dependent unblocked", () => {
@@ -42,7 +50,7 @@ describe("full task lifecycle (matches the doc's sequence diagram)", () => {
     const notes = db.prepare("SELECT * FROM handoff_notes WHERE task_id = ?").all(taskA.id);
     expect(notes).toHaveLength(1);
 
-    const { unblocked_task_ids } = completeTask(db, taskA.id);
+    const { unblocked_task_ids } = completeTask(db, noopVerifier, { task_id: taskA.id });
     expect(unblocked_task_ids).toEqual([taskB.id]);
 
     const secondSessionNext = getNextTask(db, project.id);
@@ -75,7 +83,7 @@ describe("full task lifecycle (matches the doc's sequence diagram)", () => {
 
   it("complete_task rejects an unknown task", () => {
     const db = openDatabase(":memory:");
-    expect(() => completeTask(db, "missing")).toThrow(/Unknown task_id/);
+    expect(() => completeTask(db, noopVerifier, { task_id: "missing" })).toThrow(/Unknown task_id/);
   });
 });
 
@@ -143,10 +151,71 @@ describe("ownership conflicts (A3)", () => {
 
   it("release_task rejects a task that is already done", () => {
     const { db, task } = setup();
-    completeTask(db, task.id);
+    completeTask(db, noopVerifier, { task_id: task.id });
 
     expect(() => releaseTask(db, { task_id: task.id, session_id: "session-1" })).toThrow(
       /already done/,
     );
+  });
+});
+
+describe("completion verification (B2)", () => {
+  function setup() {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Build schema",
+      file_paths: ["src/db/schema.ts"],
+    });
+    return { db, project, task };
+  }
+
+  it("rejects completion when the verifier fails", () => {
+    const { db, task } = setup();
+    const failingVerifier: CompletionVerifier = {
+      verify: () => ({ passed: false, reason: "no changes detected" }),
+    };
+
+    expect(() => completeTask(db, failingVerifier, { task_id: task.id })).toThrow(
+      CompletionVerificationError,
+    );
+    const row = db.prepare(`SELECT status FROM tasks WHERE id = ?`).get(task.id);
+    expect(row).toMatchObject({ status: "pending" });
+  });
+
+  it("force skips verification entirely", () => {
+    const { db, task } = setup();
+    const failingVerifier: CompletionVerifier = {
+      verify: () => ({ passed: false, reason: "no changes detected" }),
+    };
+
+    expect(() => completeTask(db, failingVerifier, { task_id: task.id, force: true })).not.toThrow();
+    const row = db.prepare(`SELECT status FROM tasks WHERE id = ?`).get(task.id);
+    expect(row).toMatchObject({ status: "done" });
+  });
+
+  it("passes the task's root_path, file_paths, and test_command through to the verifier", () => {
+    const { db, project, task } = setup();
+    let received: unknown;
+    const spyVerifier: CompletionVerifier = {
+      verify: (input) => {
+        received = input;
+        return { passed: true, reason: "ok" };
+      },
+    };
+
+    completeTask(db, spyVerifier, { task_id: task.id, test_command: "npm test" });
+
+    expect(received).toEqual({
+      rootPath: project.root_path,
+      filePaths: ["src/db/schema.ts"],
+      testCommand: "npm test",
+    });
+  });
+
+  it("succeeds when the verifier passes", () => {
+    const { db, task } = setup();
+    expect(() => completeTask(db, noopVerifier, { task_id: task.id })).not.toThrow();
   });
 });
