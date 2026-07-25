@@ -2,21 +2,61 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DatabaseInstance } from "../../db/connection.js";
 import { addHandoffNote } from "../../domain/handoffNotes.js";
-import { claimTask, completeTask } from "../../domain/lifecycle.js";
-import { jsonResult } from "../toolResult.js";
+import { claimTask, completeTask, releaseTask, TaskConflictError } from "../../domain/lifecycle.js";
+import { conflictResult, jsonResult } from "../toolResult.js";
 
 export function registerLifecycleTools(server: McpServer, db: DatabaseInstance): void {
   server.registerTool(
     "claim_task",
     {
-      description: "Record which session is working a task (informational in v1, not a hard lock).",
+      description:
+        "Record which session is working a task. Rejects with a conflict error if another session's lock on it is still active.",
       inputSchema: {
         task_id: z.string().min(1),
         session_id: z.string().min(1),
       },
     },
     async ({ task_id, session_id }) => {
-      claimTask(db, task_id, session_id);
+      try {
+        claimTask(db, task_id, session_id);
+      } catch (error) {
+        if (error instanceof TaskConflictError) {
+          return conflictResult({
+            message: error.message,
+            current_owner_session_id: error.currentOwnerSessionId,
+            lock_expires_at: error.lockExpiresAt,
+          });
+        }
+        throw error;
+      }
+      return jsonResult({ ok: true });
+    },
+  );
+
+  server.registerTool(
+    "release_task",
+    {
+      description:
+        "Release ownership of a task so it's immediately available again, instead of waiting for its lock to expire. Pass force to override another session's still-active lock.",
+      inputSchema: {
+        task_id: z.string().min(1),
+        session_id: z.string().min(1),
+        force: z.boolean().optional(),
+      },
+    },
+    async ({ task_id, session_id, force }) => {
+      try {
+        releaseTask(db, { task_id, session_id, force });
+      } catch (error) {
+        if (error instanceof TaskConflictError) {
+          return conflictResult({
+            message: error.message,
+            current_owner_session_id: error.currentOwnerSessionId,
+            lock_expires_at: error.lockExpiresAt,
+          });
+        }
+        throw error;
+      }
       return jsonResult({ ok: true });
     },
   );

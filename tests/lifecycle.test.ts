@@ -4,7 +4,7 @@ import { createProject } from "../src/domain/projects.js";
 import { createTask } from "../src/domain/tasks.js";
 import { addDependency } from "../src/domain/dependencies.js";
 import { getNextTask } from "../src/domain/status.js";
-import { claimTask, completeTask } from "../src/domain/lifecycle.js";
+import { claimTask, completeTask, releaseTask, TaskConflictError } from "../src/domain/lifecycle.js";
 import { addHandoffNote } from "../src/domain/handoffNotes.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 
@@ -76,5 +76,77 @@ describe("full task lifecycle (matches the doc's sequence diagram)", () => {
   it("complete_task rejects an unknown task", () => {
     const db = openDatabase(":memory:");
     expect(() => completeTask(db, "missing")).toThrow(/Unknown task_id/);
+  });
+});
+
+describe("ownership conflicts (A3)", () => {
+  function setup() {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const { task } = createTask(db, noopEstimator, { project_id: project.id, title: "Build schema" });
+    getNextTask(db, project.id); // hand out, owner still null
+    claimTask(db, task.id, "session-1"); // session-1 now holds an active lock
+    return { db, project, task };
+  }
+
+  it("claim_task rejects a different session while the lock is active", () => {
+    const { db, task } = setup();
+
+    expect(() => claimTask(db, task.id, "session-2")).toThrow(TaskConflictError);
+    const row = db.prepare(`SELECT owner_session_id FROM tasks WHERE id = ?`).get(task.id);
+    expect(row).toMatchObject({ owner_session_id: "session-1" });
+  });
+
+  it("claim_task allows the current owner to renew their own lock", () => {
+    const { db, task } = setup();
+    expect(() => claimTask(db, task.id, "session-1")).not.toThrow();
+  });
+
+  it("release_task rejects a different session without force", () => {
+    const { db, task } = setup();
+
+    expect(() => releaseTask(db, { task_id: task.id, session_id: "session-2" })).toThrow(
+      TaskConflictError,
+    );
+    const row = db.prepare(`SELECT status FROM tasks WHERE id = ?`).get(task.id);
+    expect(row).toMatchObject({ status: "in_progress" });
+  });
+
+  it("release_task with force overrides another session's active lock", () => {
+    const { db, task } = setup();
+
+    releaseTask(db, { task_id: task.id, session_id: "session-2", force: true });
+    const row = db.prepare(`SELECT status, owner_session_id, lock_expires_at FROM tasks WHERE id = ?`).get(
+      task.id,
+    );
+    expect(row).toMatchObject({ status: "pending", owner_session_id: null, lock_expires_at: null });
+  });
+
+  it("release_task by the owner puts the task straight back to pending, reclaimable immediately", () => {
+    const { db, project, task } = setup();
+
+    releaseTask(db, { task_id: task.id, session_id: "session-1" });
+
+    const row = db.prepare(`SELECT status, owner_session_id FROM tasks WHERE id = ?`).get(task.id);
+    expect(row).toMatchObject({ status: "pending", owner_session_id: null });
+
+    const next = getNextTask(db, project.id);
+    expect(next.task?.id).toBe(task.id);
+  });
+
+  it("release_task rejects an unknown task", () => {
+    const db = openDatabase(":memory:");
+    expect(() => releaseTask(db, { task_id: "missing", session_id: "session-1" })).toThrow(
+      /Unknown task_id/,
+    );
+  });
+
+  it("release_task rejects a task that is already done", () => {
+    const { db, task } = setup();
+    completeTask(db, task.id);
+
+    expect(() => releaseTask(db, { task_id: task.id, session_id: "session-1" })).toThrow(
+      /already done/,
+    );
   });
 });
