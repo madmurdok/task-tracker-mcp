@@ -3,7 +3,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { openDatabase } from "../src/db/connection.js";
+import { createProject } from "../src/domain/projects.js";
+import { createTask } from "../src/domain/tasks.js";
+import type { BudgetEstimator } from "../src/domain/budget.js";
+import { completeTask, CompletionVerificationError } from "../src/domain/lifecycle.js";
 import { GitDiffCompletionVerifier } from "../src/domain/verification.js";
+
+const noopEstimator: BudgetEstimator = { estimateTokens: () => 0 };
 
 function initTempRepo(): string {
   const dir = mkdtempSync(path.join(tmpdir(), "ttmcp-verify-"));
@@ -75,5 +82,64 @@ describe("GitDiffCompletionVerifier", () => {
     const result = verifier.verify({ rootPath: dir, filePaths: ["a.txt"], testCommand: "true" });
     expect(result.passed).toBe(false);
     expect(result.reason).toMatch(/no changes detected/);
+  });
+});
+
+/**
+ * B3: the real GitDiffCompletionVerifier wired through the real DB/domain
+ * layer, not the mock verifiers B2's tests use for control - proves the
+ * pieces actually work together against a real git-backed project.
+ */
+describe("completeTask against a real project + a real git repo", () => {
+  const verifier = new GitDiffCompletionVerifier();
+  let dir: string;
+
+  beforeEach(() => {
+    dir = initTempRepo();
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("rejects completion until the declared file is actually touched, then accepts it", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: dir });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Add a config file",
+      file_paths: ["config.json"],
+    });
+
+    expect(() => completeTask(db, verifier, { task_id: task.id })).toThrow(
+      CompletionVerificationError,
+    );
+
+    writeFileSync(path.join(dir, "config.json"), "{}\n");
+
+    const result = completeTask(db, verifier, { task_id: task.id });
+    expect(result).toEqual({ unblocked_task_ids: [] });
+
+    const row = db.prepare(`SELECT status FROM tasks WHERE id = ?`).get(task.id);
+    expect(row).toMatchObject({ status: "done" });
+  });
+
+  it("also requires the test_command to pass when one is given", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: dir });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Add a config file",
+      file_paths: ["config.json"],
+    });
+    writeFileSync(path.join(dir, "config.json"), "{}\n");
+
+    expect(() =>
+      completeTask(db, verifier, { task_id: task.id, test_command: "node -e 'process.exit(1)'" }),
+    ).toThrow(CompletionVerificationError);
+
+    expect(() =>
+      completeTask(db, verifier, { task_id: task.id, test_command: "node -e 'process.exit(0)'" }),
+    ).not.toThrow();
   });
 });
