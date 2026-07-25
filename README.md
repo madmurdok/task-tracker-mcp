@@ -28,7 +28,19 @@ npm test           # vitest
 npm run typecheck  # tsc --noEmit
 ```
 
-## Tools (v1)
+## Tools
 
 `create_project`, `create_task`, `add_dependency`, `split_task`, `get_next_task`,
-`list_tasks`, `get_project_status`, `claim_task`, `add_handoff_note`, `complete_task`.
+`list_tasks`, `get_project_status`, `claim_task`, `release_task`, `check_doc_sync`,
+`add_handoff_note`, `complete_task`.
+
+## Status CLI
+
+Read-only, bypasses the MCP transport entirely — opens the same SQLite file
+directly.
+
+```bash
+npm run build
+npm run status                        # list every registered project
+npm run status <project_id_or_name>   # that project's status + full task list
+```

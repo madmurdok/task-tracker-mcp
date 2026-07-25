@@ -23,17 +23,12 @@ and hand off work across sessions.
   so a fresh session resumes from a summary instead of re-deriving context.
 - Work across multiple projects from one running server instance.
 
-**Non-goals (v1)**
-- Verifying completion against real git diffs/test runs — v1 completion is
-  Claude-declared (`complete_task`), not verified. Revisit once the basic loop is
-  proven.
-- True multi-session ownership (stale-lock timeouts, forced reclaim, conflict UI) —
-  v1 only guarantees no two callers get the same task from `get_next_task` (see
-  Failure Modes). Full ownership semantics are v2.
-- Auto re-sync when the design doc changes after the graph is generated — v1 assumes
-  Claude edits the graph manually to reflect doc changes.
-- A UI. v1 is MCP-tools-only; a CLI/viewer can be added later without touching the
-  core.
+**Non-goals**
+- Automatically reconciling the task graph when the design doc changes — v2 added
+  drift *detection* (`check_doc_sync`, see Interfaces), but Claude still has to be
+  told to re-plan the graph itself; that reconciliation step stays manual.
+- A full UI/viewer — v2 added a minimal read-only status CLI (see Interfaces), but
+  it's a print-and-exit tool, not an interactive viewer.
 
 ## Constraints
 
@@ -65,6 +60,9 @@ graph TD
     Server --> Domain[Domain/Service Layer]
     Domain --> DB[(SQLite: ~/.task-tracker/tracker.db)]
     Domain --> Budget[Context Budget Estimator]
+    Domain --> Verifier[Completion Verifier]
+    Human[Human operator] -->|reads directly, no MCP| CLI[Status CLI]
+    CLI --> DB
 ```
 
 - **MCP Tool Handlers** — thin adapters: validate input, call the domain layer,
@@ -76,6 +74,16 @@ graph TD
   (chars-on-disk / 4 as a first heuristic) and flags tasks over a configurable
   threshold (e.g. 15k tokens) as "should split" in tool responses. Isolated behind
   an interface so the heuristic can be swapped later without touching callers.
+- **Completion Verifier** — pluggable check (`GitDiffCompletionVerifier`) that
+  `complete_task` runs before accepting a Claude-declared completion: confirms the
+  task's declared files actually changed (`git status --porcelain`) and, if a
+  `test_command` was given, that it exits zero. `force: true` skips it. Isolated
+  behind a `CompletionVerifier` interface the same way the Budget Estimator isolates
+  its heuristic.
+- **Status CLI** (`src/cli/status.ts`) — a standalone script that opens the SQLite
+  file directly and calls the same domain functions (`getProjectStatus`,
+  `listTasks`) the MCP tools use, so a human can eyeball progress without going
+  through Claude or the MCP transport at all.
 - **SQLite** — single file, WAL mode (safe concurrent reads, serialized writes).
 
 ## Data Flow
@@ -120,6 +128,8 @@ erDiagram
         text id PK
         text name
         text root_path
+        text design_doc_path "nullable"
+        text design_doc_hash "nullable, sha256 of doc content at create_project time"
         text created_at
     }
     TASKS {
@@ -128,9 +138,10 @@ erDiagram
         text title
         text description
         text acceptance_criteria
-        text status "pending|in_progress|blocked|done"
+        text status "pending|in_progress|done (blocked is derived, see below)"
         int estimated_tokens
-        text owner_session_id "nullable, v1: informational only"
+        text owner_session_id "nullable, enforced via claim_task/release_task"
+        text lock_expires_at "nullable, 30min lease; enables auto-reclaim by get_next_task"
         text created_at
         text updated_at
     }
@@ -162,16 +173,19 @@ of sync with the graph.
 All responses are compact JSON — no HTML/markdown formatting, no metadata Claude
 didn't ask for.
 
-- `create_project(name, root_path) -> { project_id }`
+- `create_project(name, root_path, design_doc_path?) -> { project_id, design_doc_hash }` — pass `design_doc_path` (relative to `root_path`) to hash it now and enable later `check_doc_sync` calls.
 - `create_task(project_id, title, description, acceptance_criteria, file_paths[], depends_on?: task_id[]) -> { task_id, estimated_tokens, over_budget: bool }`
 - `add_dependency(task_id, depends_on_task_id) -> { ok: true }` (rejects if it would create a cycle)
 - `split_task(task_id, subtasks: [{title, description, acceptance_criteria, file_paths}]) -> { new_task_ids[] }` — original task is replaced; its dependents and dependencies are rewired onto the subtasks.
-- `get_next_task(project_id) -> { task } | { task: null, reason: "all_done" | "all_blocked", blocked_on?: [...] }` — atomically marks the returned task `in_progress` as part of the same transaction that selects it (the v1 answer to concurrent callers, see Failure Modes).
-- `claim_task(task_id, session_id) -> { ok: true }` — records `owner_session_id`; informational in v1, not enforced as a hard lock.
+- `get_next_task(project_id) -> { task } | { task: null, reason: "all_done" | "all_blocked", blocked_on?: [...] }` — atomically marks the returned task `in_progress` and gives it a 30-minute lock lease as part of the same transaction that selects it (see Failure Modes for both the no-duplicate-hand-out guarantee and stale-lock reclaim).
+- `claim_task(task_id, session_id) -> { ok: true } | conflict error` — records `owner_session_id` and renews the lock lease; rejects with `{ error: "conflict", current_owner_session_id, lock_expires_at }` if a different session's lock is still active.
+- `release_task(task_id, session_id, force?) -> { ok: true } | conflict error` — gives up ownership immediately (back to `pending`) instead of waiting out the lease; `force: true` overrides another session's still-active lock.
+- `check_doc_sync(project_id) -> { tracked, in_sync, design_doc_path, stored_hash, current_hash }` — compares the tracked design doc's current hash against the one captured at `create_project` time; `tracked: false` means no doc was ever registered.
 - `add_handoff_note(task_id, session_id, { decisions, remaining_work, discoveries }) -> { ok: true }`
-- `complete_task(task_id, summary) -> { ok: true, unblocked_task_ids: [...] }`
+- `complete_task(task_id, summary, test_command?, force?) -> { ok: true, unblocked_task_ids: [...] } | verification_failed error` — runs the Completion Verifier first (declared files changed + `test_command` exits zero, if given); `force: true` skips it.
 - `get_project_status(project_id) -> { total, done, in_progress, blocked, pending, percent }`
 - `list_tasks(project_id, status?) -> { tasks: [{ id, title, status, estimated_tokens }] }` — summary rows only; use `get_next_task`/a future `get_task` for full detail.
+- **Status CLI** (outside MCP): `node dist/cli/status.js [project_id_or_name]` — no arg lists every registered project's status; with an arg, prints that project's status plus its full task list. Read-only, opens the DB directly.
 
 ## Failure Modes & Edge Cases
 
@@ -186,12 +200,19 @@ didn't ask for.
 - **A task's estimate turns out wrong once work starts.** Claude calls `split_task`;
   the remainder becomes new pending tasks that inherit the original's dependency
   edges, so the graph stays consistent.
-- **A session dies mid-task without completing or splitting it.** The task stays
-  `in_progress` indefinitely. v1 surfaces this passively — `list_tasks` shows it and
-  `updated_at` shows staleness — but there's no automatic reclaim; a human (or a
-  future v2) has to intervene.
-- **Design doc changes after the graph exists.** Not auto-detected; out of scope for
-  v1 by design (see Non-goals). Claude has to be told to reconcile manually.
+- **A session dies mid-task without completing or splitting it.** `get_next_task`
+  hands out a task with a 30-minute lock lease (`LOCK_LEASE_MS`); once that expires,
+  a later `get_next_task` call automatically reclaims it (clearing the dead
+  session's `owner_session_id`) instead of leaving it stuck `in_progress` forever.
+- **Two sessions want the same in-flight task.** `claim_task`/`release_task` reject
+  with a `conflict` error (`current_owner_session_id`, `lock_expires_at`) while
+  another session's lock is still active; `release_task(force: true)` overrides it.
+- **A `complete_task` call's declared files were never actually touched.**
+  `complete_task` rejects with `verification_failed` (reason included) unless
+  `force: true` is passed — see Completion Verifier in Components.
+- **Design doc changes after the graph exists.** `check_doc_sync` detects the drift
+  (doc hash no longer matches), but doesn't touch the graph itself — Claude still
+  has to be told to reconcile it manually (see Non-goals).
 - **`add_dependency` would create a cycle.** Rejected synchronously with an error;
   the domain layer checks reachability before writing.
 
@@ -201,12 +222,7 @@ didn't ask for.
   too far off in practice (e.g. dense code vs. prose), it's isolated behind the
   Budget Estimator interface and can be swapped for something better without
   touching callers.
-- **Git-diff-based completion verification (gap #6 from the original discussion)**
-  is deferred past v1. Confirm you're fine building the habit of trusting
-  Claude-declared completion first, before we add the verification layer.
-- **Locking/ownership (gap #8)** is deferred past full semantics in v1 — only the
-  atomic "no duplicate hand-out" guarantee is in from the start. Confirm this is
-  enough until you're actually running concurrent sessions regularly.
-- **No viewer/CLI in v1.** If you want to eyeball project status without going
-  through Claude, that's a small addition later (read-only, sits on top of the same
-  domain layer).
+- **Doc-sync reconciliation is still manual.** `check_doc_sync` tells Claude the
+  design doc drifted, but doesn't touch the graph itself — Claude still has to
+  re-derive and apply the diff by hand. Revisit if that manual step proves to be a
+  recurring papercut.

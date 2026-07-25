@@ -9,7 +9,7 @@ import { registerStatusTools } from "./tools/status.js";
 import { registerTaskTools } from "./tools/tasks.js";
 
 export function createServer(db: DatabaseInstance): McpServer {
-  const server = new McpServer({ name: "task-tracker-mcp", version: "0.1.0" });
+  const server = new McpServer({ name: "task-tracker-mcp", version: "0.2.0" });
   const estimator = new HeuristicBudgetEstimator();
   const verifier = new GitDiffCompletionVerifier();
 
