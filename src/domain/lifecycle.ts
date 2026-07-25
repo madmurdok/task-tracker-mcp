@@ -1,14 +1,18 @@
 import type { DatabaseInstance } from "../db/connection.js";
-import { hasUnmetDependencies } from "./status.js";
+import { hasUnmetDependencies, LOCK_LEASE_MS } from "./status.js";
 
 /**
- * v1: informational only, not enforced as a hard lock (see doc's Non-goals /
- * Failure Modes - full multi-session ownership is v2).
+ * Records ownership and renews the stale-lock lease (see LOCK_LEASE_MS) so an
+ * actively-worked task isn't reclaimed out from under its session by a later
+ * get_next_task call.
  */
 export function claimTask(db: DatabaseInstance, taskId: string, sessionId: string): void {
+  const now = new Date().toISOString();
+  const lockExpiresAt = new Date(Date.parse(now) + LOCK_LEASE_MS).toISOString();
+
   const result = db
-    .prepare(`UPDATE tasks SET owner_session_id = ?, updated_at = ? WHERE id = ?`)
-    .run(sessionId, new Date().toISOString(), taskId);
+    .prepare(`UPDATE tasks SET owner_session_id = ?, lock_expires_at = ?, updated_at = ? WHERE id = ?`)
+    .run(sessionId, lockExpiresAt, now, taskId);
 
   if (result.changes === 0) {
     throw new Error(`Unknown task_id: ${taskId}`);

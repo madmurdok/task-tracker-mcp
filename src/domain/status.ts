@@ -25,6 +25,18 @@ export type GetNextTaskResult =
   | { task: null; reason: "all_blocked"; blocked_on: string[] };
 
 /**
+ * How long a hand-out (via get_next_task) or an explicit claim_task holds a
+ * task before it's considered stale and eligible for automatic reclaim by a
+ * later get_next_task call (v2 ownership semantics - v1 only guaranteed no
+ * duplicate hand-out, see the doc's Non-goals/Failure Modes).
+ */
+export const LOCK_LEASE_MS = 30 * 60 * 1000;
+
+function withLease(nowIso: string): string {
+  return new Date(Date.parse(nowIso) + LOCK_LEASE_MS).toISOString();
+}
+
+/**
  * `status = blocked` is never stored (see schema) - it's computed here from unmet
  * dependencies at query time, so it can't drift out of sync with the graph.
  */
@@ -45,8 +57,31 @@ export function displayStatus(db: DatabaseInstance, task: Pick<Task, "id" | "sta
   return hasUnmetDependencies(db, task.id) ? "blocked" : "pending";
 }
 
+function handOut(
+  db: DatabaseInstance,
+  candidate: Task,
+  nowIso: string,
+  ownerSessionId: string | null,
+): GetNextTaskResult {
+  const lockExpiresAt = withLease(nowIso);
+  db.prepare(
+    `UPDATE tasks SET status = 'in_progress', owner_session_id = ?, lock_expires_at = ?, updated_at = ? WHERE id = ?`,
+  ).run(ownerSessionId, lockExpiresAt, nowIso, candidate.id);
+  return {
+    task: {
+      ...candidate,
+      status: "in_progress",
+      owner_session_id: ownerSessionId,
+      lock_expires_at: lockExpiresAt,
+      updated_at: nowIso,
+    },
+  };
+}
+
 export function getNextTask(db: DatabaseInstance, projectId: string): GetNextTaskResult {
   const select = db.transaction((): GetNextTaskResult => {
+    const nowIso = new Date().toISOString();
+
     const pendingTasks = db
       .prepare(
         `SELECT * FROM tasks WHERE project_id = ? AND status = 'pending' ORDER BY created_at ASC`,
@@ -55,13 +90,24 @@ export function getNextTask(db: DatabaseInstance, projectId: string): GetNextTas
 
     for (const candidate of pendingTasks) {
       if (!hasUnmetDependencies(db, candidate.id)) {
-        const updatedAt = new Date().toISOString();
-        db.prepare(`UPDATE tasks SET status = 'in_progress', updated_at = ? WHERE id = ?`).run(
-          updatedAt,
-          candidate.id,
-        );
-        return { task: { ...candidate, status: "in_progress", updated_at: updatedAt } };
+        return handOut(db, candidate, nowIso, candidate.owner_session_id);
       }
+    }
+
+    // No fresh pending work - see if an in_progress task's lock has expired
+    // (its session died or never completed) and can be automatically reclaimed.
+    const reclaimable = db
+      .prepare(
+        `SELECT * FROM tasks
+         WHERE project_id = ? AND status = 'in_progress'
+           AND lock_expires_at IS NOT NULL AND lock_expires_at < ?
+         ORDER BY lock_expires_at ASC
+         LIMIT 1`,
+      )
+      .get(projectId, nowIso) as Task | undefined;
+
+    if (reclaimable) {
+      return handOut(db, reclaimable, nowIso, null);
     }
 
     const remaining = db

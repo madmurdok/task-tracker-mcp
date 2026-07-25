@@ -54,6 +54,25 @@ describe("full task lifecycle (matches the doc's sequence diagram)", () => {
     expect(() => claimTask(db, "missing", "session-1")).toThrow(/Unknown task_id/);
   });
 
+  it("claim_task renews the lock lease", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const { task } = createTask(db, noopEstimator, { project_id: project.id, title: "Build schema" });
+    getNextTask(db, project.id); // hand out, sets an initial lease
+
+    db.prepare(`UPDATE tasks SET lock_expires_at = ? WHERE id = ?`).run(
+      new Date(Date.now() + 1000).toISOString(),
+      task.id,
+    );
+
+    claimTask(db, task.id, "session-1");
+
+    const row = db.prepare(`SELECT lock_expires_at FROM tasks WHERE id = ?`).get(task.id) as {
+      lock_expires_at: string;
+    };
+    expect(new Date(row.lock_expires_at).getTime()).toBeGreaterThan(Date.now() + 5000);
+  });
+
   it("complete_task rejects an unknown task", () => {
     const db = openDatabase(":memory:");
     expect(() => completeTask(db, "missing")).toThrow(/Unknown task_id/);
