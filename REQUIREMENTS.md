@@ -121,12 +121,28 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
       name TEXT NOT NULL DEFAULT '',
       description TEXT NOT NULL DEFAULT '',
       status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'released')),
+      sequence INTEGER NOT NULL,
       release_notes TEXT,
       released_at TEXT,
       created_at TEXT NOT NULL
     );
     -- unique (project_id, version); index on project_id
     ```
+    `sequence` is what `list_releases` actually orders by — resolves the auto-review
+    Weakly-justified-decision finding (releases have a real order, version-number
+    order, that plain `created_at` can't be trusted to match; e.g. a "0.1.1" hotfix
+    created after "0.2" already exists). `createRelease` auto-assigns it as
+    `COALESCE(MAX(sequence) WHERE project_id = ?, 0) + 10` — incrementing by **10**,
+    not 1, deliberately leaving gaps so a release can later be manually slotted
+    between two existing ones without renumbering anything else. `listReleases`
+    becomes `ORDER BY sequence ASC, created_at ASC` (the latter only as a tiebreak
+    for equal/duplicate sequences, which are allowed — no uniqueness constraint on
+    `sequence`). New MCP tool `set_release_sequence(project_id, release_id,
+    sequence: number) -> { ok: true }` lets it be adjusted later (e.g. set to `15` to
+    place a release between two already at `10` and `20`); unlike `set_task_release`,
+    this isn't blocked by a release already being `released` — reordering where a
+    past release *shows up* in a list is unrelated to the task-membership-drift
+    problem `set_task_release`'s freeze rule exists for.
     `tasks` gets a second nullable grouping FK alongside `epic_id`:
     `release_id TEXT REFERENCES releases(id) ON DELETE SET NULL` (same
     CREATE-TABLE-plus-`ensureColumn` treatment). Also add
@@ -144,6 +160,16 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
     *Implementation note:* `listTasks`'s optional-parameter list is getting long
     (`status?`, `epicRef?`, now `releaseRef?`) — worth considering a small options
     object at execution time, not a design blocker.
+  - **Domain — released releases are frozen for task membership** (closes the
+    auto-review Bottleneck finding on drift, resolved as the strict option): once a
+    release's `status` is `'released'`, its task set can never change again.
+    `createTask`/`createTasks` reject a `release_id` that resolves to an already-
+    `released` release ("Release X is already released; cannot assign new tasks to
+    it"). `setTaskRelease` rejects the move if *either* the task's current release
+    or its target release is already `released` (moving a task *out of* a released
+    release is exactly the same drift, just backwards). `splitTask` needs no extra
+    code for this — it already creates subtasks via `createTask`, so the same guard
+    applies for free.
   - **Domain — persisting completion summary:** `CompleteTaskInput` gets
     `summary?: string`; `completeTask`'s transaction sets
     `completion_summary = summary ?? null` alongside the existing `status = 'done'`
@@ -157,11 +183,16 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
     `completeTask` — same shape of operation):
     1. Resolve project + release; reject if `status` is already `'released'`
        (one-shot, like `complete_task` has no "un-complete").
-    2. Reject if any task in the release isn't `done` yet, listing the offending
-       task ids — this check is **not** skippable by `force` (can't ship unfinished
-       work), unlike the test gate below.
-    3. Unless `force`, run the test gate by calling the *same* injected
-       `CompletionVerifier` already used by `complete_task` —
+    2. Reject if any task in the release isn't `done` (or, once Item 6 ships,
+       `cancelled` — a cancelled task shouldn't block a release either) yet, listing
+       the offending task ids — this check is **not** skippable by `force` (can't
+       ship unfinished work), unlike the test gate below.
+    3. Unless `force`, `test_command` is **required** — reject with a clear error
+       ("release_it requires a test_command or force:true to skip the test gate")
+       if neither is given, so omitting it can't silently skip testing (see the
+       auto-review Contradictions finding this closes). When a `test_command` is
+       given, run the test gate by calling the *same* injected `CompletionVerifier`
+       already used by `complete_task` —
        `verifier.verify({ rootPath: project.root_path, filePaths: [], testCommand })`.
        Passing an empty `filePaths` skips the git-diff check entirely (see
        `GitDiffCompletionVerifier.verify` in `src/domain/verification.ts`) and runs
@@ -173,6 +204,15 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
     5. In one transaction: `UPDATE releases SET status = 'released', release_notes =
        ?, released_at = ? WHERE id = ?`.
     6. Returns `{ ok: true, release_notes, released_at }`.
+  - **Domain/MCP — escape valve for a stuck release (closes the auto-review
+    Bottleneck finding below, small half):** `setTaskRelease(db, task_id,
+    release_ref | null)` in `src/domain/releases.ts` — resolves `task_id` via
+    `requireTask` (Item 1), resolves `release_ref` via `requireRelease` scoped to
+    the task's own `project_id` (or clears it when `null`), then updates
+    `tasks.release_id`. Exposed as MCP tool `set_task_release(task_id, release_id:
+    string | null) -> { ok: true }`, letting a task that turns out not to belong in
+    a release be moved to another release or unassigned entirely, without needing
+    full task-cancellation semantics (deferred — see Item 6).
   - **MCP tools — new `src/mcp/tools/releases.ts`** (mirrors
     `src/mcp/tools/epics.ts`, plus one action tool needing the verifier like
     `registerLifecycleTools` does):
@@ -180,6 +220,8 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
     - `list_releases(project_id) -> { releases: [{ id, version, name, description, status, released_at, total, done, in_progress, blocked, pending, percent }] }`
     - `get_release_status(project_id, release_id) -> { ...same shape... }`
     - `release_it(project_id, release_id, test_command?, force?) -> { ok: true, release_notes, released_at } | not_all_done error | verification_failed error`
+    - `set_task_release(task_id, release_id: string | null) -> { ok: true }`
+    - `set_release_sequence(project_id, release_id, sequence: number) -> { ok: true }`
     - `create_task(s)` and `list_tasks` gain `release_id`/`release_id` filter params,
       same as their existing `epic_id` ones.
   - **Docs:** add `RELEASES` to the architecture doc's ER diagram (own box, FK from
@@ -198,6 +240,89 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
   project this is an easy step to forget.
 - **Direction:** revisit only if this proves a recurring papercut in practice — no
   concrete design yet.
+
+### 6. Task cancellation lifecycle
+
+- **Status:** planned
+- **Priority:** medium
+- **Problem:** There is no way to cancel/abandon a task anywhere in the tracker — a
+  task that turns out unnecessary (requirement dropped, superseded) stays `pending`
+  or `in_progress` forever, with `complete_task` (a dishonest force-complete) as the
+  only way to get it out of everyone's way. This surfaced concretely via Item 4's
+  `release_it`: its "all tasks done" gate is intentionally not skippable by `force`,
+  so a dead task permanently blocks its release (partially mitigated by
+  `set_task_release` letting it be moved out of the release, but that doesn't help
+  `get_next_task`/dependents, which still treat an abandoned task as unresolved
+  forever).
+- **Confirmed with the user:** cancellation reason gets its own
+  `cancellation_reason` column (not shared with `completion_summary` from Item 4 —
+  two distinct single-purpose fields for two distinct lifecycle events). Cancelled
+  tasks get their own bucket in every status aggregation and still count toward
+  `total`; `percent` stays `done / total` unchanged — cancellation is visible, not
+  hidden from the stats.
+- **Design:**
+  - **Data model:** `tasks.status`'s CHECK constraint widens to
+    `CHECK (status IN ('pending', 'in_progress', 'done', 'cancelled'))`, plus a new
+    nullable `cancellation_reason TEXT` column.
+  - **⚠️ Migration is the hard part of this item, not a routine `ensureColumn`.**
+    SQLite bakes a `CHECK` constraint into the table's stored schema permanently —
+    unlike every column added so far, there is no `ALTER TABLE ... ADD COLUMN` that
+    loosens an existing `CHECK`. Every already-existing `~/.task-tracker/tracker.db`
+    has the *old* three-value constraint physically baked into its `tasks` table, so
+    it will keep rejecting `status = 'cancelled'` forever unless the table itself is
+    rebuilt. `runMigrations` needs a genuinely different kind of step for this one:
+    1. Detect whether the rebuild is still needed (e.g. check `sqlite_master`'s
+       stored `CREATE TABLE` text for `tasks` for the substring `'cancelled'`).
+    2. If needed: `db.pragma("foreign_keys = OFF")` first — `task_files`,
+       `task_dependencies`, and `handoff_notes` all have
+       `ON DELETE CASCADE` FKs into `tasks(id)`, so dropping/renaming `tasks` with
+       enforcement still on risks cascading deletes wiping them out mid-migration.
+    3. `ALTER TABLE tasks RENAME TO tasks_old`, `CREATE TABLE tasks (...)` using the
+       *current* full column list from `schema.ts` (every column any earlier
+       migration has already added — `epic_id`, `release_id`, `priority`,
+       `completion_summary`, etc. — plus the widened `CHECK` and the new
+       `cancellation_reason`), `INSERT INTO tasks (<explicit column list>) SELECT
+       <same list> FROM tasks_old`, `DROP TABLE tasks_old`.
+    4. Recreate every index that pointed at the old table
+       (`idx_tasks_project_id`, `idx_tasks_status`, `idx_tasks_epic_id`,
+       `idx_tasks_release_id`, ...) — dropping the old table drops them too.
+    5. `db.pragma("foreign_keys = ON")` again, all of the above wrapped in one
+       transaction.
+    This needs its own dedicated test (not just the existing schema-shape checks in
+    `tests/db.test.ts`): build a DB on the *old* 3-value schema, insert rows, run
+    `runMigrations`, and assert both that old rows/statuses survived intact and that
+    a `cancelled` insert now succeeds.
+  - **Domain — `src/domain/tasks.ts`:** `TaskStatus`/`DisplayStatus` gain
+    `"cancelled"`. `displayStatus` needs no change — it already returns
+    `task.status` as-is for anything other than `'pending'`, so `'cancelled'` flows
+    through untouched.
+  - **Domain — resolution rules:** `hasUnmetDependencies`'s query changes from
+    `t.status != 'done'` to `t.status NOT IN ('done', 'cancelled')`, so a cancelled
+    prerequisite stops blocking its dependents. `get_next_task`'s `all_done`-vs-
+    `all_blocked` decision query gets the same `NOT IN ('done', 'cancelled')` swap.
+    Its *candidate* query (`status = 'pending'`) already excludes `cancelled` tasks
+    with no change needed.
+  - **Domain — `cancelTask(db, task_id, reason?, force?)`** in
+    `src/domain/lifecycle.ts`, right next to `completeTask`/`releaseTask` (reusing
+    their exact conflict-handling shape): rejects an already-`done`/already-
+    `cancelled` task; rejects with the same `TaskConflictError` as
+    `claimTask`/`releaseTask` if another session's lock is still active, unless
+    `force`. Otherwise: sets `status = 'cancelled'`, `cancellation_reason = reason ??
+    null`, and clears `owner_session_id`/`lock_expires_at` (same as `releaseTask` —
+    a cancelled task isn't being worked by anyone). Computes `unblocked_task_ids`
+    with the *same* dependents-scan `completeTask` already does — worth factoring
+    that scan into one shared helper both call, rather than duplicating it.
+  - **Domain — status aggregation:** `ProjectStatus` (and therefore `EpicStatus`/
+    the release equivalent) gets a `cancelled` field; `aggregateStatus` needs no
+    logic change since it already does `counts[status] += 1` from `displayStatus`'s
+    result — adding `cancelled: 0` to the initial counts object is enough.
+  - **Item 4 update required:** `releaseIt`'s "all tasks done" gate changes from
+    "every task is `done`" to "every task is `done` OR `cancelled`" — this is what
+    actually closes that bottleneck for good (see Item 4, step 2).
+  - **MCP:** new tool `cancel_task(task_id, reason?, force?) -> { ok: true,
+    unblocked_task_ids: [...] } | conflict error`. `list_tasks`'s `status` filter
+    enum (`src/mcp/tools/status.ts`) gains `"cancelled"` alongside the existing four
+    values.
 
 ## Implemented
 
@@ -243,3 +368,31 @@ is just an index.
 - Move finished items to a `## Done` section (or just mark `done` and leave them —
   keep whichever is less friction) instead of deleting, so the backlog also reads as
   a changelog of *why* things were built.
+
+## Additional Discussion Topics (auto-review)
+
+### Contradictions
+
+- ~~**Item 4's test gate is optional, not guaranteed.**~~ **Resolved:** `release_it`
+  now rejects unless either `test_command` or `force: true` is given (see Item 4's
+  design, step 3) — omitting both is an error instead of a silent no-op test pass.
+
+### Bottlenecks
+
+- ~~**No escape valve for a release with a task that will never be "done."**~~
+  **Partially resolved:** `set_task_release` (Item 4) lets a dead task be moved out
+  of a release so it stops blocking `release_it`. The underlying problem — no way to
+  cancel a task at all, so it still blocks `get_next_task`/dependents forever — is
+  real and deliberately tracked separately as Item 6 (task cancellation lifecycle),
+  since it's bigger than release grouping and deserves its own design pass.
+- ~~**Release membership can silently drift after `released`.**~~ **Resolved (strict
+  option chosen):** a `released` release's task membership is now frozen —
+  `create_task`/`create_tasks` reject assigning into it, and `set_task_release`
+  rejects moving a task into *or* out of it (see Item 4's design).
+
+### Weakly-justified decisions
+
+- ~~**`listReleases` copies epics' creation-order convention onto a domain that has a
+  real order.**~~ **Resolved:** releases get an explicit `sequence` column
+  (auto-assigned in gaps of 10, manually adjustable via `set_release_sequence`) that
+  `list_releases` orders by instead of `created_at` (see Item 4's design).
