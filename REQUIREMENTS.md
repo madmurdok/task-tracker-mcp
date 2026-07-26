@@ -41,6 +41,15 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
     `Task`.
   - New read-only MCP tool `get_task(task_id) -> TaskDetail` — same builder, no
     claim/lock side effect, so a task can be re-inspected anytime.
+  - **`splitTask` gains a status guard** (closes the auto-review Weakly-justified
+    finding on this): reject with `Cannot split task ${taskId}: already ${status}`
+    if the original task's status is `done` or `cancelled` (the latter once Item 6
+    ships). Today, splitting a finished task is merely pointless; once `cancelled`
+    exists, it would otherwise silently resurrect an abandoned task — deleting its
+    row (losing `cancellation_reason`) and replacing it with fresh `pending`
+    subtasks, with no trace the cancellation ever happened. No `force` override —
+    reviving cancelled work deliberately should be its own explicit action, not a
+    side effect of splitting.
   - Docs: update `docs/architecture/task-tracker-mcp.md`'s Interfaces entries for
     `get_next_task`/`get_task` and the Data Flow diagram (the "task packet" comment
     becomes literally true instead of aspirational).
@@ -54,8 +63,11 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
   with 50+ tasks that's a lot of tool calls just to stand up the initial graph.
 - **Design:**
   - New tool `create_tasks(project_id, tasks: [{ temp_id?, title, description?,
-    acceptance_criteria?, file_paths?, epic_id?, depends_on?: string[] }]) ->
-    { tasks: [{ temp_id?, task_id, estimated_tokens, over_budget }] }`.
+    acceptance_criteria?, file_paths?, epic_id?, release_id?, priority?,
+    depends_on?: string[] }]) -> { tasks: [{ temp_id?, task_id, estimated_tokens,
+    over_budget }] }` — `release_id`/`priority` kept in sync with what Items 3 and 4
+    each add to `create_task` itself (closes the auto-review Contradictions finding
+    on this spec going stale relative to those two items).
   - `temp_id` is an arbitrary client-chosen string scoped to the batch, letting a
     task's `depends_on` reference a sibling created earlier in the *same* call
     before it has a real id; an entry in `depends_on` that isn't a known `temp_id`
@@ -200,7 +212,11 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
        straight reuse.
     4. Build release notes from every `done` task in the release:
        `- {title}: {completion_summary}` (omit the `: ...` part when a task has no
-       summary), ordered by `updated_at` (completion order).
+       summary), ordered by `updated_at` (completion order). Once Item 6 ships and a
+       release can close with `cancelled` tasks in it too, append a second
+       `Cancelled:` section listing them the same way (`- {title}: {reason}`) — so
+       the notes surface what was dropped, not just what shipped (closes the
+       auto-review Weakly-justified finding on this).
     5. In one transaction: `UPDATE releases SET status = 'released', release_notes =
        ?, released_at = ? WHERE id = ?`.
     6. Returns `{ ok: true, release_notes, released_at }`.
@@ -263,35 +279,55 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 - **Design:**
   - **Data model:** `tasks.status`'s CHECK constraint widens to
     `CHECK (status IN ('pending', 'in_progress', 'done', 'cancelled'))`, plus a new
-    nullable `cancellation_reason TEXT` column.
-  - **⚠️ Migration is the hard part of this item, not a routine `ensureColumn`.**
-    SQLite bakes a `CHECK` constraint into the table's stored schema permanently —
-    unlike every column added so far, there is no `ALTER TABLE ... ADD COLUMN` that
-    loosens an existing `CHECK`. Every already-existing `~/.task-tracker/tracker.db`
-    has the *old* three-value constraint physically baked into its `tasks` table, so
-    it will keep rejecting `status = 'cancelled'` forever unless the table itself is
-    rebuilt. `runMigrations` needs a genuinely different kind of step for this one:
+    nullable `cancellation_reason TEXT` column. `cancellation_reason` itself is added
+    as an ordinary `ensureColumn` step, same as every other column in this doc —
+    kept entirely separate from (and running *before*) the CHECK-widening rebuild
+    below, so the rebuild's own data copy has a real source column to read from
+    (closes the auto-review Contradictions finding on this — the rebuild's `INSERT
+    ... SELECT` can't select a column `tasks_old` was never given).
+  - **⚠️ The CHECK-constraint rebuild is the hard part of this item, not a routine
+    `ensureColumn`.** SQLite bakes a `CHECK` constraint into the table's stored
+    schema permanently — unlike every column added so far, there is no
+    `ALTER TABLE ... ADD COLUMN` that loosens an existing `CHECK`. Every
+    already-existing `~/.task-tracker/tracker.db` has the *old* three-value
+    constraint physically baked into its `tasks` table, so it will keep rejecting
+    `status = 'cancelled'` forever unless the table itself is rebuilt.
+    `runMigrations` needs a genuinely different kind of step for this one:
     1. Detect whether the rebuild is still needed (e.g. check `sqlite_master`'s
        stored `CREATE TABLE` text for `tasks` for the substring `'cancelled'`).
-    2. If needed: `db.pragma("foreign_keys = OFF")` first — `task_files`,
-       `task_dependencies`, and `handoff_notes` all have
+    2. If needed, run the whole rebuild as one `better-sqlite3`
+       `db.transaction(fn).immediate()` call — `.immediate()` acquires SQLite's
+       write lock (`BEGIN IMMEDIATE`) up front instead of lazily, so a second
+       process (the MCP server *and* the Status CLI both call `openDatabase()`
+       independently, per the architecture doc) can't race through its own
+       `RENAME`/`CREATE`/`DROP` sequence at the same time (closes the auto-review
+       Bottleneck finding on this). Pair with `db.pragma('busy_timeout = 5000')` at
+       connection-open time so the second process *waits* for the lock instead of
+       failing immediately with `SQLITE_BUSY` — it then re-enters the transaction,
+       re-runs the "already migrated?" check from step 1, sees it's now `true`, and
+       no-ops.
+    3. Inside that transaction: `db.pragma("foreign_keys = OFF")` first —
+       `task_files`, `task_dependencies`, and `handoff_notes` all have
        `ON DELETE CASCADE` FKs into `tasks(id)`, so dropping/renaming `tasks` with
        enforcement still on risks cascading deletes wiping them out mid-migration.
-    3. `ALTER TABLE tasks RENAME TO tasks_old`, `CREATE TABLE tasks (...)` using the
+    4. `ALTER TABLE tasks RENAME TO tasks_old`, `CREATE TABLE tasks (...)` using the
        *current* full column list from `schema.ts` (every column any earlier
        migration has already added — `epic_id`, `release_id`, `priority`,
-       `completion_summary`, etc. — plus the widened `CHECK` and the new
-       `cancellation_reason`), `INSERT INTO tasks (<explicit column list>) SELECT
-       <same list> FROM tasks_old`, `DROP TABLE tasks_old`.
-    4. Recreate every index that pointed at the old table
+       `completion_summary`, `cancellation_reason`, etc. — plus the widened
+       `CHECK`), `INSERT INTO tasks (<explicit column list>) SELECT <same list>
+       FROM tasks_old` (valid now that every one of those columns, including
+       `cancellation_reason`, already exists on `tasks_old`), `DROP TABLE
+       tasks_old`.
+    5. Recreate every index that pointed at the old table
        (`idx_tasks_project_id`, `idx_tasks_status`, `idx_tasks_epic_id`,
        `idx_tasks_release_id`, ...) — dropping the old table drops them too.
-    5. `db.pragma("foreign_keys = ON")` again, all of the above wrapped in one
-       transaction.
+    6. `db.pragma("foreign_keys = ON")` again, still inside the same transaction.
     This needs its own dedicated test (not just the existing schema-shape checks in
     `tests/db.test.ts`): build a DB on the *old* 3-value schema, insert rows, run
     `runMigrations`, and assert both that old rows/statuses survived intact and that
-    a `cancelled` insert now succeeds.
+    a `cancelled` insert now succeeds. Worth a second test simulating two concurrent
+    `openDatabase()` calls against the same pre-migration file to confirm the second
+    one waits and no-ops rather than erroring.
   - **Domain — `src/domain/tasks.ts`:** `TaskStatus`/`DisplayStatus` gain
     `"cancelled"`. `displayStatus` needs no change — it already returns
     `task.status` as-is for anything other than `'pending'`, so `'cancelled'` flows
@@ -373,52 +409,27 @@ is just an index.
 
 ### Contradictions
 
-- **Item 6's migration copies a column that can't exist yet on the source table.**
-  Step 3 says `INSERT INTO tasks (<explicit column list>) SELECT <same list> FROM
-  tasks_old`, with the column list explicitly including the new
-  `cancellation_reason`. But `tasks_old` is just the pre-migration table renamed in
-  place — it was never `ALTER TABLE ... ADD COLUMN cancellation_reason`'d, so it
-  doesn't have that column to select. As written, this `INSERT` would fail. The
-  fix is straightforward and actually simplifies the item: add
-  `cancellation_reason` as an ordinary `ensureColumn` step (like every other column
-  in this doc) *before* the rebuild, so `tasks_old` already has it by the time the
-  rebuild copies data — decoupling "add a nullable column" (routine) from "widen the
-  CHECK constraint" (the genuinely risky part) shrinks the risky step to just the
-  latter.
-- **Item 2's `create_tasks` spec is now stale relative to Items 3 and 4.** Item 2's
-  own type signature only lists `{ temp_id?, title, description?,
-  acceptance_criteria?, file_paths?, epic_id?, depends_on? }` per task. But Item 3
-  says "`create_task`/`create_tasks` accept an optional `priority`," and Item 4 says
-  "`create_task(s)` ... gain `release_id`" — both explicitly claim `create_tasks`
-  gains a field, yet neither edited Item 2's written spec to actually show
-  `priority?`/`release_id?` in the per-task shape. Whoever implements Item 2 first
-  (per its own text, in isolation) would ship a batch-creation tool two fields short
-  of what Items 3 and 4 already assume it has.
+- ~~**Item 6's migration copies a column that can't exist yet on the source
+  table.**~~ **Resolved:** `cancellation_reason` is now added via a routine
+  `ensureColumn` step *before* the CHECK-widening rebuild (see Item 6's Data model),
+  so the rebuild's `INSERT ... SELECT` has a real source column to read.
+- ~~**Item 2's `create_tasks` spec is now stale relative to Items 3 and 4.**~~
+  **Resolved:** Item 2's `create_tasks` spec now includes `release_id?`/`priority?`
+  directly.
 
 ### Bottlenecks
 
-- **The CHECK-constraint rebuild (Item 6) assumes a single writer touching the DB
-  during migration, but this project already has two.** `runMigrations` runs on
-  every `openDatabase()` call, and per the architecture doc this file is opened
-  independently by both the MCP server *and* the standalone Status CLI
-  (`node dist/cli/status.js`) — a documented, intended multi-process setup, not the
-  "distributed systems" case the project's non-goals exclude. The rebuild's
-  `RENAME` → `CREATE` → `INSERT` → `DROP` sequence is far less forgiving of two
-  processes racing through it at once than every previous migration step (plain
-  `ADD COLUMN`/`CREATE ... IF NOT EXISTS`, both naturally idempotent). If the MCP
-  server and a `status` CLI invocation both start right after an upgrade and both
-  see "rebuild needed," one can be left holding a half-finished `tasks_old` or
-  hitting a "table already exists" error mid-sequence. Not addressed by the current
-  design.
+- ~~**The CHECK-constraint rebuild (Item 6) assumes a single writer touching the DB
+  during migration, but this project already has two.**~~ **Resolved:** the rebuild
+  runs inside a `db.transaction(fn).immediate()` (acquires the write lock up front)
+  paired with `busy_timeout = 5000`, so a second process waits for the first to
+  finish and then no-ops instead of racing (see Item 6's design).
 
 ### Weakly-justified decisions
 
-- **Release notes still only look at `done` tasks, but a release can now close with
-  `cancelled` ones in it too.** Item 6 changes `release_it`'s gate from "every task
-  `done`" to "every task `done` or `cancelled`" (its own stated goal), but Item 4's
-  notes-generation step (step 4) was written before Item 6 existed and still only
-  iterates `done` tasks. The result: a release that shipped 5 of 7 originally-scoped
-  tasks (2 cancelled) generates notes that read like only 5 were ever planned —
-  nothing in the notes surfaces that something was dropped. Reasonable as an MVP
-  choice, but it's an artifact of write-order between the two items rather than a
-  considered decision.
+- ~~**Release notes still only look at `done` tasks, but a release can now close
+  with `cancelled` ones in it too.**~~ **Resolved:** `releaseIt` now appends a
+  `Cancelled:` section to the generated notes (see Item 4, step 4).
+- ~~**`split_task` has no status guard, and Item 6 makes that consequential.**~~
+  **Resolved:** `splitTask` now rejects `done`/`cancelled` originals outright (see
+  Item 1's design).
