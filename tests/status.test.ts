@@ -3,7 +3,8 @@ import { openDatabase } from "../src/db/connection.js";
 import { createProject } from "../src/domain/projects.js";
 import { createTask } from "../src/domain/tasks.js";
 import { addDependency } from "../src/domain/dependencies.js";
-import { getNextTask, getProjectStatus, listTasks } from "../src/domain/status.js";
+import { getNextTask, getProjectStatus, getTaskDetail, listTasks } from "../src/domain/status.js";
+import { addHandoffNote } from "../src/domain/handoffNotes.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 
 const noopEstimator: BudgetEstimator = { estimateTokens: () => 0 };
@@ -12,7 +13,7 @@ function setup() {
   const db = openDatabase(":memory:");
   const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
   const makeTask = (title: string) =>
-    createTask(db, noopEstimator, { project_id: project.id, title }).task;
+    createTask(db, noopEstimator, { project_id: project.id, title, complexity_hint: "normal" }).task;
   return { db, project, makeTask };
 }
 
@@ -38,6 +39,35 @@ describe("getNextTask", () => {
     expect(first.task).toBeTruthy();
     expect(second.task).toBeTruthy();
     expect(first.task?.id).not.toBe(second.task?.id);
+  });
+
+  it("prefers a higher-priority task over an older, lower-priority one", () => {
+    const { db, project } = setup();
+    createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Low priority, created first",
+      complexity_hint: "normal",
+    });
+    const { task: highPriority } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "High priority, created second",
+      complexity_hint: "normal",
+      priority: 10,
+    });
+
+    const result = getNextTask(db, project.id);
+
+    expect(result.task?.id).toBe(highPriority.id);
+  });
+
+  it("falls back to creation order when priorities are equal (the default)", () => {
+    const { db, project, makeTask } = setup();
+    const a = makeTask("A");
+    makeTask("B");
+
+    const result = getNextTask(db, project.id);
+
+    expect(result.task?.id).toBe(a.id);
   });
 
   it("skips a task whose dependency is unmet and reports all_blocked", () => {
@@ -135,7 +165,15 @@ describe("listTasks / getProjectStatus", () => {
     expect(bSummary?.status).toBe("blocked");
 
     const status = getProjectStatus(db, project.id);
-    expect(status).toEqual({ total: 2, done: 0, in_progress: 0, blocked: 1, pending: 1, percent: 0 });
+    expect(status).toEqual({
+      total: 2,
+      done: 0,
+      in_progress: 0,
+      blocked: 1,
+      pending: 1,
+      cancelled: 0,
+      percent: 0,
+    });
   });
 
   it("filters list_tasks by status", () => {
@@ -148,5 +186,49 @@ describe("listTasks / getProjectStatus", () => {
 
     const doneOnly = listTasks(db, project.id, "done");
     expect(doneOnly).toHaveLength(0);
+  });
+});
+
+describe("getTaskDetail", () => {
+  it("returns the task's file_paths and handoff_notes alongside its own fields", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Build the thing",
+      file_paths: ["src/a.ts"],
+      complexity_hint: "normal",
+    });
+    addHandoffNote(db, {
+      task_id: task.id,
+      session_id: "session-1",
+      decisions: "used better-sqlite3",
+    });
+
+    const detail = getTaskDetail(db, task.id);
+
+    expect(detail).toMatchObject({
+      id: task.id,
+      title: "Build the thing",
+      file_paths: ["src/a.ts"],
+    });
+    expect(detail.handoff_notes).toMatchObject([
+      { task_id: task.id, session_id: "session-1", decisions: "used better-sqlite3" },
+    ]);
+  });
+
+  it("returns empty arrays for a task with no files or handoff notes", () => {
+    const { db, makeTask } = setup();
+    const task = makeTask("Solo");
+
+    const detail = getTaskDetail(db, task.id);
+
+    expect(detail.file_paths).toEqual([]);
+    expect(detail.handoff_notes).toEqual([]);
+  });
+
+  it("throws for an unknown task_id", () => {
+    const db = openDatabase(":memory:");
+    expect(() => getTaskDetail(db, "missing")).toThrow(/Unknown task_id: missing/);
   });
 });

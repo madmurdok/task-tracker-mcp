@@ -18,6 +18,10 @@ export function openDatabase(dbPath: string = defaultDbPath()): Database.Databas
 
   const db = new Database(dbPath);
   db.pragma("foreign_keys = ON");
+  // Lets a writer that loses a lock race (e.g. schema.ts's widenTaskStatusCheck
+  // rebuild, run independently by both this server and the Status CLI) wait
+  // for the winner to finish instead of failing immediately with SQLITE_BUSY.
+  db.pragma("busy_timeout = 5000");
   if (dbPath !== ":memory:") {
     db.pragma("journal_mode = WAL");
   }

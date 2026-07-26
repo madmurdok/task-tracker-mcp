@@ -11,7 +11,11 @@ const noopEstimator: BudgetEstimator = { estimateTokens: () => 0 };
 function setup() {
   const db = openDatabase(":memory:");
   const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
-  const { task } = createTask(db, noopEstimator, { project_id: project.id, title: "Solo task" });
+  const { task } = createTask(db, noopEstimator, {
+    project_id: project.id,
+    title: "Solo task",
+    complexity_hint: "normal",
+  });
   return { db, project, task };
 }
 

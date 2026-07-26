@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DatabaseInstance } from "../../db/connection.js";
 import { addHandoffNote } from "../../domain/handoffNotes.js";
 import {
+  cancelTask,
   claimTask,
   completeTask,
   CompletionVerificationError,
@@ -102,13 +103,42 @@ export function registerLifecycleTools(
         force: z.boolean().optional(),
       },
     },
-    async ({ task_id, test_command, force }) => {
+    async ({ task_id, summary, test_command, force }) => {
       let result;
       try {
-        result = completeTask(db, verifier, { task_id, test_command, force });
+        result = completeTask(db, verifier, { task_id, summary, test_command, force });
       } catch (error) {
         if (error instanceof CompletionVerificationError) {
           return verificationFailedResult({ message: error.message, reason: error.reason });
+        }
+        throw error;
+      }
+      return jsonResult({ ok: true, ...result });
+    },
+  );
+
+  server.registerTool(
+    "cancel_task",
+    {
+      description:
+        "Abandon a task that turns out unnecessary, instead of dishonestly force-completing it. Unblocks dependents the same way complete_task does. Rejects with a conflict error if another session's lock on it is still active, unless force is given.",
+      inputSchema: {
+        task_id: z.string().min(1),
+        reason: z.string().optional(),
+        force: z.boolean().optional(),
+      },
+    },
+    async ({ task_id, reason, force }) => {
+      let result;
+      try {
+        result = cancelTask(db, { task_id, reason, force });
+      } catch (error) {
+        if (error instanceof TaskConflictError) {
+          return conflictResult({
+            message: error.message,
+            current_owner_session_id: error.currentOwnerSessionId,
+            lock_expires_at: error.lockExpiresAt,
+          });
         }
         throw error;
       }

@@ -1,5 +1,7 @@
 import type { DatabaseInstance } from "../db/connection.js";
-import { hasUnmetDependencies, LOCK_LEASE_MS } from "./status.js";
+import { requireProject } from "./projects.js";
+import { requireRelease } from "./releases.js";
+import { findUnblockedDependents, LOCK_LEASE_MS } from "./status.js";
 import type { CompletionVerifier } from "./verification.js";
 
 /**
@@ -119,6 +121,7 @@ export interface CompleteTaskResult {
 
 export interface CompleteTaskInput {
   task_id: string;
+  summary?: string;
   test_command?: string;
   force?: boolean;
 }
@@ -144,7 +147,7 @@ export function completeTask(
   verifier: CompletionVerifier,
   input: CompleteTaskInput,
 ): CompleteTaskResult {
-  const { task_id: taskId, test_command: testCommand, force = false } = input;
+  const { task_id: taskId, summary, test_command: testCommand, force = false } = input;
 
   const task = db.prepare(`SELECT project_id FROM tasks WHERE id = ?`).get(taskId) as
     | { project_id: string }
@@ -173,25 +176,184 @@ export function completeTask(
   }
 
   const run = db.transaction((): CompleteTaskResult => {
-    db.prepare(`UPDATE tasks SET status = 'done', updated_at = ? WHERE id = ?`).run(
-      new Date().toISOString(),
-      taskId,
+    db.prepare(
+      `UPDATE tasks SET status = 'done', completion_summary = ?, updated_at = ? WHERE id = ?`,
+    ).run(summary ?? null, new Date().toISOString(), taskId);
+
+    return { unblocked_task_ids: findUnblockedDependents(db, taskId) };
+  });
+
+  return run();
+}
+
+/**
+ * Raised when release_it's "every task done or cancelled" gate isn't met.
+ * Deliberately not skippable by `force` (see ReleaseItInput) - unlike a
+ * missing/failing test gate, shipping unfinished work isn't something to
+ * override.
+ */
+export class ReleaseNotAllDoneError extends Error {
+  constructor(
+    message: string,
+    public readonly pendingTaskIds: string[],
+  ) {
+    super(message);
+    this.name = "ReleaseNotAllDoneError";
+  }
+}
+
+export interface ReleaseItInput {
+  project_id: string;
+  release_id: string;
+  test_command?: string;
+  force?: boolean;
+}
+
+export interface ReleaseItResult {
+  release_notes: string;
+  released_at: string;
+}
+
+/**
+ * Ships a release: gates on every one of its tasks being done or cancelled
+ * (not force-skippable), then on a test run (force-skippable, but not
+ * silently - test_command is required unless force is given, so omitting
+ * both is an error rather than a no-op pass), then generates release notes
+ * from the done tasks (plus a Cancelled section for cancelled ones) and marks
+ * the release released. One-shot, like complete_task has no "un-complete."
+ *
+ * Reuses the same CompletionVerifier complete_task uses - filePaths: [] skips
+ * its git-diff check entirely (see GitDiffCompletionVerifier.verify), running
+ * only testCommand, so no separate "release verifier" abstraction is needed.
+ * Both the missing-test_command and the failed-test_command cases surface as
+ * CompletionVerificationError, matching complete_task's verification_failed
+ * shape at the MCP layer.
+ */
+export function releaseIt(
+  db: DatabaseInstance,
+  verifier: CompletionVerifier,
+  input: ReleaseItInput,
+): ReleaseItResult {
+  const { project_id: projectRef, release_id: releaseRef, test_command: testCommand, force = false } = input;
+
+  const project = requireProject(db, projectRef);
+  const release = requireRelease(db, project.id, releaseRef);
+
+  if (release.status === "released") {
+    throw new Error(`Release ${releaseRef} is already released`);
+  }
+
+  const notDone = db
+    .prepare(`SELECT id FROM tasks WHERE release_id = ? AND status NOT IN ('done', 'cancelled')`)
+    .all(release.id) as Array<{ id: string }>;
+  if (notDone.length > 0) {
+    throw new ReleaseNotAllDoneError(
+      `Release ${releaseRef} has ${notDone.length} task(s) not done or cancelled`,
+      notDone.map((t) => t.id),
     );
+  }
 
-    const dependents = db
-      .prepare(`SELECT DISTINCT task_id FROM task_dependencies WHERE depends_on_task_id = ?`)
-      .all(taskId) as Array<{ task_id: string }>;
+  if (!force) {
+    if (!testCommand) {
+      throw new CompletionVerificationError(
+        "release_it requires a test_command or force:true to skip the test gate",
+        "test_command required unless force is given",
+      );
+    }
+    const result = verifier.verify({ rootPath: project.root_path, filePaths: [], testCommand });
+    if (!result.passed) {
+      throw new CompletionVerificationError(
+        `Test gate failed for release ${releaseRef}: ${result.reason}`,
+        result.reason,
+      );
+    }
+  }
 
-    const unblocked = dependents
-      .filter((dep) => {
-        const dependentTask = db
-          .prepare(`SELECT status FROM tasks WHERE id = ?`)
-          .get(dep.task_id) as { status: string } | undefined;
-        return dependentTask?.status === "pending" && !hasUnmetDependencies(db, dep.task_id);
-      })
-      .map((dep) => dep.task_id);
+  const doneTasks = db
+    .prepare(
+      `SELECT title, completion_summary FROM tasks WHERE release_id = ? AND status = 'done' ORDER BY updated_at ASC`,
+    )
+    .all(release.id) as Array<{ title: string; completion_summary: string | null }>;
+  const cancelledTasks = db
+    .prepare(
+      `SELECT title, cancellation_reason FROM tasks WHERE release_id = ? AND status = 'cancelled' ORDER BY updated_at ASC`,
+    )
+    .all(release.id) as Array<{ title: string; cancellation_reason: string | null }>;
 
-    return { unblocked_task_ids: unblocked };
+  let notes = doneTasks
+    .map((t) => `- ${t.title}${t.completion_summary ? `: ${t.completion_summary}` : ""}`)
+    .join("\n");
+  if (cancelledTasks.length > 0) {
+    const cancelledLines = cancelledTasks
+      .map((t) => `- ${t.title}${t.cancellation_reason ? `: ${t.cancellation_reason}` : ""}`)
+      .join("\n");
+    notes += `${notes ? "\n\n" : ""}Cancelled:\n${cancelledLines}`;
+  }
+
+  const releasedAt = new Date().toISOString();
+
+  const run = db.transaction(() => {
+    db.prepare(
+      `UPDATE releases SET status = 'released', release_notes = ?, released_at = ? WHERE id = ?`,
+    ).run(notes, releasedAt, release.id);
+  });
+  run();
+
+  return { release_notes: notes, released_at: releasedAt };
+}
+
+export interface CancelTaskInput {
+  task_id: string;
+  reason?: string;
+  force?: boolean;
+}
+
+export interface CancelTaskResult {
+  unblocked_task_ids: string[];
+}
+
+/**
+ * Abandons a task that turns out unnecessary, without the dishonesty of a
+ * force-completed complete_task call. Clears ownership/lock the same way
+ * releaseTask does (a cancelled task isn't being worked by anyone), and
+ * unblocks dependents the same way completeTask does - a cancelled
+ * prerequisite is resolved, not stuck, from a dependent's point of view (see
+ * hasUnmetDependencies in status.ts). There's no session_id parameter here
+ * (unlike claim/release), so the conflict check is owner-agnostic: any active
+ * lock blocks a plain cancel_task call, `force` overrides it regardless of
+ * who holds it.
+ */
+export function cancelTask(db: DatabaseInstance, input: CancelTaskInput): CancelTaskResult {
+  const { task_id: taskId, reason, force = false } = input;
+  const now = new Date().toISOString();
+
+  const run = db.transaction((): CancelTaskResult => {
+    const task = db
+      .prepare(`SELECT status, owner_session_id, lock_expires_at FROM tasks WHERE id = ?`)
+      .get(taskId) as
+      | { status: string; owner_session_id: string | null; lock_expires_at: string | null }
+      | undefined;
+
+    if (!task) {
+      throw new Error(`Unknown task_id: ${taskId}`);
+    }
+    if (task.status === "done" || task.status === "cancelled") {
+      throw new Error(`Task ${taskId} is already ${task.status}, nothing to cancel`);
+    }
+
+    if (!force && task.owner_session_id !== null && isLockActive(task.lock_expires_at, now)) {
+      throw new TaskConflictError(
+        `Task ${taskId} is currently held by session ${task.owner_session_id}; pass force to override`,
+        task.owner_session_id,
+        task.lock_expires_at,
+      );
+    }
+
+    db.prepare(
+      `UPDATE tasks SET status = 'cancelled', cancellation_reason = ?, owner_session_id = NULL, lock_expires_at = NULL, updated_at = ? WHERE id = ?`,
+    ).run(reason ?? null, now, taskId);
+
+    return { unblocked_task_ids: findUnblockedDependents(db, taskId) };
   });
 
   return run();

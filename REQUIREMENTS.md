@@ -12,7 +12,7 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 
 ### 1. Task detail packet: `get_task` + `get_next_task` returns file_paths & handoff_notes
 
-- **Status:** planned
+- **Status:** done (see Implemented, v4)
 - **Priority:** high
 - **Problem:** The architecture doc's data flow explicitly promises a "compact task
   packet (files, acceptance criteria, prior handoff notes)" from `get_next_task`, but
@@ -56,7 +56,7 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 
 ### 2. Bulk task creation for initial planning
 
-- **Status:** planned
+- **Status:** done (see Implemented, v4)
 - **Priority:** medium
 - **Problem:** Planning a large design doc into the graph means one `create_task`
   MCP round-trip per task (plus one `add_dependency` call per edge) — for a project
@@ -84,7 +84,7 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 
 ### 3. Priority hint for `get_next_task`
 
-- **Status:** planned
+- **Status:** done (see Implemented, v4)
 - **Priority:** low
 - **Problem:** `get_next_task` always picks the oldest unblocked pending task
   (`ORDER BY created_at ASC`). On a large project with many tasks unblocked at once
@@ -109,7 +109,7 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 
 ### 4. Release grouping (version-based), with a release-time test gate and auto-generated release notes
 
-- **Status:** planned
+- **Status:** done (see Implemented, v4)
 - **Priority:** high
 - **Problem:** On a large project, tasks need a second, orthogonal grouping besides
   Epic: a **release** ("0.1", "0.2", "2.6", ...) — an explicitly-numbered bucket of
@@ -260,7 +260,7 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 
 ### 6. Task cancellation lifecycle
 
-- **Status:** planned
+- **Status:** done (see Implemented, v4)
 - **Priority:** medium
 - **Problem:** There is no way to cancel/abandon a task anywhere in the tracker — a
   task that turns out unnecessary (requirement dropped, superseded) stays `pending`
@@ -375,7 +375,7 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 
 ### 7. Mandatory complexity hint on task creation (for opus-subagent delegation)
 
-- **Status:** planned
+- **Status:** done (see Implemented, v4)
 - **Priority:** medium
 - **Problem:** Claude Code has an `opus` subagent meant for unusually hard work
   (deep debugging, tricky refactors, architectural trade-offs, multi-step
@@ -453,6 +453,32 @@ is just an index.
   per-project-unique name, aggregate task status counts on read, and are inherited by
   a task's subtasks on `split_task`. Epics do **not** enter the dependency graph and
   `get_next_task` is not epic-aware (an explicit non-goal, see architecture doc).
+- **v4 — task detail packet** (`get_task`, enriched `get_next_task`): both return
+  `file_paths`/`handoff_notes` alongside the task row; `get_task` has no claim/lock
+  side effect. `split_task` now rejects an already-`done`/`cancelled` original.
+- **v4 — mandatory complexity_hint** (`create_task`/`create_tasks`/`split_task`):
+  `complexity_hint: "normal" | "high"` is required at creation (inherited,
+  overridable, on split) — see the project's `CLAUDE.md` for how this drives
+  opus-subagent delegation.
+- **v4 — priority** (`set_task_priority`, `priority` on `create_task`/`create_tasks`):
+  `get_next_task` orders candidates `priority DESC, created_at ASC`; default `0`
+  keeps pure creation-order behavior unless priorities are actually set.
+- **v4 — task cancellation** (`cancel_task`): abandons a task without a dishonest
+  force-completion; unblocks dependents the same way `complete_task` does;
+  `cancelled` is a full `status` value (required a one-time table-rebuild migration
+  for already-existing DBs, since SQLite bakes `CHECK` constraints in permanently).
+- **v4 — releases** (`create_release`, `list_releases`, `get_release_status`,
+  `release_it`, `set_task_release`, `set_release_sequence`, `release_id` on
+  `create_task`/`create_tasks`/`list_tasks`): version-based grouping orthogonal to
+  epics. `release_it` gates on every task being `done`/`cancelled` (not
+  force-skippable) then on a required `test_command` (or explicit `force`) run
+  through the same Completion Verifier `complete_task` uses, and generates
+  `release_notes` from `completion_summary`/`cancellation_reason`. A `released`
+  release's task membership is frozen. Releases, like epics, don't enter the
+  dependency graph and aren't `get_next_task`-aware.
+- **v4 — bulk task creation** (`create_tasks`): plans a whole batch (e.g. from a
+  design doc) in one call, with `temp_id`-based cross-references for
+  same-batch dependency edges; whole batch rolls back together on any error.
 
 ## How to use this file
 

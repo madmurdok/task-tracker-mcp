@@ -109,6 +109,7 @@ describe("completeTask against a real project + a real git repo", () => {
       project_id: project.id,
       title: "Add a config file",
       file_paths: ["config.json"],
+      complexity_hint: "normal",
     });
 
     expect(() => completeTask(db, verifier, { task_id: task.id })).toThrow(
@@ -131,6 +132,7 @@ describe("completeTask against a real project + a real git repo", () => {
       project_id: project.id,
       title: "Add a config file",
       file_paths: ["config.json"],
+      complexity_hint: "normal",
     });
     writeFileSync(path.join(dir, "config.json"), "{}\n");
 

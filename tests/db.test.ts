@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { openDatabase } from "../src/db/connection.js";
 
 describe("openDatabase", () => {
-  it("creates all six schema tables", () => {
+  it("creates all seven schema tables", () => {
     const db = openDatabase(":memory:");
 
     const tables = db
@@ -14,6 +14,7 @@ describe("openDatabase", () => {
       "epics",
       "handoff_notes",
       "projects",
+      "releases",
       "task_dependencies",
       "task_files",
       "tasks",

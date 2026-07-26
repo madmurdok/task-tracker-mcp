@@ -1,10 +1,10 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DatabaseInstance } from "../../db/connection.js";
-import { getNextTask, getProjectStatus, listTasks } from "../../domain/status.js";
+import { getNextTask, getProjectStatus, getTaskDetail, listTasks } from "../../domain/status.js";
 import { jsonResult } from "../toolResult.js";
 
-const statusEnum = z.enum(["pending", "in_progress", "blocked", "done"]);
+const statusEnum = z.enum(["pending", "in_progress", "blocked", "done", "cancelled"]);
 
 export function registerStatusTools(server: McpServer, db: DatabaseInstance): void {
   server.registerTool(
@@ -21,15 +21,26 @@ export function registerStatusTools(server: McpServer, db: DatabaseInstance): vo
     "list_tasks",
     {
       description:
-        "List tasks for a project as compact summary rows, optionally filtered by status and/or epic. project_id accepts a project id or its unique name; epic_id accepts an epic id or its name within that project.",
+        "List tasks for a project as compact summary rows, optionally filtered by status, epic, and/or release (combinable). project_id accepts a project id or its unique name; epic_id accepts an epic id or its name within that project; release_id accepts a release id or its version within that project.",
       inputSchema: {
         project_id: z.string().min(1),
         status: statusEnum.optional(),
         epic_id: z.string().optional(),
+        release_id: z.string().optional(),
       },
     },
-    async ({ project_id, status, epic_id }) =>
-      jsonResult({ tasks: listTasks(db, project_id, status, epic_id) }),
+    async ({ project_id, status, epic_id, release_id }) =>
+      jsonResult({ tasks: listTasks(db, project_id, status, epic_id, release_id) }),
+  );
+
+  server.registerTool(
+    "get_task",
+    {
+      description:
+        "Fetch a single task's full detail (including file_paths and handoff_notes) by id, with no claim/lock side effect - unlike get_next_task, safe to call anytime just to re-inspect a task.",
+      inputSchema: { task_id: z.string().min(1) },
+    },
+    async ({ task_id }) => jsonResult(getTaskDetail(db, task_id)),
   );
 
   server.registerTool(

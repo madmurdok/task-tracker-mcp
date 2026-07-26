@@ -11,7 +11,7 @@ function setup() {
   const db = openDatabase(":memory:");
   const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
   const makeTask = (title: string) =>
-    createTask(db, noopEstimator, { project_id: project.id, title }).task;
+    createTask(db, noopEstimator, { project_id: project.id, title, complexity_hint: "normal" }).task;
   return { db, makeTask };
 }
 

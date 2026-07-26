@@ -103,6 +103,7 @@ describe("createTask with epic_id", () => {
       project_id: project.id,
       epic_id: epic.id,
       title: "Add login form",
+      complexity_hint: "normal",
     });
 
     expect(task.epic_id).toBe(epic.id);
@@ -116,6 +117,7 @@ describe("createTask with epic_id", () => {
       project_id: project.id,
       epic_id: "Auth rework",
       title: "Add login form",
+      complexity_hint: "normal",
     });
 
     expect(task.epic_id).toBe(epic.id);
@@ -124,7 +126,12 @@ describe("createTask with epic_id", () => {
   it("rejects an unknown epic_id", () => {
     const { db, project } = setup();
     expect(() =>
-      createTask(db, noopEstimator, { project_id: project.id, epic_id: "missing", title: "x" }),
+      createTask(db, noopEstimator, {
+        project_id: project.id,
+        epic_id: "missing",
+        title: "x",
+        complexity_hint: "normal",
+      }),
     ).toThrow(/Unknown epic: missing/);
   });
 
@@ -138,13 +145,18 @@ describe("createTask with epic_id", () => {
         project_id: project.id,
         epic_id: otherEpic.id,
         title: "x",
+        complexity_hint: "normal",
       }),
     ).toThrow(/Unknown epic/);
   });
 
   it("defaults epic_id to null when not given", () => {
     const { db, project } = setup();
-    const { task } = createTask(db, noopEstimator, { project_id: project.id, title: "No epic" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "No epic",
+      complexity_hint: "normal",
+    });
     expect(task.epic_id).toBeNull();
   });
 });
@@ -159,9 +171,20 @@ describe("getEpicStatus / listEpicsWithStatus", () => {
       project_id: project.id,
       epic_id: epic.id,
       title: "A",
+      complexity_hint: "normal",
     }).task;
-    createTask(db, noopEstimator, { project_id: project.id, epic_id: epic.id, title: "B (blocked)" });
-    createTask(db, noopEstimator, { project_id: project.id, epic_id: outsideEpic.id, title: "Outside" });
+    createTask(db, noopEstimator, {
+      project_id: project.id,
+      epic_id: epic.id,
+      title: "B (blocked)",
+      complexity_hint: "normal",
+    });
+    createTask(db, noopEstimator, {
+      project_id: project.id,
+      epic_id: outsideEpic.id,
+      title: "Outside",
+      complexity_hint: "normal",
+    });
 
     const b = db.prepare("SELECT id FROM tasks WHERE title = ?").get("B (blocked)") as { id: string };
     db.prepare("INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES (?, ?)").run(
@@ -197,12 +220,24 @@ describe("listTasks epic_id filter", () => {
       project_id: project.id,
       epic_id: epic.id,
       title: "In epic",
+      complexity_hint: "normal",
     }).task;
-    const outside = createTask(db, noopEstimator, { project_id: project.id, title: "Outside" }).task;
+    const outside = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Outside",
+      complexity_hint: "normal",
+    }).task;
 
     const filtered = listTasks(db, project.id, undefined, epic.id);
     expect(filtered).toEqual([
-      { id: inEpic.id, title: "In epic", status: "pending", estimated_tokens: 0, epic_id: epic.id },
+      {
+        id: inEpic.id,
+        title: "In epic",
+        status: "pending",
+        estimated_tokens: 0,
+        epic_id: epic.id,
+        release_id: null,
+      },
     ]);
 
     const all = listTasks(db, project.id);
