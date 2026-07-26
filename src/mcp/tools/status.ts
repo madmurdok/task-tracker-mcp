@@ -11,7 +11,7 @@ export function registerStatusTools(server: McpServer, db: DatabaseInstance): vo
     "get_next_task",
     {
       description:
-        "Atomically pick the next unblocked pending task for a project and mark it in_progress.",
+        "Atomically pick the next unblocked pending task for a project and mark it in_progress. project_id accepts a project id or its unique name.",
       inputSchema: { project_id: z.string().min(1) },
     },
     async ({ project_id }) => jsonResult(getNextTask(db, project_id)),
@@ -20,7 +20,8 @@ export function registerStatusTools(server: McpServer, db: DatabaseInstance): vo
   server.registerTool(
     "list_tasks",
     {
-      description: "List tasks for a project as compact summary rows, optionally filtered by status.",
+      description:
+        "List tasks for a project as compact summary rows, optionally filtered by status. project_id accepts a project id or its unique name.",
       inputSchema: {
         project_id: z.string().min(1),
         status: statusEnum.optional(),
@@ -32,7 +33,8 @@ export function registerStatusTools(server: McpServer, db: DatabaseInstance): vo
   server.registerTool(
     "get_project_status",
     {
-      description: "Aggregate task counts (and completion percent) for a project.",
+      description:
+        "Aggregate task counts (and completion percent) for a project. project_id accepts a project id or its unique name.",
       inputSchema: { project_id: z.string().min(1) },
     },
     async ({ project_id }) => jsonResult(getProjectStatus(db, project_id)),
