@@ -103,14 +103,22 @@ function createColumn(column, tasks) {
   return section;
 }
 
+// Which release swimlanes are collapsed, keyed by release_id ("__none__" for
+// the no-release lane). Deliberately a plain in-memory Set, not persisted
+// anywhere - purely local UI state that resets on reload, per Item 8's "no
+// interaction with the tracker itself" constraint. Survives across re-renders
+// (each poll tears down and rebuilds every lane from scratch) precisely
+// because it lives outside renderBoard/createLane, not inside the DOM.
+const collapsedLanes = new Set();
+
+function laneKey(lane) {
+  return lane.release_id ?? "__none__";
+}
+
 function createLane(lane) {
+  const key = laneKey(lane);
   const section = document.createElement("section");
   section.className = "lane";
-
-  const heading = document.createElement("h2");
-  heading.className = "lane-title";
-  heading.textContent = laneTitle(lane);
-  section.appendChild(heading);
 
   const columns = document.createElement("div");
   columns.className = "lane-columns";
@@ -124,6 +132,29 @@ function createLane(lane) {
       ),
     );
   }
+
+  const heading = document.createElement("h2");
+  heading.className = "lane-title";
+  heading.textContent = laneTitle(lane);
+  // A collapsed lane's columns are still rebuilt above with this poll's
+  // fresh data - only their visibility is hidden - so re-expanding later
+  // shows current state, not a stale snapshot from before the collapse.
+  const applyCollapsed = () => {
+    const isCollapsed = collapsedLanes.has(key);
+    section.classList.toggle("collapsed", isCollapsed);
+    columns.hidden = isCollapsed;
+  };
+  heading.addEventListener("click", () => {
+    if (collapsedLanes.has(key)) {
+      collapsedLanes.delete(key);
+    } else {
+      collapsedLanes.add(key);
+    }
+    applyCollapsed();
+  });
+  applyCollapsed();
+
+  section.appendChild(heading);
   section.appendChild(columns);
 
   return section;

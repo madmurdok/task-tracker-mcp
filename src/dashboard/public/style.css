@@ -125,6 +125,16 @@ a {
 .lane-title {
   margin: 0 0 0.5rem;
   font-size: 0.95rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.lane-title::before {
+  content: "\25be  ";
+}
+
+.lane.collapsed .lane-title::before {
+  content: "\25b8  ";
 }
 
 .lane-columns {
