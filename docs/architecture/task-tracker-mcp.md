@@ -126,7 +126,7 @@ erDiagram
 
     PROJECTS {
         text id PK
-        text name
+        text name UK "unique - lets every project-scoped tool accept it in place of id"
         text root_path
         text design_doc_path "nullable"
         text design_doc_hash "nullable, sha256 of doc content at create_project time"
@@ -173,7 +173,14 @@ of sync with the graph.
 All responses are compact JSON — no HTML/markdown formatting, no metadata Claude
 didn't ask for.
 
-- `create_project(name, root_path, design_doc_path?) -> { project_id, design_doc_hash }` — pass `design_doc_path` (relative to `root_path`) to hash it now and enable later `check_doc_sync` calls.
+Everywhere a `project_id` parameter is listed below, it accepts either the
+project's id **or** its unique `name` — `requireProject` (in the domain layer)
+resolves either form, so Claude doesn't need to remember a UUID once a project
+has been created. `list_projects` exists specifically to make that name
+discoverable.
+
+- `create_project(name, root_path, design_doc_path?) -> { project_id, design_doc_hash }` — pass `design_doc_path` (relative to `root_path`) to hash it now and enable later `check_doc_sync` calls. Rejects with an error if `name` is already in use (see Data Model).
+- `list_projects() -> { projects: [{ id, name, root_path }] }` — lets Claude or a human look up a project's id/name without going around the MCP server.
 - `create_task(project_id, title, description, acceptance_criteria, file_paths[], depends_on?: task_id[]) -> { task_id, estimated_tokens, over_budget: bool }`
 - `add_dependency(task_id, depends_on_task_id) -> { ok: true }` (rejects if it would create a cycle)
 - `split_task(task_id, subtasks: [{title, description, acceptance_criteria, file_paths}]) -> { new_task_ids[] }` — original task is replaced; its dependents and dependencies are rewired onto the subtasks.
@@ -215,6 +222,14 @@ didn't ask for.
   has to be told to reconcile it manually (see Non-goals).
 - **`add_dependency` would create a cycle.** Rejected synchronously with an error;
   the domain layer checks reachability before writing.
+- **`create_project` is called with a name already in use.** Rejected with a
+  clear error (`Project name already in use: ...`) rather than a raw SQLite
+  constraint message, since `projects.name` is unique (see Data Model) and every
+  other tool relies on that to resolve a project by name.
+- **A project-scoped tool is called with an id or name that doesn't exist.**
+  `requireProject` raises a clear error (`Unknown project: ...`) immediately,
+  rather than the pre-v3 behavior of silently treating an unrecognized id as an
+  empty/all-done project.
 
 ## Open Questions / Risks
 
