@@ -57,8 +57,6 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_tasks_epic_id ON tasks(epic_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_release_id ON tasks(release_id);
 
 CREATE TABLE IF NOT EXISTS task_files (
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -186,6 +184,11 @@ export function runMigrations(db: DatabaseInstance): void {
   ensureColumn(db, "projects", "design_doc_path", "TEXT");
   ensureColumn(db, "projects", "design_doc_hash", "TEXT");
   ensureColumn(db, "tasks", "epic_id", "TEXT REFERENCES epics(id) ON DELETE SET NULL");
+  // Must run after the ensureColumn above, not in the unconditional SCHEMA_SQL
+  // block - CREATE TABLE IF NOT EXISTS no-ops for a tasks table that already
+  // existed pre-epics, so an unconditional CREATE INDEX ON tasks(epic_id)
+  // there would fail with "no such column: epic_id" against it.
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_epic_id ON tasks(epic_id)`);
   ensureColumn(
     db,
     "tasks",
@@ -203,6 +206,7 @@ export function runMigrations(db: DatabaseInstance): void {
   // Also no ordering constraint relative to widenTaskStatusCheck() - same
   // reasoning as priority above.
   ensureColumn(db, "tasks", "release_id", "TEXT REFERENCES releases(id) ON DELETE SET NULL");
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_release_id ON tasks(release_id)`); // same reasoning as idx_tasks_epic_id above
   ensureColumn(db, "tasks", "completion_summary", "TEXT");
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(name)`);
 }
