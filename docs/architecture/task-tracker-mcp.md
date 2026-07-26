@@ -29,6 +29,16 @@ and hand off work across sessions.
   told to re-plan the graph itself; that reconciliation step stays manual.
 - A full UI/viewer — v2 added a minimal read-only status CLI (see Interfaces), but
   it's a print-and-exit tool, not an interactive viewer.
+- Epics participating in scheduling — v3 added epics as a pure grouping/reporting
+  layer (`create_epic`, `list_epics`, `get_epic_status`, `epic_id` on tasks), but
+  epics don't enter the dependency graph, can't depend on each other, and
+  `get_next_task` is not epic-aware; they exist so related tasks can be organized
+  and reported on together, not to change how work is scheduled.
+- Releases participating in scheduling — v4 added releases (`create_release`,
+  `list_releases`, `get_release_status`, `release_it`, `release_id` on tasks), the
+  same non-goal as epics above: a release is a reporting/shipping gate (grouped
+  *by version*, orthogonal to epics grouping *by feature*), not a scheduling unit.
+  `get_next_task` is not release-aware either.
 
 ## Constraints
 
@@ -107,9 +117,10 @@ sequenceDiagram
 
     U->>C2: "Continue the build"
     C2->>S: get_next_task(project_id)
-    S-->>C2: compact task packet (files, acceptance criteria, prior handoff notes)
+    S-->>C2: compact task packet (file_paths, acceptance criteria, handoff_notes)
     C2->>S: claim_task(task_id)
     Note over C2: implements the task
+    C2->>S: get_task(task_id) (optional - re-check detail anytime, no side effect)
     C2->>S: add_handoff_note(task_id, decisions/remaining/discoveries)
     C2->>S: complete_task(task_id, summary)
     S-->>C2: next task now unblocked (if dependency satisfied)
@@ -120,6 +131,10 @@ sequenceDiagram
 ```mermaid
 erDiagram
     PROJECTS ||--o{ TASKS : has
+    PROJECTS ||--o{ EPICS : has
+    PROJECTS ||--o{ RELEASES : has
+    EPICS ||--o{ TASKS : groups
+    RELEASES ||--o{ TASKS : groups
     TASKS ||--o{ TASK_FILES : references
     TASKS ||--o{ TASK_DEPENDENCIES : "depends on"
     TASKS ||--o{ HANDOFF_NOTES : accumulates
@@ -132,16 +147,41 @@ erDiagram
         text design_doc_hash "nullable, sha256 of doc content at create_project time"
         text created_at
     }
+    EPICS {
+        text id PK
+        text project_id FK
+        text name "unique per project (not globally) - see Interfaces"
+        text description
+        text created_at
+    }
+    RELEASES {
+        text id PK
+        text project_id FK
+        text version "unique per project (not globally), e.g. '0.1'"
+        text name
+        text description
+        text status "planned|released - one-shot, see release_it"
+        int sequence "what list_releases orders by, not created_at - gaps of 10, see set_release_sequence"
+        text release_notes "nullable, generated once by release_it"
+        text released_at "nullable"
+        text created_at
+    }
     TASKS {
         text id PK
         text project_id FK
+        text epic_id "nullable FK - grouping only, see Non-goals"
+        text release_id "nullable FK - grouping only, frozen once released, see Non-goals/Interfaces"
         text title
         text description
         text acceptance_criteria
-        text status "pending|in_progress|done (blocked is derived, see below)"
+        text status "pending|in_progress|done|cancelled (blocked is derived, see below)"
         int estimated_tokens
         text owner_session_id "nullable, enforced via claim_task/release_task"
         text lock_expires_at "nullable, 30min lease; enables auto-reclaim by get_next_task"
+        text complexity_hint "normal|high - required at create_task time, see Interfaces"
+        text cancellation_reason "nullable, set by cancel_task"
+        int priority "default 0, higher sorts first in get_next_task"
+        text completion_summary "nullable, set by complete_task, sourced into release notes"
         text created_at
         text updated_at
     }
@@ -166,7 +206,13 @@ erDiagram
 
 `status = blocked` is derived, not stored authoritatively — `get_next_task` and
 `list_tasks` compute it from unmet dependencies at query time, so it can't drift out
-of sync with the graph.
+of sync with the graph; a `cancelled` prerequisite resolves a dependent the same way
+a `done` one does. An epic's or release's status is derived the same way: it's an
+aggregate (`get_epic_status`/`list_epics`, `get_release_status`/`list_releases`) over
+its tasks' computed statuses, never stored on the epic/release itself — except a
+release's own `planned`/`released` status and `release_notes`, which genuinely are
+stored, since `release_it` is a one-shot action with a real before/after (like
+`complete_task` has no "un-complete", a release has no "un-release").
 
 ## Interfaces
 
@@ -181,17 +227,29 @@ discoverable.
 
 - `create_project(name, root_path, design_doc_path?) -> { project_id, design_doc_hash }` — pass `design_doc_path` (relative to `root_path`) to hash it now and enable later `check_doc_sync` calls. Rejects with an error if `name` is already in use (see Data Model).
 - `list_projects() -> { projects: [{ id, name, root_path }] }` — lets Claude or a human look up a project's id/name without going around the MCP server.
-- `create_task(project_id, title, description, acceptance_criteria, file_paths[], depends_on?: task_id[]) -> { task_id, estimated_tokens, over_budget: bool }`
+- `create_epic(project_id, name, description?) -> { epic_id }` — `name` must be unique within the project (not globally, unlike project names — the same epic name can repeat across different projects).
+- `list_epics(project_id) -> { epics: [{ id, name, description, total, done, in_progress, blocked, pending, cancelled, percent }] }` — status counts are aggregated per epic in the same call, no follow-up needed per epic.
+- `get_epic_status(project_id, epic_id) -> { id, name, total, done, in_progress, blocked, pending, cancelled, percent }` — `epic_id` accepts an epic id or its name within that project (mirrors the project id-or-name convention).
+- `create_release(project_id, version, name?, description?) -> { release_id }` — `version` must be unique within the project (same "unique per project, not globally" rule as epic names). A release groups tasks *by shipment*, orthogonal to an epic grouping *by feature* — the same task can belong to one of each.
+- `list_releases(project_id) -> { releases: [{ id, version, name, description, status, released_at, total, done, in_progress, blocked, pending, cancelled, percent }] }` — ordered by `sequence`, not creation time (see Data Model); status counts aggregated per release in the same call.
+- `get_release_status(project_id, release_id) -> { id, version, name, status, total, done, in_progress, blocked, pending, cancelled, percent }` — `release_id` accepts a release id or its version within that project.
+- `release_it(project_id, release_id, test_command?, force?) -> { ok: true, release_notes, released_at } | not_all_done error | verification_failed error` — one-shot (rejects if already released). Gates on every task in the release being `done` or `cancelled` first (**not** skippable by `force` — `{ error: "not_all_done", message, pending_task_ids }`); then on a test run — `test_command` is required unless `force: true` (omitting both is an error, not a silent pass), and when given is run through the *same* Completion Verifier `complete_task` uses (with an empty file list, so only the test command runs — no separate "release verifier"). Generates `release_notes` from the release's `done` tasks (`- title: completion_summary`) plus a `Cancelled:` section for its `cancelled` ones (`- title: reason`), and stores it on the release alongside `released_at`.
+- `set_task_release(task_id, release_id: string | null) -> { ok: true }` — moves a task to a different release, or clears it (`null`). Rejects if *either* the task's current release or its target release is already `released` — a released release's task membership is frozen (its `release_notes` were generated once, from exactly those tasks; assigning/removing afterward would silently drift them with nothing to detect it).
+- `set_release_sequence(project_id, release_id, sequence) -> { ok: true }` — reorders where a release shows up in `list_releases` (e.g. slot a hotfix between two existing ones). *Not* blocked by `released` status — display order is unrelated to the membership-freeze rule above.
+- `create_task(project_id, title, complexity_hint, description?, acceptance_criteria?, file_paths?, epic_id?, release_id?, priority?, depends_on?: task_id[]) -> { task_id, estimated_tokens, over_budget: bool }` — `complexity_hint` (`"normal" | "high"`) is **required**, not optional like the rest — forces an explicit judgment call at creation time on whether a task is worth delegating to a stronger subagent (see the project's `CLAUDE.md` "Task delegation" section), so that call isn't re-derived or missed by whichever session later picks the task up. `epic_id`/`release_id` (both optional) accept an id or name/version within `project_id`; each rejects a ref that doesn't exist or belongs to a different project, and `release_id` additionally rejects an already-`released` release. `priority` (optional, default `0`) — higher sorts first in `get_next_task`.
+- `set_task_priority(task_id, priority) -> { ok: true }` — adjusts a task's priority after creation, once its importance turns out different than assumed; deliberately its own single-purpose tool rather than a general "update_task".
+- `cancel_task(task_id, reason?, force?) -> { ok: true, unblocked_task_ids: [...] } | conflict error` — abandons a task that turns out unnecessary, without the dishonesty of a force-completed `complete_task`. Unblocks dependents the same way `complete_task` does. Rejects with the same conflict shape as `claim_task`/`release_task` if an active lock is held, unless `force: true` (no `session_id` param here, so the check is owner-agnostic — any active lock blocks it, regardless of whose).
 - `add_dependency(task_id, depends_on_task_id) -> { ok: true }` (rejects if it would create a cycle)
-- `split_task(task_id, subtasks: [{title, description, acceptance_criteria, file_paths}]) -> { new_task_ids[] }` — original task is replaced; its dependents and dependencies are rewired onto the subtasks.
-- `get_next_task(project_id) -> { task } | { task: null, reason: "all_done" | "all_blocked", blocked_on?: [...] }` — atomically marks the returned task `in_progress` and gives it a 30-minute lock lease as part of the same transaction that selects it (see Failure Modes for both the no-duplicate-hand-out guarantee and stale-lock reclaim).
+- `split_task(task_id, subtasks: [{title, description, acceptance_criteria, file_paths, complexity_hint?, priority?}]) -> { new_task_ids[] }` — original task is replaced; its dependents and dependencies are rewired onto the subtasks, which also inherit its `epic_id`/`release_id`/`complexity_hint`/`priority` (the latter two overridable per subtask). Rejects if the original is already `done` or `cancelled` — splitting a finished/abandoned task would otherwise silently resurrect it.
+- `get_next_task(project_id) -> { task } | { task: null, reason: "all_done" | "all_blocked", blocked_on?: [...] }` — atomically marks the returned task `in_progress` and gives it a 30-minute lock lease as part of the same transaction that selects it (see Failure Modes for both the no-duplicate-hand-out guarantee and stale-lock reclaim). Candidates are ordered `priority DESC, created_at ASC`. `task` is the full detail packet (see `get_task` below), not just the bare row. Not epic- or release-aware — picks from the whole project's graph regardless of either (see Non-goals).
+- `get_task(task_id) -> { id, title, description, acceptance_criteria, status, estimated_tokens, priority, complexity_hint, file_paths, handoff_notes, ... }` — the same detail packet `get_next_task` returns, fetchable anytime with no claim/lock side effect; use this (not `get_next_task`) to just re-inspect a task.
 - `claim_task(task_id, session_id) -> { ok: true } | conflict error` — records `owner_session_id` and renews the lock lease; rejects with `{ error: "conflict", current_owner_session_id, lock_expires_at }` if a different session's lock is still active.
 - `release_task(task_id, session_id, force?) -> { ok: true } | conflict error` — gives up ownership immediately (back to `pending`) instead of waiting out the lease; `force: true` overrides another session's still-active lock.
 - `check_doc_sync(project_id) -> { tracked, in_sync, design_doc_path, stored_hash, current_hash }` — compares the tracked design doc's current hash against the one captured at `create_project` time; `tracked: false` means no doc was ever registered.
 - `add_handoff_note(task_id, session_id, { decisions, remaining_work, discoveries }) -> { ok: true }`
-- `complete_task(task_id, summary, test_command?, force?) -> { ok: true, unblocked_task_ids: [...] } | verification_failed error` — runs the Completion Verifier first (declared files changed + `test_command` exits zero, if given); `force: true` skips it.
-- `get_project_status(project_id) -> { total, done, in_progress, blocked, pending, percent }`
-- `list_tasks(project_id, status?) -> { tasks: [{ id, title, status, estimated_tokens }] }` — summary rows only; use `get_next_task`/a future `get_task` for full detail.
+- `complete_task(task_id, summary?, test_command?, force?) -> { ok: true, unblocked_task_ids: [...] } | verification_failed error` — runs the Completion Verifier first (declared files changed + `test_command` exits zero, if given); `force: true` skips it. `summary`, if given, is persisted as `completion_summary` — the source text `release_it` pulls into generated release notes.
+- `get_project_status(project_id) -> { total, done, in_progress, blocked, pending, cancelled, percent }`
+- `list_tasks(project_id, status?, epic_id?, release_id?) -> { tasks: [{ id, title, status, estimated_tokens, epic_id, release_id }] }` — summary rows only; use `get_task` for full detail. `epic_id`/`release_id` (both optional, combinable) scope the list to one epic and/or one release.
 - **Status CLI** (outside MCP): `node dist/cli/status.js [project_id_or_name]` — no arg lists every registered project's status; with an arg, prints that project's status plus its full task list. Read-only, opens the DB directly.
 
 ## Failure Modes & Edge Cases
@@ -230,6 +288,19 @@ discoverable.
   `requireProject` raises a clear error (`Unknown project: ...`) immediately,
   rather than the pre-v3 behavior of silently treating an unrecognized id as an
   empty/all-done project.
+- **`release_it` is called before every task in the release is resolved.**
+  Rejects with a distinct `not_all_done` shape (`pending_task_ids` included) —
+  deliberately not skippable by `force`, unlike the test gate (see Interfaces).
+- **`release_it` is called without a `test_command` and without `force`.**
+  Rejected as `verification_failed` rather than silently passing — an earlier
+  version of this design let an omitted `test_command` skip testing entirely,
+  which defeated the point of the gate.
+- **An already-existing `~/.task-tracker/tracker.db` predates the `cancelled`
+  status.** Its `tasks.status` CHECK constraint is baked in at the SQLite schema
+  level and can't be widened via `ALTER TABLE` — `runMigrations` rebuilds the
+  table in place (rename, recreate with the widened CHECK, copy rows, drop the
+  renamed original) inside an `IMMEDIATE` transaction, so the MCP server and the
+  Status CLI can't race through it if both start right after an upgrade.
 
 ## Open Questions / Risks
 

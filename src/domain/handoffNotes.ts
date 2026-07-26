@@ -37,3 +37,9 @@ export function addHandoffNote(db: DatabaseInstance, input: AddHandoffNoteInput)
 
   return note;
 }
+
+export function listHandoffNotes(db: DatabaseInstance, taskId: string): HandoffNote[] {
+  return db
+    .prepare(`SELECT * FROM handoff_notes WHERE task_id = ? ORDER BY created_at ASC`)
+    .all(taskId) as HandoffNote[];
+}

@@ -25,3 +25,10 @@ export function verificationFailedResult(details: { message: string; reason: str
     isError: true,
   };
 }
+
+export function notAllDoneResult(details: { message: string; pending_task_ids: string[] }): CallToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify({ error: "not_all_done", ...details }) }],
+    isError: true,
+  };
+}

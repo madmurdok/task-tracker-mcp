@@ -30,9 +30,12 @@ npm run typecheck  # tsc --noEmit
 
 ## Tools
 
-`create_project`, `list_projects`, `create_task`, `add_dependency`, `split_task`,
-`get_next_task`, `list_tasks`, `get_project_status`, `claim_task`, `release_task`,
-`check_doc_sync`, `add_handoff_note`, `complete_task`.
+`create_project`, `list_projects`, `create_epic`, `list_epics`, `get_epic_status`,
+`create_release`, `list_releases`, `get_release_status`, `release_it`,
+`set_task_release`, `set_release_sequence`, `create_task`, `set_task_priority`,
+`cancel_task`, `add_dependency`, `split_task`, `get_next_task`, `get_task`,
+`list_tasks`, `get_project_status`, `claim_task`, `release_task`, `check_doc_sync`,
+`add_handoff_note`, `complete_task`.
 
 Every tool that takes a `project_id` also accepts the project's unique `name`
 instead, so you don't have to keep its UUID around once it's been created.

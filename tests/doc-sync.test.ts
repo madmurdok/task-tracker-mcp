@@ -44,10 +44,12 @@ describe("design doc re-sync end to end", () => {
     const { task: schema } = createTask(db, noopEstimator, {
       project_id: project.id,
       title: "Build schema",
+      complexity_hint: "normal",
     });
     const { task: domain } = createTask(db, noopEstimator, {
       project_id: project.id,
       title: "Build domain layer",
+      complexity_hint: "normal",
     });
     addDependency(db, domain.id, schema.id);
 
@@ -65,7 +67,11 @@ describe("design doc re-sync end to end", () => {
       root_path: dir,
       design_doc_path: "design.md",
     });
-    createTask(db, noopEstimator, { project_id: project.id, title: "Build schema" });
+    createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Build schema",
+      complexity_hint: "normal",
+    });
 
     // The doc grows a new section after the graph was already generated from it.
     writeFileSync(

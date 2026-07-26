@@ -1,13 +1,17 @@
 import { describe, expect, it } from "vitest";
 import { openDatabase } from "../src/db/connection.js";
 import { createProject } from "../src/domain/projects.js";
+import { createRelease } from "../src/domain/releases.js";
 import { createTask } from "../src/domain/tasks.js";
 import { addDependency } from "../src/domain/dependencies.js";
 import { getNextTask } from "../src/domain/status.js";
 import {
+  cancelTask,
   claimTask,
   completeTask,
   CompletionVerificationError,
+  releaseIt,
+  ReleaseNotAllDoneError,
   releaseTask,
   TaskConflictError,
 } from "../src/domain/lifecycle.js";
@@ -26,10 +30,12 @@ describe("full task lifecycle (matches the doc's sequence diagram)", () => {
     const { task: taskA } = createTask(db, noopEstimator, {
       project_id: project.id,
       title: "Build schema",
+      complexity_hint: "normal",
     });
     const { task: taskB } = createTask(db, noopEstimator, {
       project_id: project.id,
       title: "Build domain layer",
+      complexity_hint: "normal",
     });
     addDependency(db, taskB.id, taskA.id); // B depends on A
 
@@ -65,7 +71,11 @@ describe("full task lifecycle (matches the doc's sequence diagram)", () => {
   it("claim_task renews the lock lease", () => {
     const db = openDatabase(":memory:");
     const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
-    const { task } = createTask(db, noopEstimator, { project_id: project.id, title: "Build schema" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Build schema",
+      complexity_hint: "normal",
+    });
     getNextTask(db, project.id); // hand out, sets an initial lease
 
     db.prepare(`UPDATE tasks SET lock_expires_at = ? WHERE id = ?`).run(
@@ -91,7 +101,11 @@ describe("ownership conflicts (A3)", () => {
   function setup() {
     const db = openDatabase(":memory:");
     const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
-    const { task } = createTask(db, noopEstimator, { project_id: project.id, title: "Build schema" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Build schema",
+      complexity_hint: "normal",
+    });
     getNextTask(db, project.id); // hand out, owner still null
     claimTask(db, task.id, "session-1"); // session-1 now holds an active lock
     return { db, project, task };
@@ -167,6 +181,7 @@ describe("completion verification (B2)", () => {
       project_id: project.id,
       title: "Build schema",
       file_paths: ["src/db/schema.ts"],
+      complexity_hint: "normal",
     });
     return { db, project, task };
   }
@@ -217,5 +232,219 @@ describe("completion verification (B2)", () => {
   it("succeeds when the verifier passes", () => {
     const { db, task } = setup();
     expect(() => completeTask(db, noopVerifier, { task_id: task.id })).not.toThrow();
+  });
+
+  it("persists the summary argument as completion_summary", () => {
+    const { db, task } = setup();
+    completeTask(db, noopVerifier, { task_id: task.id, summary: "wired up the schema" });
+
+    const row = db.prepare(`SELECT completion_summary FROM tasks WHERE id = ?`).get(task.id);
+    expect(row).toMatchObject({ completion_summary: "wired up the schema" });
+  });
+
+  it("leaves completion_summary null when no summary is given", () => {
+    const { db, task } = setup();
+    completeTask(db, noopVerifier, { task_id: task.id });
+
+    const row = db.prepare(`SELECT completion_summary FROM tasks WHERE id = ?`).get(task.id);
+    expect(row).toMatchObject({ completion_summary: null });
+  });
+});
+
+describe("cancelTask", () => {
+  function setup() {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const { task: prereq } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Prereq",
+      complexity_hint: "normal",
+    });
+    const { task: dependent } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Dependent",
+      complexity_hint: "normal",
+    });
+    addDependency(db, dependent.id, prereq.id);
+    return { db, project, prereq, dependent };
+  }
+
+  it("cancels a pending task, storing the reason, clearing ownership, and unblocking dependents", () => {
+    const { db, prereq, dependent } = setup();
+
+    const result = cancelTask(db, { task_id: prereq.id, reason: "duplicate of another task" });
+
+    const row = db
+      .prepare(`SELECT status, cancellation_reason, owner_session_id, lock_expires_at FROM tasks WHERE id = ?`)
+      .get(prereq.id);
+    expect(row).toMatchObject({
+      status: "cancelled",
+      cancellation_reason: "duplicate of another task",
+      owner_session_id: null,
+      lock_expires_at: null,
+    });
+    expect(result.unblocked_task_ids).toEqual([dependent.id]);
+  });
+
+  it("rejects an already-done task", () => {
+    const { db, prereq } = setup();
+    completeTask(db, noopVerifier, { task_id: prereq.id });
+
+    expect(() => cancelTask(db, { task_id: prereq.id })).toThrow(/already done/);
+  });
+
+  it("rejects an already-cancelled task", () => {
+    const { db, prereq } = setup();
+    cancelTask(db, { task_id: prereq.id });
+
+    expect(() => cancelTask(db, { task_id: prereq.id })).toThrow(/already cancelled/);
+  });
+
+  it("rejects an unknown task_id", () => {
+    const { db } = setup();
+    expect(() => cancelTask(db, { task_id: "missing" })).toThrow(/Unknown task_id/);
+  });
+
+  it("rejects while another session's lock is active, unless force", () => {
+    const { db, project, prereq } = setup();
+    getNextTask(db, project.id);
+    claimTask(db, prereq.id, "session-1");
+
+    expect(() => cancelTask(db, { task_id: prereq.id })).toThrow(TaskConflictError);
+    expect(() => cancelTask(db, { task_id: prereq.id, force: true })).not.toThrow();
+  });
+});
+
+describe("releaseIt", () => {
+  function setup() {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const release = createRelease(db, { project_id: project.id, version: "0.1" });
+    return { db, project, release };
+  }
+
+  it("rejects if any task in the release isn't done or cancelled, even with force", () => {
+    const { db, project, release } = setup();
+    createTask(db, noopEstimator, {
+      project_id: project.id,
+      release_id: release.id,
+      title: "Still pending",
+      complexity_hint: "normal",
+    });
+
+    expect(() =>
+      releaseIt(db, noopVerifier, { project_id: project.id, release_id: release.id, force: true }),
+    ).toThrow(ReleaseNotAllDoneError);
+  });
+
+  it("requires test_command unless force is given", () => {
+    const { db, project, release } = setup();
+
+    expect(() => releaseIt(db, noopVerifier, { project_id: project.id, release_id: release.id })).toThrow(
+      CompletionVerificationError,
+    );
+    expect(() =>
+      releaseIt(db, noopVerifier, { project_id: project.id, release_id: release.id, force: true }),
+    ).not.toThrow();
+  });
+
+  it("surfaces a failing test_command as CompletionVerificationError", () => {
+    const { db, project, release } = setup();
+    const failingVerifier: CompletionVerifier = {
+      verify: () => ({ passed: false, reason: "tests failed" }),
+    };
+
+    expect(() =>
+      releaseIt(db, failingVerifier, {
+        project_id: project.id,
+        release_id: release.id,
+        test_command: "npm test",
+      }),
+    ).toThrow(CompletionVerificationError);
+  });
+
+  it("passes an empty filePaths (skips the git-diff check) and the given test_command to the verifier", () => {
+    const { db, project, release } = setup();
+    let received: unknown;
+    const spyVerifier: CompletionVerifier = {
+      verify: (input) => {
+        received = input;
+        return { passed: true, reason: "ok" };
+      },
+    };
+
+    releaseIt(db, spyVerifier, {
+      project_id: project.id,
+      release_id: release.id,
+      test_command: "npm test",
+    });
+
+    expect(received).toEqual({ rootPath: project.root_path, filePaths: [], testCommand: "npm test" });
+  });
+
+  it("rejects an already-released release", () => {
+    const { db, project, release } = setup();
+    releaseIt(db, noopVerifier, { project_id: project.id, release_id: release.id, force: true });
+
+    expect(() =>
+      releaseIt(db, noopVerifier, { project_id: project.id, release_id: release.id, force: true }),
+    ).toThrow(/already released/);
+  });
+
+  it("generates release notes from done tasks plus a Cancelled section, and marks the release released", () => {
+    const { db, project, release } = setup();
+    const { task: shipped } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      release_id: release.id,
+      title: "Add login form",
+      complexity_hint: "normal",
+    });
+    const { task: dropped } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      release_id: release.id,
+      title: "Add SSO (descoped)",
+      complexity_hint: "normal",
+    });
+    completeTask(db, noopVerifier, { task_id: shipped.id, summary: "wired up the login form" });
+    cancelTask(db, { task_id: dropped.id, reason: "descoped for this release" });
+
+    const result = releaseIt(db, noopVerifier, {
+      project_id: project.id,
+      release_id: release.id,
+      force: true,
+    });
+
+    expect(result.release_notes).toBe(
+      "- Add login form: wired up the login form\n\nCancelled:\n- Add SSO (descoped): descoped for this release",
+    );
+    expect(result.released_at).toBeTruthy();
+
+    const row = db.prepare(`SELECT status, release_notes, released_at FROM releases WHERE id = ?`).get(
+      release.id,
+    );
+    expect(row).toMatchObject({
+      status: "released",
+      release_notes: result.release_notes,
+      released_at: result.released_at,
+    });
+  });
+
+  it("omits the summary/reason suffix when a task has none", () => {
+    const { db, project, release } = setup();
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      release_id: release.id,
+      title: "No summary given",
+      complexity_hint: "normal",
+    });
+    completeTask(db, noopVerifier, { task_id: task.id });
+
+    const result = releaseIt(db, noopVerifier, {
+      project_id: project.id,
+      release_id: release.id,
+      force: true,
+    });
+
+    expect(result.release_notes).toBe("- No summary given");
   });
 });

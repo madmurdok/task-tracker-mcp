@@ -53,7 +53,11 @@ describe("status CLI", () => {
   it("prints a project's task list when given its id", () => {
     const db = openDatabase(dbPath);
     const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
-    createTask(db, noopEstimator, { project_id: project.id, title: "Do the thing" });
+    createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Do the thing",
+      complexity_hint: "normal",
+    });
     db.close();
 
     const { stdout, status } = runCli(dbPath, [project.id]);
