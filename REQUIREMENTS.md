@@ -433,6 +433,78 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
     flagged as getting long (Item 4); revisit only if filtering by this proves
     needed in practice.
 
+### 8. Real-time web dashboard for task state
+
+- **Status:** planned (approach agreed — mechanism, layout, and process model
+  discussed with the user; no schema/file-level design yet)
+- **Priority:** medium
+- **Problem:** There's no way to *watch* an agent work on a project. `list_tasks`/
+  `get_project_status` are pull-only snapshots a human has to remember to ask for,
+  and the Status CLI (Item "v2" in Implemented) is a print-and-exit dump, not
+  something you'd leave open. Watching what's `in_progress`, what just unblocked,
+  and what's `done` as it happens requires re-running the CLI by hand on a loop.
+- **Confirmed with the user:**
+  - Two pages: a project picker, and a per-project board.
+  - The board updates live with no user-driven mutation of the tracker itself —
+    pure visualization of current state, not a second write path alongside the
+    MCP tools. (A purely local UI toggle like collapsing a swimlane doesn't count
+    as "interaction" here — nothing round-trips to the tracker for it.)
+  - Cards show the minimum needed for a human glance: title, status, priority,
+    description, its `epic_id` as a small tag (orthogonal to the release
+    swimlane it already sits in), and who/what holds it (`owner_session_id`) so
+    concurrent agent sessions are distinguishable. Deliberately **not**
+    `file_paths`/`handoff_notes`/`acceptance_criteria` — that's agent-facing
+    detail (Item 1's packet), not what a human watching the board needs.
+  - An `in_progress` card whose `lock_expires_at` has already passed is
+    highlighted as **stale** — it's about to be auto-reclaimed by the next
+    `get_next_task` call (existing lease behavior), and that's an early signal
+    the session behind it likely died.
+  - `cancelled` cards stay visible but visually de-emphasized (muted/greyed),
+    not hidden — same "visible, not hidden from the stats" principle Item 6
+    already applied to status aggregation.
+  - A project-level banner surfaces `doc_drift` (Item 5's field on
+    `get_next_task`/`get_project_status`) at the top of the board — the two
+    features compose directly, no extra backend work.
+  - Releases need their own visual grouping, distinct from status. Decided:
+    **swimlanes by release** (status columns nested inside each), collapsible
+    per-release via a vertical accordion — a large project with many releases
+    doesn't turn into one giant uninterrupted board.
+  - Live updates via **frontend polling** (plain `fetch` every 1-2s against a
+    read-only HTTP endpoint), not WebSocket/SSE push. Push would need the UI
+    server to learn about writes made by the *separate* MCP server process —
+    either polling the DB internally anyway and pushing diffs (same mechanism,
+    extra transport plumbing) or a real cross-process event channel (none
+    exists today). Polling from the browser needs neither: every tick is just
+    "give me current state" through functions that already exist. The UI shows
+    a "last updated Xs ago" timestamp (or a clear disconnected state once a
+    poll fails) so a stuck poll reads as "connection lost", not "nothing's
+    happening."
+  - **Separate process**, not an HTTP add-on to the MCP server — same shape as
+    the existing Status CLI (`src/cli/status.ts`): opens the SQLite file
+    directly, read-only, no MCP round-trip. Keeps the MCP server's
+    responsibility (tool calls over stdio) from mixing with serving a web UI.
+    Binds to `127.0.0.1` only, never `0.0.0.0` — it's read-only, but still
+    serves project file paths and task descriptions with no auth in front of it.
+- **Direction (rough — turn into a full `architecture-design` pass before
+  building):**
+  - New entry point alongside `src/cli/status.ts`, e.g. `src/dashboard/server.ts`,
+    started via its own `npm run dashboard`-style script; listens on
+    `127.0.0.1` and serves static HTML/JS plus a small JSON API.
+  - The card shape needed (title, status, priority, description, epic_id,
+    release_id, owner_session_id, lock_expires_at) sits strictly between the
+    existing `TaskSummary` (too little — no priority/description/ownership) and
+    `TaskDetail` (too much — drags in file_paths/handoff_notes/
+    acceptance_criteria). Likely a new type/query rather than reusing either as
+    is.
+  - JSON API otherwise built on existing read-only domain functions
+    (`listProjects`, `listReleasesWithStatus`, `getProjectStatus`) — likely one
+    new aggregation (tasks grouped by release, then by status) rather than the
+    client stitching several endpoints together per poll.
+  - This item effectively reverses the architecture doc's existing "full
+    UI/viewer" Non-goal (it currently reads "a print-and-exit tool, not an
+    interactive viewer") — once built, that Non-goal needs updating the same way
+    Item 5 updated the doc-sync one.
+
 ## Implemented
 
 What's already shipped, so a new idea can be checked against it before being added
