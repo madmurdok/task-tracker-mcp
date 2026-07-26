@@ -46,6 +46,19 @@ export function getProject(db: DatabaseInstance, idOrName: string): Project | un
   );
 }
 
+/**
+ * Resolves a project reference (id or unique name) or throws - the single
+ * point every project-scoped domain function routes through so `project_id`
+ * inputs can be either without duplicating the id-then-name lookup.
+ */
+export function requireProject(db: DatabaseInstance, ref: string): Project {
+  const project = getProject(db, ref);
+  if (!project) {
+    throw new Error(`Unknown project: ${ref}`);
+  }
+  return project;
+}
+
 export function createProject(db: DatabaseInstance, input: CreateProjectInput): Project {
   const designDocHash = input.design_doc_path
     ? hashDesignDoc(input.root_path, input.design_doc_path)
@@ -60,10 +73,17 @@ export function createProject(db: DatabaseInstance, input: CreateProjectInput): 
     created_at: new Date().toISOString(),
   };
 
-  db.prepare(
-    `INSERT INTO projects (id, name, root_path, design_doc_path, design_doc_hash, created_at)
-     VALUES (@id, @name, @root_path, @design_doc_path, @design_doc_hash, @created_at)`,
-  ).run(project);
+  try {
+    db.prepare(
+      `INSERT INTO projects (id, name, root_path, design_doc_path, design_doc_hash, created_at)
+       VALUES (@id, @name, @root_path, @design_doc_path, @design_doc_hash, @created_at)`,
+    ).run(project);
+  } catch (error) {
+    if (error instanceof Error && (error as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") {
+      throw new Error(`Project name already in use: ${input.name}`);
+    }
+    throw error;
+  }
 
   return project;
 }
@@ -84,16 +104,8 @@ export interface DocSyncResult {
  * in sync rather than silently passing, matching the "fail closed" approach
  * CompletionVerifier already takes for a similar problem (see verification.ts).
  */
-export function checkDocSync(db: DatabaseInstance, projectId: string): DocSyncResult {
-  const project = db
-    .prepare(`SELECT root_path, design_doc_path, design_doc_hash FROM projects WHERE id = ?`)
-    .get(projectId) as
-    | { root_path: string; design_doc_path: string | null; design_doc_hash: string | null }
-    | undefined;
-
-  if (!project) {
-    throw new Error(`Unknown project_id: ${projectId}`);
-  }
+export function checkDocSync(db: DatabaseInstance, projectRef: string): DocSyncResult {
+  const project = requireProject(db, projectRef);
 
   if (!project.design_doc_path) {
     return {

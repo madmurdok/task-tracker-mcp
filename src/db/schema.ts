@@ -72,4 +72,5 @@ export function runMigrations(db: DatabaseInstance): void {
   ensureColumn(db, "tasks", "lock_expires_at", "TEXT");
   ensureColumn(db, "projects", "design_doc_path", "TEXT");
   ensureColumn(db, "projects", "design_doc_hash", "TEXT");
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(name)`);
 }

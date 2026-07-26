@@ -1,4 +1,5 @@
 import type { DatabaseInstance } from "../db/connection.js";
+import { requireProject } from "./projects.js";
 import type { Task } from "./tasks.js";
 
 export type DisplayStatus = "pending" | "in_progress" | "blocked" | "done";
@@ -78,8 +79,9 @@ function handOut(
   };
 }
 
-export function getNextTask(db: DatabaseInstance, projectId: string): GetNextTaskResult {
+export function getNextTask(db: DatabaseInstance, projectRef: string): GetNextTaskResult {
   const select = db.transaction((): GetNextTaskResult => {
+    const projectId = requireProject(db, projectRef).id;
     const nowIso = new Date().toISOString();
 
     const pendingTasks = db
@@ -126,9 +128,10 @@ export function getNextTask(db: DatabaseInstance, projectId: string): GetNextTas
 
 export function listTasks(
   db: DatabaseInstance,
-  projectId: string,
+  projectRef: string,
   statusFilter?: DisplayStatus,
 ): TaskSummary[] {
+  const projectId = requireProject(db, projectRef).id;
   const tasks = db
     .prepare(`SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC`)
     .all(projectId) as Task[];
@@ -143,7 +146,8 @@ export function listTasks(
   return statusFilter ? summaries.filter((s) => s.status === statusFilter) : summaries;
 }
 
-export function getProjectStatus(db: DatabaseInstance, projectId: string): ProjectStatus {
+export function getProjectStatus(db: DatabaseInstance, projectRef: string): ProjectStatus {
+  const projectId = requireProject(db, projectRef).id;
   const tasks = db
     .prepare(`SELECT id, status FROM tasks WHERE project_id = ?`)
     .all(projectId) as Array<Pick<Task, "id" | "status">>;
