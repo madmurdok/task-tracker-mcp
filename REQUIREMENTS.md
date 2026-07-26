@@ -64,10 +64,11 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 - **Design:**
   - New tool `create_tasks(project_id, tasks: [{ temp_id?, title, description?,
     acceptance_criteria?, file_paths?, epic_id?, release_id?, priority?,
-    depends_on?: string[] }]) -> { tasks: [{ temp_id?, task_id, estimated_tokens,
-    over_budget }] }` — `release_id`/`priority` kept in sync with what Items 3 and 4
-    each add to `create_task` itself (closes the auto-review Contradictions finding
-    on this spec going stale relative to those two items).
+    complexity_hint, depends_on?: string[] }]) -> { tasks: [{ temp_id?, task_id,
+    estimated_tokens, over_budget }] }` — `release_id`/`priority` kept in sync with
+    what Items 3 and 4 each add to `create_task` itself (closes the auto-review
+    Contradictions finding on this spec going stale relative to those two items);
+    `complexity_hint` (required, no `?`) kept in sync with Item 7 from the start.
   - `temp_id` is an arbitrary client-chosen string scoped to the batch, letting a
     task's `depends_on` reference a sibling created earlier in the *same* call
     before it has a real id; an entry in `depends_on` that isn't a known `temp_id`
@@ -371,6 +372,52 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
     unblocked_task_ids: [...] } | conflict error`. `list_tasks`'s `status` filter
     enum (`src/mcp/tools/status.ts`) gains `"cancelled"` alongside the existing four
     values.
+
+### 7. Mandatory complexity hint on task creation (for opus-subagent delegation)
+
+- **Status:** planned
+- **Priority:** medium
+- **Problem:** Claude Code has an `opus` subagent meant for unusually hard work
+  (deep debugging, tricky refactors, architectural trade-offs, multi-step
+  reasoning) instead of the default session model — but nothing about a task
+  captures whether it's worth that judgment call. That call is best made once,
+  during planning, when the full design-doc context is available — not re-derived
+  (or missed entirely) by whichever session later picks the task up via
+  `get_next_task`.
+- **Confirmed with the user:** make it **required** on task creation, not optional
+  like `priority`/`epic_id`/`release_id` — forces an explicit judgment call every
+  time, same reasoning as Item 4's `test_command`-required-or-`force` fix: an
+  optional "should I flag this" field just quietly never gets set.
+- **Design:**
+  - **Data model:** new column `complexity_hint TEXT NOT NULL DEFAULT 'normal'
+    CHECK (complexity_hint IN ('normal', 'high'))` on `tasks`. Unlike Item 6's
+    `status` CHECK, this is a **brand-new** column, not a widened constraint on an
+    existing one — a plain `ensureColumn`-style `ALTER TABLE ADD COLUMN` with a
+    `NOT NULL DEFAULT` is valid SQLite here (the default trivially satisfies the
+    `CHECK` for every existing row), no table rebuild needed.
+  - **`create_task`'s contract changes (breaking):** `create_task` already shipped
+    in v1, so this is a retrofit, not a fresh design. `CreateTaskInput.complexity_hint`
+    becomes required (`z.enum(["normal", "high"])`, no `.optional()`) at both the
+    MCP tool layer and the domain `TaskStatus`-style TS type — every existing call
+    site across the test suite (`tasks.test.ts`, `split.test.ts`, `epics.test.ts`,
+    `mcp-smoke.test.ts`, `ownership.test.ts`, the lifecycle/verification tests,
+    `cli.test.ts`) needs updating to pass it explicitly. Mechanical, but broad.
+  - **`create_tasks` (Item 2) kept in sync from the start:** its per-task spec gets
+    `complexity_hint` as a required field too, written directly into Item 2 now —
+    avoiding the staleness bug an earlier review round already caught once for
+    `release_id`/`priority`.
+  - **`splitTask` inheritance:** `SplitSubtaskInput` gets an optional
+    `complexity_hint?` — inherits `original.complexity_hint` by default (same
+    pattern as `epic_id`/`release_id`) if omitted, but can be overridden per
+    subtask, since splitting sometimes reveals one piece is meaningfully
+    harder/easier than the other.
+  - **Exposure only, no scheduling effect:** surfaces on `get_next_task`/`get_task`'s
+    `TaskDetail` (Item 1) and `list_tasks`'s `TaskSummary`, but doesn't affect
+    `get_next_task`'s selection order at all — that's `priority`'s job (Item 3);
+    this is purely a hint for *which agent* implements the task, not *when*. No
+    dedicated `list_tasks` filter for it in this pass — that param list is already
+    flagged as getting long (Item 4); revisit only if filtering by this proves
+    needed in practice.
 
 ## Implemented
 
