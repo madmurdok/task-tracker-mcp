@@ -29,6 +29,11 @@ and hand off work across sessions.
   told to re-plan the graph itself; that reconciliation step stays manual.
 - A full UI/viewer — v2 added a minimal read-only status CLI (see Interfaces), but
   it's a print-and-exit tool, not an interactive viewer.
+- Epics participating in scheduling — v3 added epics as a pure grouping/reporting
+  layer (`create_epic`, `list_epics`, `get_epic_status`, `epic_id` on tasks), but
+  epics don't enter the dependency graph, can't depend on each other, and
+  `get_next_task` is not epic-aware; they exist so related tasks can be organized
+  and reported on together, not to change how work is scheduled.
 
 ## Constraints
 
@@ -120,6 +125,8 @@ sequenceDiagram
 ```mermaid
 erDiagram
     PROJECTS ||--o{ TASKS : has
+    PROJECTS ||--o{ EPICS : has
+    EPICS ||--o{ TASKS : groups
     TASKS ||--o{ TASK_FILES : references
     TASKS ||--o{ TASK_DEPENDENCIES : "depends on"
     TASKS ||--o{ HANDOFF_NOTES : accumulates
@@ -132,9 +139,17 @@ erDiagram
         text design_doc_hash "nullable, sha256 of doc content at create_project time"
         text created_at
     }
+    EPICS {
+        text id PK
+        text project_id FK
+        text name "unique per project (not globally) - see Interfaces"
+        text description
+        text created_at
+    }
     TASKS {
         text id PK
         text project_id FK
+        text epic_id "nullable FK - grouping only, see Non-goals"
         text title
         text description
         text acceptance_criteria
@@ -166,7 +181,9 @@ erDiagram
 
 `status = blocked` is derived, not stored authoritatively — `get_next_task` and
 `list_tasks` compute it from unmet dependencies at query time, so it can't drift out
-of sync with the graph.
+of sync with the graph. An epic's status is derived the same way: it's an aggregate
+(`get_epic_status`/`list_epics`) over its tasks' computed statuses, never stored on
+the epic itself.
 
 ## Interfaces
 
@@ -181,17 +198,20 @@ discoverable.
 
 - `create_project(name, root_path, design_doc_path?) -> { project_id, design_doc_hash }` — pass `design_doc_path` (relative to `root_path`) to hash it now and enable later `check_doc_sync` calls. Rejects with an error if `name` is already in use (see Data Model).
 - `list_projects() -> { projects: [{ id, name, root_path }] }` — lets Claude or a human look up a project's id/name without going around the MCP server.
-- `create_task(project_id, title, description, acceptance_criteria, file_paths[], depends_on?: task_id[]) -> { task_id, estimated_tokens, over_budget: bool }`
+- `create_epic(project_id, name, description?) -> { epic_id }` — `name` must be unique within the project (not globally, unlike project names — the same epic name can repeat across different projects).
+- `list_epics(project_id) -> { epics: [{ id, name, description, total, done, in_progress, blocked, pending, percent }] }` — status counts are aggregated per epic in the same call, no follow-up needed per epic.
+- `get_epic_status(project_id, epic_id) -> { id, name, total, done, in_progress, blocked, pending, percent }` — `epic_id` accepts an epic id or its name within that project (mirrors the project id-or-name convention).
+- `create_task(project_id, title, description, acceptance_criteria, file_paths[], epic_id?, depends_on?: task_id[]) -> { task_id, estimated_tokens, over_budget: bool }` — `epic_id` (optional) accepts an epic id or its name within `project_id`; rejects an epic that doesn't exist or belongs to a different project.
 - `add_dependency(task_id, depends_on_task_id) -> { ok: true }` (rejects if it would create a cycle)
-- `split_task(task_id, subtasks: [{title, description, acceptance_criteria, file_paths}]) -> { new_task_ids[] }` — original task is replaced; its dependents and dependencies are rewired onto the subtasks.
-- `get_next_task(project_id) -> { task } | { task: null, reason: "all_done" | "all_blocked", blocked_on?: [...] }` — atomically marks the returned task `in_progress` and gives it a 30-minute lock lease as part of the same transaction that selects it (see Failure Modes for both the no-duplicate-hand-out guarantee and stale-lock reclaim).
+- `split_task(task_id, subtasks: [{title, description, acceptance_criteria, file_paths}]) -> { new_task_ids[] }` — original task is replaced; its dependents and dependencies are rewired onto the subtasks, which also inherit its `epic_id`.
+- `get_next_task(project_id) -> { task } | { task: null, reason: "all_done" | "all_blocked", blocked_on?: [...] }` — atomically marks the returned task `in_progress` and gives it a 30-minute lock lease as part of the same transaction that selects it (see Failure Modes for both the no-duplicate-hand-out guarantee and stale-lock reclaim). Not epic-aware — picks from the whole project's graph regardless of epic (see Non-goals).
 - `claim_task(task_id, session_id) -> { ok: true } | conflict error` — records `owner_session_id` and renews the lock lease; rejects with `{ error: "conflict", current_owner_session_id, lock_expires_at }` if a different session's lock is still active.
 - `release_task(task_id, session_id, force?) -> { ok: true } | conflict error` — gives up ownership immediately (back to `pending`) instead of waiting out the lease; `force: true` overrides another session's still-active lock.
 - `check_doc_sync(project_id) -> { tracked, in_sync, design_doc_path, stored_hash, current_hash }` — compares the tracked design doc's current hash against the one captured at `create_project` time; `tracked: false` means no doc was ever registered.
 - `add_handoff_note(task_id, session_id, { decisions, remaining_work, discoveries }) -> { ok: true }`
 - `complete_task(task_id, summary, test_command?, force?) -> { ok: true, unblocked_task_ids: [...] } | verification_failed error` — runs the Completion Verifier first (declared files changed + `test_command` exits zero, if given); `force: true` skips it.
 - `get_project_status(project_id) -> { total, done, in_progress, blocked, pending, percent }`
-- `list_tasks(project_id, status?) -> { tasks: [{ id, title, status, estimated_tokens }] }` — summary rows only; use `get_next_task`/a future `get_task` for full detail.
+- `list_tasks(project_id, status?, epic_id?) -> { tasks: [{ id, title, status, estimated_tokens, epic_id }] }` — summary rows only; use `get_next_task`/a future `get_task` for full detail. `epic_id` (optional) scopes the list to one epic.
 - **Status CLI** (outside MCP): `node dist/cli/status.js [project_id_or_name]` — no arg lists every registered project's status; with an arg, prints that project's status plus its full task list. Read-only, opens the DB directly.
 
 ## Failure Modes & Edge Cases

@@ -1,4 +1,5 @@
 import type { DatabaseInstance } from "../db/connection.js";
+import { requireEpic, listEpics, type Epic } from "./epics.js";
 import { requireProject } from "./projects.js";
 import type { Task } from "./tasks.js";
 
@@ -9,6 +10,7 @@ export interface TaskSummary {
   title: string;
   status: DisplayStatus;
   estimated_tokens: number;
+  epic_id: string | null;
 }
 
 export interface ProjectStatus {
@@ -130,28 +132,36 @@ export function listTasks(
   db: DatabaseInstance,
   projectRef: string,
   statusFilter?: DisplayStatus,
+  epicRef?: string,
 ): TaskSummary[] {
   const projectId = requireProject(db, projectRef).id;
-  const tasks = db
-    .prepare(`SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC`)
-    .all(projectId) as Task[];
+  const epicId = epicRef ? requireEpic(db, projectId, epicRef).id : null;
+
+  const tasks = epicId
+    ? (db
+        .prepare(`SELECT * FROM tasks WHERE project_id = ? AND epic_id = ? ORDER BY created_at ASC`)
+        .all(projectId, epicId) as Task[])
+    : (db
+        .prepare(`SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC`)
+        .all(projectId) as Task[]);
 
   const summaries = tasks.map((task) => ({
     id: task.id,
     title: task.title,
     status: displayStatus(db, task),
     estimated_tokens: task.estimated_tokens,
+    epic_id: task.epic_id,
   }));
 
   return statusFilter ? summaries.filter((s) => s.status === statusFilter) : summaries;
 }
 
-export function getProjectStatus(db: DatabaseInstance, projectRef: string): ProjectStatus {
-  const projectId = requireProject(db, projectRef).id;
-  const tasks = db
-    .prepare(`SELECT id, status FROM tasks WHERE project_id = ?`)
-    .all(projectId) as Array<Pick<Task, "id" | "status">>;
-
+/**
+ * Shared by getProjectStatus and the epic-scoped variants below - status
+ * counting is identical, only the task set fed in (by project vs. by epic)
+ * differs.
+ */
+function aggregateStatus(db: DatabaseInstance, tasks: Array<Pick<Task, "id" | "status">>): ProjectStatus {
   const counts: ProjectStatus = {
     total: tasks.length,
     done: 0,
@@ -169,4 +179,36 @@ export function getProjectStatus(db: DatabaseInstance, projectRef: string): Proj
   counts.percent = counts.total === 0 ? 0 : Math.round((counts.done / counts.total) * 100);
 
   return counts;
+}
+
+export function getProjectStatus(db: DatabaseInstance, projectRef: string): ProjectStatus {
+  const projectId = requireProject(db, projectRef).id;
+  const tasks = db
+    .prepare(`SELECT id, status FROM tasks WHERE project_id = ?`)
+    .all(projectId) as Array<Pick<Task, "id" | "status">>;
+
+  return aggregateStatus(db, tasks);
+}
+
+export type EpicStatus = Epic & ProjectStatus;
+
+function epicTaskCounts(db: DatabaseInstance, epicId: string): ProjectStatus {
+  const tasks = db
+    .prepare(`SELECT id, status FROM tasks WHERE epic_id = ?`)
+    .all(epicId) as Array<Pick<Task, "id" | "status">>;
+  return aggregateStatus(db, tasks);
+}
+
+export function getEpicStatus(db: DatabaseInstance, projectRef: string, epicRef: string): EpicStatus {
+  const projectId = requireProject(db, projectRef).id;
+  const epic = requireEpic(db, projectId, epicRef);
+
+  return { ...epic, ...epicTaskCounts(db, epic.id) };
+}
+
+export function listEpicsWithStatus(db: DatabaseInstance, projectRef: string): EpicStatus[] {
+  const projectId = requireProject(db, projectRef).id;
+  const epics = listEpics(db, projectId);
+
+  return epics.map((epic) => ({ ...epic, ...epicTaskCounts(db, epic.id) }));
 }

@@ -44,7 +44,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 13 registered tools over the same transport", async () => {
+  it("exercises all 16 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -59,6 +59,9 @@ describe("MCP server smoke test", () => {
         "create_project",
         "list_projects",
         "check_doc_sync",
+        "create_epic",
+        "list_epics",
+        "get_epic_status",
         "create_task",
         "add_dependency",
         "split_task",
@@ -86,12 +89,16 @@ describe("MCP server smoke test", () => {
       current_hash: null,
     });
 
+    const { epic_id } = await call("create_epic", { project_id, name: "Auth rework" });
+
     const { task_id: prereqId } = await call("create_task", {
       project_id,
+      epic_id,
       title: "Prereq",
     });
     const { task_id: bigTaskId } = await call("create_task", {
       project_id,
+      epic_id,
       title: "Too big",
     });
     await call("add_dependency", { task_id: bigTaskId, depends_on_task_id: prereqId });
@@ -104,6 +111,15 @@ describe("MCP server smoke test", () => {
 
     const listed = await call("list_tasks", { project_id });
     expect(listed.tasks).toHaveLength(3); // prereq + 2 subtasks (original was replaced)
+
+    const listedByEpic = await call("list_tasks", { project_id, epic_id });
+    expect(listedByEpic.tasks).toHaveLength(3); // all of them stayed under the epic
+
+    const { epics } = await call("list_epics", { project_id });
+    expect(epics).toEqual([expect.objectContaining({ id: epic_id, name: "Auth rework", total: 3 })]);
+
+    const epicStatus = await call("get_epic_status", { project_id, epic_id: "Auth rework" });
+    expect(epicStatus).toMatchObject({ id: epic_id, total: 3, pending: 1, blocked: 2 });
 
     const statusBefore = await call("get_project_status", { project_id: "Demo" });
     expect(statusBefore.total).toBe(3);

@@ -8,9 +8,21 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS epics (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_epics_project_id ON epics(project_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_epics_project_name ON epics(project_id, name);
+
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY,
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  epic_id TEXT REFERENCES epics(id) ON DELETE SET NULL,
   title TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   acceptance_criteria TEXT NOT NULL DEFAULT '',
@@ -24,6 +36,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_epic_id ON tasks(epic_id);
 
 CREATE TABLE IF NOT EXISTS task_files (
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -72,5 +85,6 @@ export function runMigrations(db: DatabaseInstance): void {
   ensureColumn(db, "tasks", "lock_expires_at", "TEXT");
   ensureColumn(db, "projects", "design_doc_path", "TEXT");
   ensureColumn(db, "projects", "design_doc_hash", "TEXT");
+  ensureColumn(db, "tasks", "epic_id", "TEXT REFERENCES epics(id) ON DELETE SET NULL");
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(name)`);
 }

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
 import { isOverBudget, type BudgetEstimator } from "./budget.js";
 import { addDependency } from "./dependencies.js";
+import { requireEpic } from "./epics.js";
 import { requireProject } from "./projects.js";
 
 export type TaskStatus = "pending" | "in_progress" | "done";
@@ -9,6 +10,7 @@ export type TaskStatus = "pending" | "in_progress" | "done";
 export interface Task {
   id: string;
   project_id: string;
+  epic_id: string | null;
   title: string;
   description: string;
   acceptance_criteria: string;
@@ -22,6 +24,7 @@ export interface Task {
 
 export interface CreateTaskInput {
   project_id: string;
+  epic_id?: string;
   title: string;
   description?: string;
   acceptance_criteria?: string;
@@ -39,6 +42,7 @@ export function createTask(
   input: CreateTaskInput,
 ): CreateTaskResult {
   const project = requireProject(db, input.project_id);
+  const epicId = input.epic_id ? requireEpic(db, project.id, input.epic_id).id : null;
 
   const filePaths = input.file_paths ?? [];
   const estimatedTokens = estimator.estimateTokens(project.root_path, filePaths);
@@ -47,6 +51,7 @@ export function createTask(
   const task: Task = {
     id: randomUUID(),
     project_id: project.id,
+    epic_id: epicId,
     title: input.title,
     description: input.description ?? "",
     acceptance_criteria: input.acceptance_criteria ?? "",
@@ -59,8 +64,8 @@ export function createTask(
   };
 
   const insertTask = db.prepare(
-    `INSERT INTO tasks (id, project_id, title, description, acceptance_criteria, status, estimated_tokens, owner_session_id, lock_expires_at, created_at, updated_at)
-     VALUES (@id, @project_id, @title, @description, @acceptance_criteria, @status, @estimated_tokens, @owner_session_id, @lock_expires_at, @created_at, @updated_at)`,
+    `INSERT INTO tasks (id, project_id, epic_id, title, description, acceptance_criteria, status, estimated_tokens, owner_session_id, lock_expires_at, created_at, updated_at)
+     VALUES (@id, @project_id, @epic_id, @title, @description, @acceptance_criteria, @status, @estimated_tokens, @owner_session_id, @lock_expires_at, @created_at, @updated_at)`,
   );
   const insertFile = db.prepare(`INSERT INTO task_files (task_id, file_path) VALUES (?, ?)`);
 
@@ -114,7 +119,11 @@ export function splitTask(
 
     const newTaskIds = subtasks.map(
       (subtaskInput) =>
-        createTask(db, estimator, { project_id: original.project_id, ...subtaskInput }).task.id,
+        createTask(db, estimator, {
+          project_id: original.project_id,
+          epic_id: original.epic_id ?? undefined,
+          ...subtaskInput,
+        }).task.id,
     );
 
     for (const dependent of dependents) {

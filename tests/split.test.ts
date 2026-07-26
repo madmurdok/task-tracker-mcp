@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { openDatabase } from "../src/db/connection.js";
+import { createEpic } from "../src/domain/epics.js";
 import { createProject } from "../src/domain/projects.js";
 import { createTask, splitTask } from "../src/domain/tasks.js";
 import { addDependency } from "../src/domain/dependencies.js";
@@ -53,6 +54,26 @@ describe("splitTask", () => {
     expect(remainingEdgesForOriginal).toHaveLength(0);
 
     void project;
+  });
+
+  it("keeps subtasks under the original task's epic", () => {
+    const { db, project } = setup();
+    const epic = createEpic(db, { project_id: project.id, name: "Auth rework" });
+    const original = createTask(db, noopEstimator, {
+      project_id: project.id,
+      epic_id: epic.id,
+      title: "Too big",
+    }).task;
+
+    const { new_task_ids } = splitTask(db, noopEstimator, original.id, [
+      { title: "Part 1" },
+      { title: "Part 2" },
+    ]);
+
+    for (const subtaskId of new_task_ids) {
+      const row = db.prepare("SELECT epic_id FROM tasks WHERE id = ?").get(subtaskId);
+      expect(row).toMatchObject({ epic_id: epic.id });
+    }
   });
 
   it("rejects an unknown task_id", () => {

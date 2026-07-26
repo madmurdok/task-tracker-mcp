@@ -21,13 +21,15 @@ export function registerStatusTools(server: McpServer, db: DatabaseInstance): vo
     "list_tasks",
     {
       description:
-        "List tasks for a project as compact summary rows, optionally filtered by status. project_id accepts a project id or its unique name.",
+        "List tasks for a project as compact summary rows, optionally filtered by status and/or epic. project_id accepts a project id or its unique name; epic_id accepts an epic id or its name within that project.",
       inputSchema: {
         project_id: z.string().min(1),
         status: statusEnum.optional(),
+        epic_id: z.string().optional(),
       },
     },
-    async ({ project_id, status }) => jsonResult({ tasks: listTasks(db, project_id, status) }),
+    async ({ project_id, status, epic_id }) =>
+      jsonResult({ tasks: listTasks(db, project_id, status, epic_id) }),
   );
 
   server.registerTool(
