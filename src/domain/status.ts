@@ -1,7 +1,7 @@
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireEpic, listEpics, type Epic } from "./epics.js";
 import { listHandoffNotes, type HandoffNote } from "./handoffNotes.js";
-import { requireProject } from "./projects.js";
+import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, requireRelease, type Release } from "./releases.js";
 import { listTaskFilePaths, requireTask, type Task } from "./tasks.js";
 
@@ -26,10 +26,12 @@ export interface ProjectStatus {
   percent: number;
 }
 
-export type GetNextTaskResult =
+type NextTaskOutcome =
   | { task: TaskDetail }
   | { task: null; reason: "all_done" }
   | { task: null; reason: "all_blocked"; blocked_on: string[] };
+
+export type GetNextTaskResult = NextTaskOutcome & { doc_drift: boolean };
 
 export interface TaskDetail extends Task {
   file_paths: string[];
@@ -110,7 +112,7 @@ function handOut(
   candidate: Task,
   nowIso: string,
   ownerSessionId: string | null,
-): GetNextTaskResult {
+): NextTaskOutcome {
   const lockExpiresAt = withLease(nowIso);
   db.prepare(
     `UPDATE tasks SET status = 'in_progress', owner_session_id = ?, lock_expires_at = ?, updated_at = ? WHERE id = ?`,
@@ -119,8 +121,10 @@ function handOut(
 }
 
 export function getNextTask(db: DatabaseInstance, projectRef: string): GetNextTaskResult {
-  const select = db.transaction((): GetNextTaskResult => {
-    const projectId = requireProject(db, projectRef).id;
+  const project = requireProject(db, projectRef);
+
+  const select = db.transaction((): NextTaskOutcome => {
+    const projectId = project.id;
     const nowIso = new Date().toISOString();
 
     const pendingTasks = db
@@ -164,7 +168,7 @@ export function getNextTask(db: DatabaseInstance, projectRef: string): GetNextTa
     return { task: null, reason: "all_blocked", blocked_on: pendingTasks.map((t) => t.id) };
   });
 
-  return select();
+  return { ...select(), doc_drift: isDocDrifted(project) };
 }
 
 export function listTasks(
@@ -231,13 +235,16 @@ function aggregateStatus(db: DatabaseInstance, tasks: Array<Pick<Task, "id" | "s
   return counts;
 }
 
-export function getProjectStatus(db: DatabaseInstance, projectRef: string): ProjectStatus {
-  const projectId = requireProject(db, projectRef).id;
+export function getProjectStatus(
+  db: DatabaseInstance,
+  projectRef: string,
+): ProjectStatus & { doc_drift: boolean } {
+  const project = requireProject(db, projectRef);
   const tasks = db
     .prepare(`SELECT id, status FROM tasks WHERE project_id = ?`)
-    .all(projectId) as Array<Pick<Task, "id" | "status">>;
+    .all(project.id) as Array<Pick<Task, "id" | "status">>;
 
-  return aggregateStatus(db, tasks);
+  return { ...aggregateStatus(db, tasks), doc_drift: isDocDrifted(project) };
 }
 
 export type EpicStatus = Epic & ProjectStatus;

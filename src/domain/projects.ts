@@ -97,14 +97,38 @@ export interface DocSyncResult {
 }
 
 /**
- * Compares a project's design doc against the hash captured when it was last
- * tracked (create_project's design_doc_path). `tracked: false` means no doc
- * was ever registered - there's nothing to compare, so nothing to flag.
- * A missing/unreadable doc (current_hash null) always counts as *not*
- * in sync rather than silently passing, matching the "fail closed" approach
- * CompletionVerifier already takes for a similar problem (see verification.ts).
+ * Cheap, allocation-free drift check reused by getNextTask/getProjectStatus
+ * (status.ts) so drift surfaces on every routine status check instead of only
+ * when Claude remembers to call check_doc_sync directly (see Item 5 in
+ * REQUIREMENTS.md). An unreadable doc (current_hash null) counts as drifted,
+ * same "fail closed" call checkDocSync already makes below.
  */
-export function checkDocSync(db: DatabaseInstance, projectRef: string): DocSyncResult {
+export function isDocDrifted(project: Project): boolean {
+  if (!project.design_doc_path) return false;
+  const currentHash = hashDesignDoc(project.root_path, project.design_doc_path);
+  return currentHash === null || currentHash !== project.design_doc_hash;
+}
+
+/**
+ * Compares a project's design doc against the hash captured when it was last
+ * tracked (create_project's design_doc_path, or the last `acknowledge: true`
+ * call). `tracked: false` means no doc was ever registered - there's nothing
+ * to compare, so nothing to flag. A missing/unreadable doc (current_hash null)
+ * always counts as *not* in sync rather than silently passing, matching the
+ * "fail closed" approach CompletionVerifier already takes for a similar
+ * problem (see verification.ts).
+ *
+ * `acknowledge: true` persists the current hash as the new baseline once
+ * Claude has manually reconciled the task graph with the doc's new content -
+ * the only way to do that before this option existed was to re-run
+ * create_project, which created a whole new project rather than updating the
+ * existing one in place.
+ */
+export function checkDocSync(
+  db: DatabaseInstance,
+  projectRef: string,
+  options?: { acknowledge?: boolean },
+): DocSyncResult {
   const project = requireProject(db, projectRef);
 
   if (!project.design_doc_path) {
@@ -118,6 +142,17 @@ export function checkDocSync(db: DatabaseInstance, projectRef: string): DocSyncR
   }
 
   const currentHash = hashDesignDoc(project.root_path, project.design_doc_path);
+
+  if (options?.acknowledge && currentHash !== null) {
+    db.prepare(`UPDATE projects SET design_doc_hash = ? WHERE id = ?`).run(currentHash, project.id);
+    return {
+      tracked: true,
+      in_sync: true,
+      design_doc_path: project.design_doc_path,
+      stored_hash: currentHash,
+      current_hash: currentHash,
+    };
+  }
 
   return {
     tracked: true,

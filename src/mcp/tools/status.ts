@@ -11,7 +11,7 @@ export function registerStatusTools(server: McpServer, db: DatabaseInstance): vo
     "get_next_task",
     {
       description:
-        "Atomically pick the next unblocked pending task for a project and mark it in_progress. project_id accepts a project id or its unique name.",
+        "Atomically pick the next unblocked pending task for a project and mark it in_progress. project_id accepts a project id or its unique name. doc_drift:true means the project's tracked design doc changed since it was last hashed - re-check the plan and call check_doc_sync(acknowledge:true) once reconciled.",
       inputSchema: { project_id: z.string().min(1) },
     },
     async ({ project_id }) => jsonResult(getNextTask(db, project_id)),
@@ -47,7 +47,7 @@ export function registerStatusTools(server: McpServer, db: DatabaseInstance): vo
     "get_project_status",
     {
       description:
-        "Aggregate task counts (and completion percent) for a project. project_id accepts a project id or its unique name.",
+        "Aggregate task counts (and completion percent) for a project. project_id accepts a project id or its unique name. doc_drift:true means the tracked design doc changed since it was last hashed - see check_doc_sync.",
       inputSchema: { project_id: z.string().min(1) },
     },
     async ({ project_id }) => jsonResult(getProjectStatus(db, project_id)),
