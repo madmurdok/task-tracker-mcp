@@ -92,6 +92,17 @@ a {
   font-size: 0.85rem;
 }
 
+.connection-status {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.connection-status[data-state="disconnected"] {
+  color: var(--warning);
+  font-weight: 600;
+}
+
 .error-state {
   margin: 0;
   padding: 0.75rem 1rem;

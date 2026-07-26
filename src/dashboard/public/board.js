@@ -138,6 +138,9 @@ function renderBoard(board) {
   document.title = `${board.project_name} - task-tracker-mcp dashboard`;
   driftBanner.hidden = !board.doc_drift;
 
+  // Called on every poll now, not just once - rebuild the lanes from scratch
+  // each time rather than trying to patch the existing DOM in place.
+  while (container.firstChild) container.removeChild(container.firstChild);
   for (const lane of board.lanes) {
     container.appendChild(createLane(lane));
   }
@@ -149,18 +152,50 @@ function showError(message) {
   errorState.hidden = false;
 }
 
-async function loadBoard() {
-  const projectId = new URLSearchParams(window.location.search).get("project");
-  if (!projectId) {
-    showError("No project selected. Go back to the projects list and pick one.");
-    return;
-  }
+const POLL_INTERVAL_MS = 1500;
+const CLOCK_TICK_MS = 1000;
 
+let lastUpdatedAt = null;
+let connected = true;
+let pollTimer = null;
+let clockTimer = null;
+
+function setConnectionStatus(state, message) {
+  const status = document.getElementById("connection-status");
+  status.hidden = false;
+  status.dataset.state = state;
+  status.textContent = message;
+}
+
+// Runs once a second independently of the poll interval, purely to keep the
+// "Xs ago" label ticking between polls. Must defer to whatever the most
+// recent poll actually found - otherwise this would blindly recompute
+// "connected" from a stale lastUpdatedAt every second and stomp on a
+// "Disconnected" message pollOnce just set, since the two timers run on
+// unrelated schedules.
+function tickConnectionLabel() {
+  if (!connected || lastUpdatedAt === null) return;
+  const seconds = Math.max(0, Math.round((Date.now() - lastUpdatedAt) / 1000));
+  setConnectionStatus("connected", seconds <= 1 ? "Last updated just now" : `Last updated ${seconds}s ago`);
+}
+
+function stopPolling() {
+  if (pollTimer !== null) clearInterval(pollTimer);
+  if (clockTimer !== null) clearInterval(clockTimer);
+  pollTimer = null;
+  clockTimer = null;
+}
+
+async function pollOnce(projectId) {
   let res;
   try {
     res = await fetch(`/api/projects/${encodeURIComponent(projectId)}/board`);
   } catch {
-    showError("Could not reach the dashboard server.");
+    // The server is unreachable (killed, network hiccup) - this is transient,
+    // so keep the last-rendered board on screen and keep retrying on the next
+    // tick rather than blanking the page or giving up.
+    connected = false;
+    setConnectionStatus("disconnected", "Disconnected - retrying...");
     return;
   }
 
@@ -168,15 +203,35 @@ async function loadBoard() {
   // raw status when the body isn't the JSON we expect.
   const body = await res.json().catch(() => null);
   if (!res.ok) {
+    // Unlike a network failure, a reachable server saying "unknown project"
+    // won't fix itself on retry - stop polling and show it as fatal instead
+    // of retrying the same failing request forever.
     showError(body?.error ?? `Could not load the board (HTTP ${res.status}).`);
+    stopPolling();
     return;
   }
   if (!body) {
-    showError("The dashboard server returned an unreadable response.");
+    connected = false;
+    setConnectionStatus("disconnected", "Disconnected - retrying...");
     return;
   }
 
   renderBoard(body);
+  connected = true;
+  lastUpdatedAt = Date.now();
+  tickConnectionLabel();
+}
+
+function loadBoard() {
+  const projectId = new URLSearchParams(window.location.search).get("project");
+  if (!projectId) {
+    showError("No project selected. Go back to the projects list and pick one.");
+    return;
+  }
+
+  pollOnce(projectId);
+  pollTimer = setInterval(() => pollOnce(projectId), POLL_INTERVAL_MS);
+  clockTimer = setInterval(tickConnectionLabel, CLOCK_TICK_MS);
 }
 
 loadBoard();
