@@ -74,3 +74,109 @@ a {
 .empty-state {
   color: var(--muted);
 }
+
+/* Board page */
+
+.board-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.board-header a {
+  font-size: 0.85rem;
+}
+
+.error-state {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  color: var(--muted);
+  max-width: 32rem;
+}
+
+.board {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  /* Lane columns have a minimum width, so a narrow window scrolls the whole
+     board sideways instead of each lane scrolling on its own. */
+  overflow-x: auto;
+}
+
+.lane-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.lane-columns {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(15rem, 1fr));
+  gap: 0.75rem;
+  align-items: start;
+}
+
+.column {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  padding: 0.75rem;
+}
+
+.column-title {
+  margin: 0 0 0.5rem;
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.column-count {
+  font-weight: 400;
+}
+
+.column-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.card {
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  padding: 0.5rem 0.625rem;
+  background: var(--bg);
+}
+
+.card-title {
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.375rem;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.card-status {
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  padding: 0 0.375rem;
+}
+
+.card-description {
+  margin: 0.5rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: pre-wrap;
+}

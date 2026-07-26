@@ -2,6 +2,7 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import { createServer } from "../src/dashboard/server.js";
+import type { BoardData } from "../src/domain/board.js";
 import { createProject } from "../src/domain/projects.js";
 import { createTask } from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
@@ -41,9 +42,9 @@ describe("dashboard server", () => {
 
     const res = await fetch(`${baseUrl}/api/projects/${project.id}/board`);
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = (await res.json()) as BoardData;
     expect(body.project_id).toBe(project.id);
-    expect(body.lanes[0].tasks.map((t: { title: string }) => t.title)).toEqual(["Task A"]);
+    expect(body.lanes[0].tasks.map((t) => t.title)).toEqual(["Task A"]);
   });
 
   it("resolves a project by its unique name too, same as the MCP tools", async () => {
@@ -51,13 +52,15 @@ describe("dashboard server", () => {
 
     const res = await fetch(`${baseUrl}/api/projects/Demo/board`);
     expect(res.status).toBe(200);
-    expect((await res.json()).project_id).toBe(project.id);
+    const body = (await res.json()) as BoardData;
+    expect(body.project_id).toBe(project.id);
   });
 
   it("returns a clean 404 (not a 500) for an unknown project id", async () => {
     const res = await fetch(`${baseUrl}/api/projects/does-not-exist/board`);
     expect(res.status).toBe(404);
-    expect((await res.json()).error).toMatch(/Unknown project/);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/Unknown project/);
   });
 
   it("returns 404 for a static asset that doesn't exist", async () => {
