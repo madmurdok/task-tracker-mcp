@@ -19,6 +19,10 @@ function createCard(task, statusLabel) {
   const card = document.createElement("article");
   card.className = "card";
   card.dataset.status = task.status;
+  // is_stale is independent of status (only ever true alongside
+  // "in_progress") - about to be auto-reclaimed by the next get_next_task
+  // call, so it gets its own highlight rather than reusing a status color.
+  if (task.is_stale) card.classList.add("is-stale");
 
   const title = document.createElement("h4");
   title.className = "card-title";
@@ -38,6 +42,28 @@ function createCard(task, statusLabel) {
   priority.className = "card-priority";
   priority.textContent = `priority ${task.priority}`;
   meta.appendChild(priority);
+
+  if (task.epic_name) {
+    const epic = document.createElement("span");
+    epic.className = "card-epic";
+    epic.textContent = task.epic_name;
+    meta.appendChild(epic);
+  }
+
+  const owner = document.createElement("span");
+  owner.className = "card-owner";
+  // Kept visible (not omitted) even when unclaimed, so "nobody's working
+  // this" is as scannable at a glance as "session X is".
+  owner.textContent = task.owner_session_id ?? "unclaimed";
+  if (!task.owner_session_id) owner.classList.add("card-owner-unclaimed");
+  meta.appendChild(owner);
+
+  if (task.is_stale) {
+    const stale = document.createElement("span");
+    stale.className = "card-stale-flag";
+    stale.textContent = "stale lock";
+    meta.appendChild(stale);
+  }
 
   card.appendChild(meta);
 
@@ -106,9 +132,11 @@ function createLane(lane) {
 function renderBoard(board) {
   const title = document.getElementById("board-title");
   const container = document.getElementById("board");
+  const driftBanner = document.getElementById("doc-drift-banner");
 
   title.textContent = board.project_name;
   document.title = `${board.project_name} - task-tracker-mcp dashboard`;
+  driftBanner.hidden = !board.doc_drift;
 
   for (const lane of board.lanes) {
     container.appendChild(createLane(lane));

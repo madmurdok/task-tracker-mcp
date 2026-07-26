@@ -6,6 +6,8 @@
   --text: #1b1f24;
   --muted: #6b7280;
   --accent: #3b6fe0;
+  --warning: #a15c00;
+  --warning-bg: #fff2d9;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -16,6 +18,8 @@
     --text: #e7e9ec;
     --muted: #9aa0a8;
     --accent: #6f9bff;
+    --warning: #e0b04a;
+    --warning-bg: #3a2f14;
   }
 }
 
@@ -179,4 +183,48 @@ a {
   font-size: 0.8rem;
   color: var(--muted);
   white-space: pre-wrap;
+}
+
+.card-epic {
+  border: 1px solid var(--accent);
+  border-radius: 0.25rem;
+  padding: 0 0.375rem;
+  color: var(--accent);
+}
+
+.card-owner-unclaimed {
+  font-style: italic;
+}
+
+.card-stale-flag {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+/* is-stale is independent of status (only ever paired with in_progress) -
+   an in_progress card whose lock lease has already expired, about to be
+   auto-reclaimed by the next get_next_task call. */
+.card.is-stale {
+  border-color: var(--warning);
+  background: var(--warning-bg);
+}
+
+/* Cancelled tasks stay visible, not hidden, same principle Item 6 already
+   applied to status aggregation - just visually de-emphasized. */
+.card[data-status="cancelled"] {
+  opacity: 0.55;
+}
+
+.card[data-status="cancelled"] .card-title {
+  text-decoration: line-through;
+}
+
+.doc-drift-banner {
+  margin: 0 0 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--warning);
+  border-radius: 0.5rem;
+  background: var(--warning-bg);
+  color: var(--warning);
+  max-width: 40rem;
 }
