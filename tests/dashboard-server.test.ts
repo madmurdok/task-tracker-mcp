@@ -60,9 +60,19 @@ describe("dashboard server", () => {
     expect((await res.json()).error).toMatch(/Unknown project/);
   });
 
-  it("returns 404 for a static asset that doesn't exist yet", async () => {
-    const res = await fetch(`${baseUrl}/index.html`);
+  it("returns 404 for a static asset that doesn't exist", async () => {
+    const res = await fetch(`${baseUrl}/does-not-exist.html`);
     expect(res.status).toBe(404);
+  });
+
+  it("serves the picker page's static assets", async () => {
+    const htmlRes = await fetch(`${baseUrl}/`);
+    expect(htmlRes.status).toBe(200);
+    expect(htmlRes.headers.get("content-type")).toMatch(/text\/html/);
+
+    const jsRes = await fetch(`${baseUrl}/picker.js`);
+    expect(jsRes.status).toBe(200);
+    expect(jsRes.headers.get("content-type")).toMatch(/javascript/);
   });
 
   it("rejects a static path that tries to escape the public directory", async () => {
