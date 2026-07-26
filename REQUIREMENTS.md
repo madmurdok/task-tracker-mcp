@@ -325,9 +325,21 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
     This needs its own dedicated test (not just the existing schema-shape checks in
     `tests/db.test.ts`): build a DB on the *old* 3-value schema, insert rows, run
     `runMigrations`, and assert both that old rows/statuses survived intact and that
-    a `cancelled` insert now succeeds. Worth a second test simulating two concurrent
-    `openDatabase()` calls against the same pre-migration file to confirm the second
-    one waits and no-ops rather than erroring.
+    a `cancelled` insert now succeeds. Also cover **idempotency**: call
+    `runMigrations` a second time on the already-migrated DB and assert it's a
+    clean no-op (this is what actually exercises the "already migrated?" check from
+    step 1).
+    **Deliberately not covered by an automated test:** the concurrent-process race
+    itself. `better-sqlite3` is synchronous, so genuinely proving two processes
+    racing through this needs a real second OS process or worker thread with a
+    timing-dependent wait/commit dance — a same-process test with two `Database`
+    handles would just deadlock the one JS thread instead of testing anything (see
+    the auto-review discussion this resolves). Given this path only matters once,
+    at the moment an existing DB first upgrades past this migration, and
+    `.immediate()` + `busy_timeout` is a standard, well-understood SQLite pattern,
+    a timing-based test's flakiness risk outweighs what it would prove — leave a
+    code comment on the `.immediate()` call explaining *why* (this reasoning),
+    instead of a test.
   - **Domain — `src/domain/tasks.ts`:** `TaskStatus`/`DisplayStatus` gain
     `"cancelled"`. `displayStatus` needs no change — it already returns
     `task.status` as-is for anything other than `'pending'`, so `'cancelled'` flows
@@ -407,29 +419,14 @@ is just an index.
 
 ## Additional Discussion Topics (auto-review)
 
-### Contradictions
-
-- ~~**Item 6's migration copies a column that can't exist yet on the source
-  table.**~~ **Resolved:** `cancellation_reason` is now added via a routine
-  `ensureColumn` step *before* the CHECK-widening rebuild (see Item 6's Data model),
-  so the rebuild's `INSERT ... SELECT` has a real source column to read.
-- ~~**Item 2's `create_tasks` spec is now stale relative to Items 3 and 4.**~~
-  **Resolved:** Item 2's `create_tasks` spec now includes `release_id?`/`priority?`
-  directly.
-
-### Bottlenecks
-
-- ~~**The CHECK-constraint rebuild (Item 6) assumes a single writer touching the DB
-  during migration, but this project already has two.**~~ **Resolved:** the rebuild
-  runs inside a `db.transaction(fn).immediate()` (acquires the write lock up front)
-  paired with `busy_timeout = 5000`, so a second process waits for the first to
-  finish and then no-ops instead of racing (see Item 6's design).
+Third pass. All five findings from the previous run are still holding (re-checked,
+nothing regressed).
 
 ### Weakly-justified decisions
 
-- ~~**Release notes still only look at `done` tasks, but a release can now close
-  with `cancelled` ones in it too.**~~ **Resolved:** `releaseIt` now appends a
-  `Cancelled:` section to the generated notes (see Item 4, step 4).
-- ~~**`split_task` has no status guard, and Item 6 makes that consequential.**~~
-  **Resolved:** `splitTask` now rejects `done`/`cancelled` originals outright (see
-  Item 1's design).
+- ~~**Item 6's "test two concurrent `openDatabase()` calls" plan glosses over
+  `better-sqlite3` being synchronous.**~~ **Resolved:** the concurrent-race case is
+  deliberately left untested (a same-process test would deadlock; a real one needs a
+  second OS process/worker thread and would be timing-dependent/flaky for what it
+  proves) — covered instead by an idempotency test plus a code comment on
+  `.immediate()` explaining why (see Item 6's design).
