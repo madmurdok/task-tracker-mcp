@@ -44,7 +44,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 11 registered tools over the same transport", async () => {
+  it("exercises all 13 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -57,6 +57,7 @@ describe("MCP server smoke test", () => {
     expect(tools.map((t) => t.name).sort()).toEqual(
       [
         "create_project",
+        "list_projects",
         "check_doc_sync",
         "create_task",
         "add_dependency",
@@ -72,7 +73,11 @@ describe("MCP server smoke test", () => {
     );
 
     const { project_id } = await call("create_project", { name: "Demo", root_path: "/tmp/demo" });
-    const syncBeforeDoc = await call("check_doc_sync", { project_id });
+
+    const { projects } = await call("list_projects", {});
+    expect(projects).toEqual([{ id: project_id, name: "Demo", root_path: "/tmp/demo" }]);
+
+    const syncBeforeDoc = await call("check_doc_sync", { project_id: "Demo" });
     expect(syncBeforeDoc).toEqual({
       tracked: false,
       in_sync: true,
@@ -100,7 +105,7 @@ describe("MCP server smoke test", () => {
     const listed = await call("list_tasks", { project_id });
     expect(listed.tasks).toHaveLength(3); // prereq + 2 subtasks (original was replaced)
 
-    const statusBefore = await call("get_project_status", { project_id });
+    const statusBefore = await call("get_project_status", { project_id: "Demo" });
     expect(statusBefore.total).toBe(3);
 
     const next = await call("get_next_task", { project_id });
@@ -125,6 +130,31 @@ describe("MCP server smoke test", () => {
       summary: "done",
     });
     expect(unblocked_task_ids.sort()).toEqual([...new_task_ids].sort());
+  });
+
+  it("list_projects returns an empty array when nothing is registered yet", async () => {
+    const client = await connectedClient(db);
+    const result = await client.callTool({ name: "list_projects", arguments: {} });
+    const content = result.content as Array<{ type: string; text: string }>;
+    expect(JSON.parse(content[0].text)).toEqual({ projects: [] });
+  });
+
+  it("rejects an unknown project ref and a duplicate project name with isError", async () => {
+    const client = await connectedClient(db);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      const content = result.content as Array<{ type: string; text: string }>;
+      return { isError: result.isError, text: content[0].text };
+    };
+
+    const unknownRef = await call("get_project_status", { project_id: "no-such-project" });
+    expect(unknownRef.isError).toBe(true);
+    expect(unknownRef.text).toMatch(/Unknown project: no-such-project/);
+
+    await call("create_project", { name: "Demo", root_path: "/tmp/demo" });
+    const duplicate = await call("create_project", { name: "Demo", root_path: "/tmp/other" });
+    expect(duplicate.isError).toBe(true);
+    expect(duplicate.text).toMatch(/Project name already in use: Demo/);
   });
 
   it("returns a distinct conflict shape for claim_task ownership contention", async () => {

@@ -104,6 +104,25 @@ describe("getNextTask", () => {
   });
 });
 
+describe("project ref resolution (id or name)", () => {
+  it("getNextTask, listTasks, and getProjectStatus all accept a project name", () => {
+    const { db, project, makeTask } = setup();
+    makeTask("A");
+
+    expect(getNextTask(db, project.name).task?.title).toBe("A");
+    expect(listTasks(db, project.name)).toHaveLength(1);
+    expect(getProjectStatus(db, project.name).total).toBe(1);
+  });
+
+  it("getNextTask, listTasks, and getProjectStatus all reject an unknown project ref", () => {
+    const { db } = setup();
+
+    expect(() => getNextTask(db, "missing")).toThrow(/Unknown project: missing/);
+    expect(() => listTasks(db, "missing")).toThrow(/Unknown project: missing/);
+    expect(() => getProjectStatus(db, "missing")).toThrow(/Unknown project: missing/);
+  });
+});
+
 describe("listTasks / getProjectStatus", () => {
   it("derives blocked status for a pending task with an unmet dependency", () => {
     const { db, project, makeTask } = setup();

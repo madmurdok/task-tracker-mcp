@@ -21,7 +21,7 @@ export function registerTaskTools(
     "create_task",
     {
       description:
-        "Create a task under a project, with its file list and an estimated context cost.",
+        "Create a task under a project, with its file list and an estimated context cost. project_id accepts a project id or its unique name.",
       inputSchema: {
         project_id: z.string().min(1),
         title: z.string().min(1),

@@ -41,11 +41,22 @@ describe("createTask", () => {
     expect(over_budget).toBe(true);
   });
 
-  it("rejects an unknown project_id", () => {
+  it("rejects an unknown project", () => {
     const db = openDatabase(":memory:");
 
     expect(() =>
       createTask(db, stubEstimator(0), { project_id: "missing", title: "x" }),
-    ).toThrow(/Unknown project_id/);
+    ).toThrow(/Unknown project: missing/);
+  });
+
+  it("accepts a project name in place of project_id and stores the literal id as the FK", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+
+    const { task } = createTask(db, stubEstimator(0), { project_id: "Demo", title: "x" });
+
+    expect(task.project_id).toBe(project.id);
+    const row = db.prepare("SELECT project_id FROM tasks WHERE id = ?").get(task.id);
+    expect(row).toMatchObject({ project_id: project.id });
   });
 });

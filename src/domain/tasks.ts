@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
 import { isOverBudget, type BudgetEstimator } from "./budget.js";
 import { addDependency } from "./dependencies.js";
+import { requireProject } from "./projects.js";
 
 export type TaskStatus = "pending" | "in_progress" | "done";
 
@@ -37,13 +38,7 @@ export function createTask(
   estimator: BudgetEstimator,
   input: CreateTaskInput,
 ): CreateTaskResult {
-  const project = db
-    .prepare("SELECT root_path FROM projects WHERE id = ?")
-    .get(input.project_id) as { root_path: string } | undefined;
-
-  if (!project) {
-    throw new Error(`Unknown project_id: ${input.project_id}`);
-  }
+  const project = requireProject(db, input.project_id);
 
   const filePaths = input.file_paths ?? [];
   const estimatedTokens = estimator.estimateTokens(project.root_path, filePaths);
@@ -51,7 +46,7 @@ export function createTask(
 
   const task: Task = {
     id: randomUUID(),
-    project_id: input.project_id,
+    project_id: project.id,
     title: input.title,
     description: input.description ?? "",
     acceptance_criteria: input.acceptance_criteria ?? "",

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { openDatabase } from "../src/db/connection.js";
-import { checkDocSync, createProject } from "../src/domain/projects.js";
+import { checkDocSync, createProject, getProject, requireProject } from "../src/domain/projects.js";
 
 describe("createProject", () => {
   it("inserts and returns a project with a generated id", () => {
@@ -18,6 +18,15 @@ describe("createProject", () => {
 
     const row = db.prepare("SELECT * FROM projects WHERE id = ?").get(project.id);
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
+  });
+
+  it("rejects a duplicate project name", () => {
+    const db = openDatabase(":memory:");
+    createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+
+    expect(() => createProject(db, { name: "Demo", root_path: "/tmp/other" })).toThrow(
+      /Project name already in use: Demo/,
+    );
   });
 
   describe("design_doc_path", () => {
@@ -66,6 +75,31 @@ describe("createProject", () => {
   });
 });
 
+describe("getProject / requireProject", () => {
+  it("resolves a project by id", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+
+    expect(getProject(db, project.id)).toEqual(project);
+    expect(requireProject(db, project.id)).toEqual(project);
+  });
+
+  it("resolves a project by name", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+
+    expect(getProject(db, "Demo")).toEqual(project);
+    expect(requireProject(db, "Demo")).toEqual(project);
+  });
+
+  it("getProject returns undefined and requireProject throws for an unknown ref", () => {
+    const db = openDatabase(":memory:");
+
+    expect(getProject(db, "missing")).toBeUndefined();
+    expect(() => requireProject(db, "missing")).toThrow(/Unknown project: missing/);
+  });
+});
+
 describe("checkDocSync", () => {
   let dir: string;
 
@@ -79,7 +113,14 @@ describe("checkDocSync", () => {
 
   it("rejects an unknown project", () => {
     const db = openDatabase(":memory:");
-    expect(() => checkDocSync(db, "missing")).toThrow(/Unknown project_id/);
+    expect(() => checkDocSync(db, "missing")).toThrow(/Unknown project: missing/);
+  });
+
+  it("resolves the project by name as well as by id", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: dir });
+
+    expect(checkDocSync(db, "Demo")).toEqual(checkDocSync(db, project.id));
   });
 
   it("reports tracked:false when no design_doc_path was ever set", () => {
