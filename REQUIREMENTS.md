@@ -373,26 +373,52 @@ is just an index.
 
 ### Contradictions
 
-- ~~**Item 4's test gate is optional, not guaranteed.**~~ **Resolved:** `release_it`
-  now rejects unless either `test_command` or `force: true` is given (see Item 4's
-  design, step 3) — omitting both is an error instead of a silent no-op test pass.
+- **Item 6's migration copies a column that can't exist yet on the source table.**
+  Step 3 says `INSERT INTO tasks (<explicit column list>) SELECT <same list> FROM
+  tasks_old`, with the column list explicitly including the new
+  `cancellation_reason`. But `tasks_old` is just the pre-migration table renamed in
+  place — it was never `ALTER TABLE ... ADD COLUMN cancellation_reason`'d, so it
+  doesn't have that column to select. As written, this `INSERT` would fail. The
+  fix is straightforward and actually simplifies the item: add
+  `cancellation_reason` as an ordinary `ensureColumn` step (like every other column
+  in this doc) *before* the rebuild, so `tasks_old` already has it by the time the
+  rebuild copies data — decoupling "add a nullable column" (routine) from "widen the
+  CHECK constraint" (the genuinely risky part) shrinks the risky step to just the
+  latter.
+- **Item 2's `create_tasks` spec is now stale relative to Items 3 and 4.** Item 2's
+  own type signature only lists `{ temp_id?, title, description?,
+  acceptance_criteria?, file_paths?, epic_id?, depends_on? }` per task. But Item 3
+  says "`create_task`/`create_tasks` accept an optional `priority`," and Item 4 says
+  "`create_task(s)` ... gain `release_id`" — both explicitly claim `create_tasks`
+  gains a field, yet neither edited Item 2's written spec to actually show
+  `priority?`/`release_id?` in the per-task shape. Whoever implements Item 2 first
+  (per its own text, in isolation) would ship a batch-creation tool two fields short
+  of what Items 3 and 4 already assume it has.
 
 ### Bottlenecks
 
-- ~~**No escape valve for a release with a task that will never be "done."**~~
-  **Partially resolved:** `set_task_release` (Item 4) lets a dead task be moved out
-  of a release so it stops blocking `release_it`. The underlying problem — no way to
-  cancel a task at all, so it still blocks `get_next_task`/dependents forever — is
-  real and deliberately tracked separately as Item 6 (task cancellation lifecycle),
-  since it's bigger than release grouping and deserves its own design pass.
-- ~~**Release membership can silently drift after `released`.**~~ **Resolved (strict
-  option chosen):** a `released` release's task membership is now frozen —
-  `create_task`/`create_tasks` reject assigning into it, and `set_task_release`
-  rejects moving a task into *or* out of it (see Item 4's design).
+- **The CHECK-constraint rebuild (Item 6) assumes a single writer touching the DB
+  during migration, but this project already has two.** `runMigrations` runs on
+  every `openDatabase()` call, and per the architecture doc this file is opened
+  independently by both the MCP server *and* the standalone Status CLI
+  (`node dist/cli/status.js`) — a documented, intended multi-process setup, not the
+  "distributed systems" case the project's non-goals exclude. The rebuild's
+  `RENAME` → `CREATE` → `INSERT` → `DROP` sequence is far less forgiving of two
+  processes racing through it at once than every previous migration step (plain
+  `ADD COLUMN`/`CREATE ... IF NOT EXISTS`, both naturally idempotent). If the MCP
+  server and a `status` CLI invocation both start right after an upgrade and both
+  see "rebuild needed," one can be left holding a half-finished `tasks_old` or
+  hitting a "table already exists" error mid-sequence. Not addressed by the current
+  design.
 
 ### Weakly-justified decisions
 
-- ~~**`listReleases` copies epics' creation-order convention onto a domain that has a
-  real order.**~~ **Resolved:** releases get an explicit `sequence` column
-  (auto-assigned in gaps of 10, manually adjustable via `set_release_sequence`) that
-  `list_releases` orders by instead of `created_at` (see Item 4's design).
+- **Release notes still only look at `done` tasks, but a release can now close with
+  `cancelled` ones in it too.** Item 6 changes `release_it`'s gate from "every task
+  `done`" to "every task `done` or `cancelled`" (its own stated goal), but Item 4's
+  notes-generation step (step 4) was written before Item 6 existed and still only
+  iterates `done` tasks. The result: a release that shipped 5 of 7 originally-scoped
+  tasks (2 cancelled) generates notes that read like only 5 were ever planned —
+  nothing in the notes surfaces that something was dropped. Reasonable as an MVP
+  choice, but it's an artifact of write-order between the two items rather than a
+  considered decision.
