@@ -123,6 +123,41 @@ describe("widenTaskStatusCheck (via runMigrations)", () => {
     ).toThrow(/CHECK constraint failed/);
   });
 
+  it("leaves task_files/task_dependencies/handoff_notes able to accept new rows after the rebuild", () => {
+    // Regression test: SQLite's `ALTER TABLE tasks RENAME TO tasks_old` used
+    // to also rewrite these three tables' stored FK clause to say
+    // `tasks_old(id)` instead of `tasks(id)` - invisible until something
+    // actually INSERTs into one of their FK columns, which is exactly what
+    // this test does that the "preserves existing rows" test above doesn't.
+    const db = openPreCancellationDb();
+    db.prepare(
+      `INSERT INTO projects (id, name, root_path, created_at) VALUES ('p1', 'Demo', '/tmp/demo', 'now')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO tasks (id, project_id, title, created_at, updated_at) VALUES ('t1', 'p1', 'A', 'now', 'now')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO tasks (id, project_id, title, created_at, updated_at) VALUES ('t2', 'p1', 'B', 'now', 'now')`,
+    ).run();
+
+    runMigrations(db);
+
+    expect(() =>
+      db.prepare(`INSERT INTO task_files (task_id, file_path) VALUES ('t1', 'src/new.ts')`).run(),
+    ).not.toThrow();
+    expect(() =>
+      db.prepare(`INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ('t2', 't1')`).run(),
+    ).not.toThrow();
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO handoff_notes (id, task_id, session_id, decisions, created_at)
+           VALUES ('h-new', 't1', 's1', 'note', 'now')`,
+        )
+        .run(),
+    ).not.toThrow();
+  });
+
   it("is idempotent - a second runMigrations call on an already-migrated DB is a clean no-op", () => {
     const db = openPreCancellationDb();
     db.prepare(
@@ -155,6 +190,128 @@ describe("widenTaskStatusCheck (via runMigrations)", () => {
 
     expect(after).toBe(before);
     expect(before).toContain("cancelled");
+  });
+});
+
+describe("repairDanglingTasksOldReferences (via runMigrations)", () => {
+  /**
+   * Builds a DB in the exact broken end-state widenTaskStatusCheck's rebuild
+   * used to leave behind before the legacy_alter_table fix: `tasks` already
+   * has the widened CHECK (the rebuild "succeeded"), but `task_files`/
+   * `task_dependencies`/`handoff_notes` still have their FK clause pointing
+   * at the now-nonexistent `tasks_old` (SQLite allows CREATE TABLE with a
+   * dangling REFERENCES target - it's only validated at DML time).
+   */
+  function openCorruptedPostRebuildDb(): Database.Database {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    db.exec(`
+      CREATE TABLE projects (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, root_path TEXT NOT NULL,
+        design_doc_path TEXT, design_doc_hash TEXT, created_at TEXT NOT NULL
+      );
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        epic_id TEXT,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        acceptance_criteria TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'done', 'cancelled')),
+        estimated_tokens INTEGER NOT NULL DEFAULT 0,
+        owner_session_id TEXT,
+        lock_expires_at TEXT,
+        complexity_hint TEXT NOT NULL DEFAULT 'normal',
+        cancellation_reason TEXT,
+        priority INTEGER NOT NULL DEFAULT 0,
+        release_id TEXT,
+        completion_summary TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE task_files (
+        task_id TEXT NOT NULL REFERENCES tasks_old(id) ON DELETE CASCADE, file_path TEXT NOT NULL
+      );
+      CREATE TABLE task_dependencies (
+        task_id TEXT NOT NULL REFERENCES tasks_old(id) ON DELETE CASCADE,
+        depends_on_task_id TEXT NOT NULL REFERENCES tasks_old(id) ON DELETE CASCADE,
+        PRIMARY KEY (task_id, depends_on_task_id)
+      );
+      CREATE TABLE handoff_notes (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks_old(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL, decisions TEXT NOT NULL DEFAULT '', remaining_work TEXT NOT NULL DEFAULT '',
+        discoveries TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+      );
+    `);
+    return db;
+  }
+
+  it("repairs a DB already left with dangling tasks_old FKs, preserving existing rows", () => {
+    const db = openCorruptedPostRebuildDb();
+    db.prepare(
+      `INSERT INTO projects (id, name, root_path, created_at) VALUES ('p1', 'Demo', '/tmp/demo', 'now')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO tasks (id, project_id, title, created_at, updated_at) VALUES ('t1', 'p1', 'A', 'now', 'now')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO tasks (id, project_id, title, created_at, updated_at) VALUES ('t2', 'p1', 'B', 'now', 'now')`,
+    ).run();
+    // In reality these rows were inserted *before* the rebuild corrupted the
+    // FK clause (SQLite doesn't re-validate existing rows when a table's
+    // schema text changes) - foreign_keys has to be off for the fixture's own
+    // setup insert here since, unlike the real sequence of events, this
+    // fixture's task_files/handoff_notes never had a valid tasks_old to
+    // insert against in the first place.
+    db.pragma("foreign_keys = OFF");
+    db.prepare(`INSERT INTO task_files (task_id, file_path) VALUES ('t1', 'old.ts')`).run();
+    db.prepare(
+      `INSERT INTO handoff_notes (id, task_id, session_id, decisions, created_at)
+       VALUES ('h1', 't1', 's1', 'pre-existing note', 'now')`,
+    ).run();
+    db.pragma("foreign_keys = ON");
+
+    runMigrations(db);
+
+    expect(db.prepare(`SELECT * FROM task_files WHERE task_id = 't1'`).all()).toEqual([
+      { task_id: "t1", file_path: "old.ts" },
+    ]);
+    expect(db.prepare(`SELECT * FROM handoff_notes WHERE task_id = 't1'`).all()).toMatchObject([
+      { id: "h1", decisions: "pre-existing note" },
+    ]);
+
+    expect(() =>
+      db.prepare(`INSERT INTO task_files (task_id, file_path) VALUES ('t2', 'new.ts')`).run(),
+    ).not.toThrow();
+    expect(() =>
+      db.prepare(`INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ('t2', 't1')`).run(),
+    ).not.toThrow();
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO handoff_notes (id, task_id, session_id, decisions, created_at)
+           VALUES ('h2', 't2', 's1', 'new note', 'now')`,
+        )
+        .run(),
+    ).not.toThrow();
+  });
+
+  it("is idempotent - a second runMigrations call on an already-repaired DB is a clean no-op", () => {
+    const db = openCorruptedPostRebuildDb();
+    db.prepare(
+      `INSERT INTO projects (id, name, root_path, created_at) VALUES ('p1', 'Demo', '/tmp/demo', 'now')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO tasks (id, project_id, title, created_at, updated_at) VALUES ('t1', 'p1', 'A', 'now', 'now')`,
+    ).run();
+
+    runMigrations(db);
+    const afterFirst = db.prepare(`SELECT sql FROM sqlite_master WHERE name = 'task_files'`).get();
+
+    expect(() => runMigrations(db)).not.toThrow();
+    const afterSecond = db.prepare(`SELECT sql FROM sqlite_master WHERE name = 'task_files'`).get();
+
+    expect(afterSecond).toEqual(afterFirst);
   });
 });
 
