@@ -173,6 +173,7 @@ describe("listTasks / getProjectStatus", () => {
       pending: 1,
       cancelled: 0,
       percent: 0,
+      doc_drift: false,
     });
   });
 

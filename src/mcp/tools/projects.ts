@@ -38,13 +38,14 @@ export function registerProjectTools(server: McpServer, db: DatabaseInstance): v
     "check_doc_sync",
     {
       description:
-        "Check whether a project's tracked design doc has changed since create_project last hashed it. tracked:false means no design_doc_path was ever set - nothing to compare. project_id accepts a project id or its unique name.",
+        "Check whether a project's tracked design doc has changed since create_project last hashed it (or since the last acknowledge). tracked:false means no design_doc_path was ever set - nothing to compare. project_id accepts a project id or its unique name. Pass acknowledge:true once the task graph has been manually reconciled with the doc's new content - this persists the current hash as the new baseline in place (no need to re-run create_project), so doc_drift stops being reported by get_next_task/get_project_status.",
       inputSchema: {
         project_id: z.string().min(1),
+        acknowledge: z.boolean().optional(),
       },
     },
-    async ({ project_id }) => {
-      const result = checkDocSync(db, project_id);
+    async ({ project_id, acknowledge }) => {
+      const result = checkDocSync(db, project_id, { acknowledge });
       return jsonResult(result);
     },
   );

@@ -24,9 +24,13 @@ and hand off work across sessions.
 - Work across multiple projects from one running server instance.
 
 **Non-goals**
-- Automatically reconciling the task graph when the design doc changes — v2 added
-  drift *detection* (`check_doc_sync`, see Interfaces), but Claude still has to be
-  told to re-plan the graph itself; that reconciliation step stays manual.
+- Automatically re-planning the task graph when the design doc changes — v2 added
+  drift *detection* (`check_doc_sync`), and v5 made drift impossible to silently
+  miss by surfacing it on `get_next_task`/`get_project_status` (`doc_drift`) with
+  an `acknowledge` step to clear it once reconciled, but re-deriving *what actually
+  changed* and applying it to the graph is still a manual, Claude-driven step —
+  the server never diffs doc content or generates/edits tasks on its own (see
+  Interfaces, Failure Modes).
 - A full UI/viewer — v2 added a minimal read-only status CLI (see Interfaces), but
   it's a print-and-exit tool, not an interactive viewer.
 - Epics participating in scheduling — v3 added epics as a pure grouping/reporting
@@ -144,7 +148,7 @@ erDiagram
         text name UK "unique - lets every project-scoped tool accept it in place of id"
         text root_path
         text design_doc_path "nullable"
-        text design_doc_hash "nullable, sha256 of doc content at create_project time"
+        text design_doc_hash "nullable, sha256 of doc content at create_project time, or last check_doc_sync(acknowledge:true) call"
         text created_at
     }
     EPICS {
@@ -241,14 +245,14 @@ discoverable.
 - `cancel_task(task_id, reason?, force?) -> { ok: true, unblocked_task_ids: [...] } | conflict error` — abandons a task that turns out unnecessary, without the dishonesty of a force-completed `complete_task`. Unblocks dependents the same way `complete_task` does. Rejects with the same conflict shape as `claim_task`/`release_task` if an active lock is held, unless `force: true` (no `session_id` param here, so the check is owner-agnostic — any active lock blocks it, regardless of whose).
 - `add_dependency(task_id, depends_on_task_id) -> { ok: true }` (rejects if it would create a cycle)
 - `split_task(task_id, subtasks: [{title, description, acceptance_criteria, file_paths, complexity_hint?, priority?}]) -> { new_task_ids[] }` — original task is replaced; its dependents and dependencies are rewired onto the subtasks, which also inherit its `epic_id`/`release_id`/`complexity_hint`/`priority` (the latter two overridable per subtask). Rejects if the original is already `done` or `cancelled` — splitting a finished/abandoned task would otherwise silently resurrect it.
-- `get_next_task(project_id) -> { task } | { task: null, reason: "all_done" | "all_blocked", blocked_on?: [...] }` — atomically marks the returned task `in_progress` and gives it a 30-minute lock lease as part of the same transaction that selects it (see Failure Modes for both the no-duplicate-hand-out guarantee and stale-lock reclaim). Candidates are ordered `priority DESC, created_at ASC`. `task` is the full detail packet (see `get_task` below), not just the bare row. Not epic- or release-aware — picks from the whole project's graph regardless of either (see Non-goals).
+- `get_next_task(project_id) -> { task, doc_drift } | { task: null, reason: "all_done" | "all_blocked", blocked_on?: [...], doc_drift }` — atomically marks the returned task `in_progress` and gives it a 30-minute lock lease as part of the same transaction that selects it (see Failure Modes for both the no-duplicate-hand-out guarantee and stale-lock reclaim). Candidates are ordered `priority DESC, created_at ASC`. `task` is the full detail packet (see `get_task` below), not just the bare row. Not epic- or release-aware — picks from the whole project's graph regardless of either (see Non-goals). `doc_drift: true` means the tracked design doc changed since its hash was last captured — see `check_doc_sync`.
 - `get_task(task_id) -> { id, title, description, acceptance_criteria, status, estimated_tokens, priority, complexity_hint, file_paths, handoff_notes, ... }` — the same detail packet `get_next_task` returns, fetchable anytime with no claim/lock side effect; use this (not `get_next_task`) to just re-inspect a task.
 - `claim_task(task_id, session_id) -> { ok: true } | conflict error` — records `owner_session_id` and renews the lock lease; rejects with `{ error: "conflict", current_owner_session_id, lock_expires_at }` if a different session's lock is still active.
 - `release_task(task_id, session_id, force?) -> { ok: true } | conflict error` — gives up ownership immediately (back to `pending`) instead of waiting out the lease; `force: true` overrides another session's still-active lock.
-- `check_doc_sync(project_id) -> { tracked, in_sync, design_doc_path, stored_hash, current_hash }` — compares the tracked design doc's current hash against the one captured at `create_project` time; `tracked: false` means no doc was ever registered.
+- `check_doc_sync(project_id, acknowledge?) -> { tracked, in_sync, design_doc_path, stored_hash, current_hash }` — compares the tracked design doc's current hash against the one captured at `create_project` time (or the last `acknowledge`); `tracked: false` means no doc was ever registered. Pass `acknowledge: true` once the graph has been manually reconciled with the doc's new content to persist the current hash as the new baseline *in place* (no need to re-run `create_project`); a no-op if untracked or the doc can't currently be read.
 - `add_handoff_note(task_id, session_id, { decisions, remaining_work, discoveries }) -> { ok: true }`
 - `complete_task(task_id, summary?, test_command?, force?) -> { ok: true, unblocked_task_ids: [...] } | verification_failed error` — runs the Completion Verifier first (declared files changed + `test_command` exits zero, if given); `force: true` skips it. `summary`, if given, is persisted as `completion_summary` — the source text `release_it` pulls into generated release notes.
-- `get_project_status(project_id) -> { total, done, in_progress, blocked, pending, cancelled, percent }`
+- `get_project_status(project_id) -> { total, done, in_progress, blocked, pending, cancelled, percent, doc_drift }` — `doc_drift` mirrors `get_next_task`'s (see `check_doc_sync`).
 - `list_tasks(project_id, status?, epic_id?, release_id?) -> { tasks: [{ id, title, status, estimated_tokens, epic_id, release_id }] }` — summary rows only; use `get_task` for full detail. `epic_id`/`release_id` (both optional, combinable) scope the list to one epic and/or one release.
 - **Status CLI** (outside MCP): `node dist/cli/status.js [project_id_or_name]` — no arg lists every registered project's status; with an arg, prints that project's status plus its full task list. Read-only, opens the DB directly.
 
@@ -276,8 +280,11 @@ discoverable.
   `complete_task` rejects with `verification_failed` (reason included) unless
   `force: true` is passed — see Completion Verifier in Components.
 - **Design doc changes after the graph exists.** `check_doc_sync` detects the drift
-  (doc hash no longer matches), but doesn't touch the graph itself — Claude still
-  has to be told to reconcile it manually (see Non-goals).
+  (doc hash no longer matches); `get_next_task`/`get_project_status` also report
+  `doc_drift: true` on every call from then on, so it can't be silently missed on
+  a long-running project the way a one-off `check_doc_sync` call could be. The
+  graph itself is never touched automatically — Claude re-plans by hand and then
+  calls `check_doc_sync(acknowledge: true)` to clear the flag (see Non-goals).
 - **`add_dependency` would create a cycle.** Rejected synchronously with an error;
   the domain layer checks reachability before writing.
 - **`create_project` is called with a name already in use.** Rejected with a
@@ -308,7 +315,9 @@ discoverable.
   too far off in practice (e.g. dense code vs. prose), it's isolated behind the
   Budget Estimator interface and can be swapped for something better without
   touching callers.
-- **Doc-sync reconciliation is still manual.** `check_doc_sync` tells Claude the
-  design doc drifted, but doesn't touch the graph itself — Claude still has to
-  re-derive and apply the diff by hand. Revisit if that manual step proves to be a
-  recurring papercut.
+- **Doc-sync reconciliation is surfaced automatically, but still applied by hand.**
+  `doc_drift` on `get_next_task`/`get_project_status` closes the "forgot to check"
+  gap, but Claude still has to re-derive and apply the diff to the graph itself —
+  the server doesn't parse or diff doc content. Revisit only if that manual
+  re-planning step (as opposed to the *noticing* it, which is now solved) proves
+  to be a recurring papercut.

@@ -249,14 +249,28 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 
 ### 5. Design-doc drift reconciliation stays manual
 
-- **Status:** proposed (carried over from the architecture doc's existing Open
-  Questions/Non-goals — not a new finding)
+- **Status:** done (see Implemented, v5)
 - **Priority:** low
 - **Problem:** `check_doc_sync` detects that a tracked design doc changed but doesn't
   touch the graph; Claude has to be told to re-plan by hand. On a long-running large
-  project this is an easy step to forget.
-- **Direction:** revisit only if this proves a recurring papercut in practice — no
-  concrete design yet.
+  project this is an easy step to forget. A second, smaller papercut: the only way
+  to clear a detected drift was to call `create_project` again, which creates a
+  brand-new project rather than updating the existing one in place.
+- **Design:** deliberately the smallest change that closes the *forgetting* gap,
+  not automatic doc-diffing/re-planning (out of scope — the server never parses or
+  diffs doc content, matching the architecture doc's existing Non-goals).
+  - `isDocDrifted(project)` (`src/domain/projects.ts`) — pure hash-comparison
+    helper, no new column (reuses `design_doc_hash`).
+  - `get_next_task` and `get_project_status` now return `doc_drift: boolean`
+    (`src/domain/status.ts`), so drift surfaces on the two calls that sit in
+    Claude's normal work loop instead of only on an explicit, easy-to-forget
+    `check_doc_sync` call. `get_epic_status`/`get_release_status`/`list_tasks`
+    deliberately left untouched — not the "am I still on track" checkpoints this
+    problem is about.
+  - `check_doc_sync` gains `acknowledge?: boolean` — when true (and the doc is
+    tracked and readable), persists the current hash as the new baseline in
+    place, replacing the old "re-register under a new project" workaround.
+    No-op if untracked or unreadable.
 
 ### 6. Task cancellation lifecycle
 
@@ -479,6 +493,14 @@ is just an index.
 - **v4 — bulk task creation** (`create_tasks`): plans a whole batch (e.g. from a
   design doc) in one call, with `temp_id`-based cross-references for
   same-batch dependency edges; whole batch rolls back together on any error.
+- **v5 — design-doc drift reconciliation** (`doc_drift` on `get_next_task`/
+  `get_project_status`, `acknowledge` on `check_doc_sync`): drift is now surfaced
+  automatically on the two calls in Claude's normal work loop instead of only on
+  an explicit `check_doc_sync` call, closing the "easy to forget" gap; once
+  reconciled by hand, `check_doc_sync(acknowledge: true)` persists the current
+  hash as the new baseline in place (no new project needed). Re-planning itself
+  is still manual — the server never diffs doc content or touches the graph on
+  its own.
 
 ## How to use this file
 
