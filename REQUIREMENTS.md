@@ -10,9 +10,9 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 
 ## Open Items
 
-### 1. `get_next_task` doesn't return file_paths or handoff notes
+### 1. Task detail packet: `get_task` + `get_next_task` returns file_paths & handoff_notes
 
-- **Status:** proposed
+- **Status:** planned
 - **Priority:** high
 - **Problem:** The architecture doc's data flow explicitly promises a "compact task
   packet (files, acceptance criteria, prior handoff notes)" from `get_next_task`, but
@@ -20,41 +20,173 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
   `task_files` table) and `add_handoff_note` is write-only — there's no read path for
   prior notes anywhere. A fresh session picking up a task can't see which files it
   should touch or what a previous session already decided, which defeats the core
-  cross-session handoff goal of the whole project.
-- **Direction:** extend `get_next_task` (and any future `get_task`) to include
-  `file_paths` and the task's handoff notes (most recent first, or all of them).
+  cross-session handoff goal of the whole project. `list_tasks` also only returns
+  compact summary rows, with no side-effect-free way to re-fetch one task's full
+  detail later (originally tracked as a separate item — folded in here since both
+  need the same underlying data).
+- **Design:**
+  - `requireTask(db, task_id) -> Task` in `src/domain/tasks.ts` — a shared lookup
+    (throws `Unknown task_id: ...`); `splitTask`'s existing inline
+    `SELECT ... WHERE id = ?` gets replaced with this instead of keeping a second
+    copy of the same check.
+  - `listTaskFilePaths(db, task_id) -> string[]` — new query over `task_files`
+    (nothing reads that table back today).
+  - `listHandoffNotes(db, task_id) -> HandoffNote[]` in `src/domain/handoffNotes.ts`,
+    ordered `created_at ASC` (same convention as every other list in the codebase).
+  - `getTaskDetail(db, task_id) -> Task & { file_paths, handoff_notes }` in
+    `src/domain/status.ts` (next to `getNextTask`/`displayStatus`, which it reuses),
+    composing the three functions above.
+  - `get_next_task`'s success shape becomes `{ task: TaskDetail }` — `handOut()`
+    calls `getTaskDetail` on the freshly-updated row instead of returning the bare
+    `Task`.
+  - New read-only MCP tool `get_task(task_id) -> TaskDetail` — same builder, no
+    claim/lock side effect, so a task can be re-inspected anytime.
+  - Docs: update `docs/architecture/task-tracker-mcp.md`'s Interfaces entries for
+    `get_next_task`/`get_task` and the Data Flow diagram (the "task packet" comment
+    becomes literally true instead of aspirational).
 
-### 2. `get_task(task_id)` — full task detail on demand
+### 2. Bulk task creation for initial planning
 
-- **Status:** proposed
-- **Priority:** medium
-- **Problem:** `list_tasks` intentionally returns compact summary rows only; there's
-  no way to re-fetch one task's full detail (description, acceptance criteria, files,
-  dependencies, handoff notes) later without re-running `get_next_task`, which has
-  side effects (claims the task). Already flagged as a known gap in the architecture
-  doc's Interfaces section ("use get_next_task/a future get_task for full detail").
-- **Direction:** a read-only `get_task(task_id)` tool, side-effect free.
-
-### 3. Bulk task creation for initial planning
-
-- **Status:** proposed
+- **Status:** planned
 - **Priority:** medium
 - **Problem:** Planning a large design doc into the graph means one `create_task`
   MCP round-trip per task (plus one `add_dependency` call per edge) — for a project
   with 50+ tasks that's a lot of tool calls just to stand up the initial graph.
-- **Direction:** a `create_tasks` (plural) tool taking an array of task specs
-  (optionally with inline `depends_on` refs by index/temp-id) in one call.
+- **Design:**
+  - New tool `create_tasks(project_id, tasks: [{ temp_id?, title, description?,
+    acceptance_criteria?, file_paths?, epic_id?, depends_on?: string[] }]) ->
+    { tasks: [{ temp_id?, task_id, estimated_tokens, over_budget }] }`.
+  - `temp_id` is an arbitrary client-chosen string scoped to the batch, letting a
+    task's `depends_on` reference a sibling created earlier in the *same* call
+    before it has a real id; an entry in `depends_on` that isn't a known `temp_id`
+    in this batch is treated as an existing `task_id` (so a batch can also wire new
+    tasks onto an already-existing graph).
+  - Domain-level `createTasks(db, estimator, project_id, specs)`: reject duplicate
+    `temp_id`s up front, create every task first (reusing `createTask` as-is), *then*
+    resolve and add every `depends_on` edge in a second pass (reusing `addDependency`
+    as-is, so cycle detection stays exactly where it already lives) — the two-pass
+    split avoids needing creation order to match dependency order within a batch.
+  - Whole call wrapped in one `db.transaction`, so a bad epic ref or a cyclic edge
+    rolls back the entire batch instead of leaving a half-planned graph.
 
-### 4. Ordering/priority hints for `get_next_task`
+### 3. Priority hint for `get_next_task`
 
-- **Status:** proposed
+- **Status:** planned
 - **Priority:** low
 - **Problem:** `get_next_task` always picks the oldest unblocked pending task
   (`ORDER BY created_at ASC`). On a large project with many tasks unblocked at once
   across different epics, there's no way for Claude (the planner) to say "do this
   branch first" — only creation order decides.
-- **Direction:** optional `priority` field on tasks, or an epic-level ordering hint,
-  factored into `get_next_task`'s selection query.
+- **Design:**
+  - New nullable-with-default `priority INTEGER NOT NULL DEFAULT 0` column on
+    `tasks` (migration via `ensureColumn`, same pattern as every other added
+    column); higher sorts first.
+  - `create_task`/`create_tasks` accept an optional `priority`.
+  - New single-purpose tool `set_task_priority(task_id, priority)` to adjust it
+    later, once a task turns out to matter more/less than assumed at creation time
+    — deliberately not folded into a general-purpose "update_task" tool, since
+    priority is the only mutable field this problem actually needs.
+  - `get_next_task`'s candidate query changes to
+    `ORDER BY priority DESC, created_at ASC` — with every task defaulting to `0`,
+    existing behavior (pure creation order) is unchanged until priorities are
+    actually set.
+  - Epic-level ordering hints are explicitly out of scope for this pass — task
+    priority alone covers the stated problem; revisit only if task-level proves
+    insufficient in practice.
+
+### 4. Release grouping (version-based), with a release-time test gate and auto-generated release notes
+
+- **Status:** planned
+- **Priority:** high
+- **Problem:** On a large project, tasks need a second, orthogonal grouping besides
+  Epic: a **release** ("0.1", "0.2", "2.6", ...) — an explicitly-numbered bucket of
+  tasks that, once all done, gets shipped: gated by a test run, and accompanied by
+  auto-generated release notes. Epic groups *by feature* ("Auth rework"); Release
+  groups *by shipment* — the same task can belong to one of each. Confirmed with the
+  user: Release is an independent entity from Epic (not "Epic + a version field"),
+  and `release_it` should run a test command as a gate before allowing the release,
+  not just flip a status flag.
+- **Prerequisite finding:** `complete_task`'s `summary` argument is accepted by the
+  MCP tool schema but silently discarded — `CompleteTaskInput`/`completeTask` in
+  `src/domain/lifecycle.ts` don't even have a field for it. There is currently no
+  stored per-task completion text anywhere, which release notes need as their source.
+- **Design:**
+  - **Data model** — new `releases` table, `releases.name/description` and `unique
+    (project_id, version)` mirroring `epics.name`'s per-project uniqueness:
+    ```sql
+    CREATE TABLE releases (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      version TEXT NOT NULL,
+      name TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'released')),
+      release_notes TEXT,
+      released_at TEXT,
+      created_at TEXT NOT NULL
+    );
+    -- unique (project_id, version); index on project_id
+    ```
+    `tasks` gets a second nullable grouping FK alongside `epic_id`:
+    `release_id TEXT REFERENCES releases(id) ON DELETE SET NULL` (same
+    CREATE-TABLE-plus-`ensureColumn` treatment). Also add
+    `completion_summary TEXT` (nullable) to `tasks`, to close the prerequisite
+    finding above.
+  - **Domain — `src/domain/releases.ts`** (mirrors `src/domain/epics.ts` exactly):
+    `createRelease`, `getRelease`/`requireRelease` (resolved by id or `version`,
+    scoped to project — same reasoning as epic name scoping), `listReleases`.
+  - **Domain — task association:** `CreateTaskInput`/`create_tasks` get an optional
+    `release_id`, validated with `requireRelease(db, project.id, ref)` exactly like
+    `epic_id` is today; `splitTask` inherits `release_id` onto subtasks the same way
+    it already inherits `epic_id`. `listTasks` gets an independent optional
+    `releaseRef` filter alongside the existing `epicRef` one (both may be given
+    together) — `TaskSummary` gets a `release_id` field next to `epic_id`.
+    *Implementation note:* `listTasks`'s optional-parameter list is getting long
+    (`status?`, `epicRef?`, now `releaseRef?`) — worth considering a small options
+    object at execution time, not a design blocker.
+  - **Domain — persisting completion summary:** `CompleteTaskInput` gets
+    `summary?: string`; `completeTask`'s transaction sets
+    `completion_summary = summary ?? null` alongside the existing `status = 'done'`
+    update. `Task`/`TaskDetail` (see Open Item #1) naturally expose it since it's
+    just another column on the row.
+  - **Domain — status aggregation:** `getReleaseStatus`/`listReleasesWithStatus` in
+    `src/domain/status.ts`, reusing the same `aggregateStatus` helper introduced for
+    epics, filtered by `release_id`.
+  - **Domain — `releaseIt(db, verifier, { project_id, release_id, test_command?,
+    force? })`** in `src/domain/releases.ts` (or `lifecycle.ts`, next to
+    `completeTask` — same shape of operation):
+    1. Resolve project + release; reject if `status` is already `'released'`
+       (one-shot, like `complete_task` has no "un-complete").
+    2. Reject if any task in the release isn't `done` yet, listing the offending
+       task ids — this check is **not** skippable by `force` (can't ship unfinished
+       work), unlike the test gate below.
+    3. Unless `force`, run the test gate by calling the *same* injected
+       `CompletionVerifier` already used by `complete_task` —
+       `verifier.verify({ rootPath: project.root_path, filePaths: [], testCommand })`.
+       Passing an empty `filePaths` skips the git-diff check entirely (see
+       `GitDiffCompletionVerifier.verify` in `src/domain/verification.ts`) and runs
+       only `testCommand`, so **no new verifier abstraction is needed** — this is a
+       straight reuse.
+    4. Build release notes from every `done` task in the release:
+       `- {title}: {completion_summary}` (omit the `: ...` part when a task has no
+       summary), ordered by `updated_at` (completion order).
+    5. In one transaction: `UPDATE releases SET status = 'released', release_notes =
+       ?, released_at = ? WHERE id = ?`.
+    6. Returns `{ ok: true, release_notes, released_at }`.
+  - **MCP tools — new `src/mcp/tools/releases.ts`** (mirrors
+    `src/mcp/tools/epics.ts`, plus one action tool needing the verifier like
+    `registerLifecycleTools` does):
+    - `create_release(project_id, version, name?, description?) -> { release_id }`
+    - `list_releases(project_id) -> { releases: [{ id, version, name, description, status, released_at, total, done, in_progress, blocked, pending, percent }] }`
+    - `get_release_status(project_id, release_id) -> { ...same shape... }`
+    - `release_it(project_id, release_id, test_command?, force?) -> { ok: true, release_notes, released_at } | not_all_done error | verification_failed error`
+    - `create_task(s)` and `list_tasks` gain `release_id`/`release_id` filter params,
+      same as their existing `epic_id` ones.
+  - **Docs:** add `RELEASES` to the architecture doc's ER diagram (own box, FK from
+    `TASKS` alongside `EPICS`, no relation to `EPICS` itself), document the new tools
+    and the `epic_id`-style additions in Interfaces, and add a Non-goals line
+    ("releases don't participate in the dependency graph or `get_next_task` either,
+    same as epics — a release is a reporting/shipping gate, not a scheduling unit").
 
 ### 5. Design-doc drift reconciliation stays manual
 
