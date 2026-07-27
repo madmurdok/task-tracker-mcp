@@ -132,6 +132,20 @@ function widenTaskStatusCheck(db: DatabaseInstance): void {
   if (taskStatusCheckAllowsCancelled(db)) return;
 
   db.pragma("foreign_keys = OFF");
+  // Modern SQLite's `ALTER TABLE ... RENAME TO` doesn't just rename `tasks` -
+  // by default it also rewrites every OTHER table's stored FK clause that
+  // references `tasks(id)` to say `tasks_old(id)` instead, "helpfully"
+  // keeping foreign keys pointed at the renamed table. That's exactly wrong
+  // here: `task_files`/`task_dependencies`/`handoff_notes` end up with a
+  // dangling FK to `tasks_old` once it's dropped below, and every future
+  // INSERT touching those FK columns then fails with "no such table:
+  // tasks_old" (foreign_keys enforcement has to resolve the parent table).
+  // `legacy_alter_table` disables that auto-rewrite, so RENAME only touches
+  // `tasks` itself - dependent tables keep saying `tasks(id)`, which
+  // correctly resolves once the new `tasks` table is created under that same
+  // name a few lines down. (Any DB that already ran this rebuild before this
+  // pragma was added is fixed once by repairDanglingTasksOldReferences below.)
+  db.pragma("legacy_alter_table = ON");
   try {
     const rebuild = db.transaction(() => {
       if (taskStatusCheckAllowsCancelled(db)) return; // someone else won the race while we waited for the lock
@@ -165,6 +179,97 @@ function widenTaskStatusCheck(db: DatabaseInstance): void {
       db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id)`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_epic_id ON tasks(epic_id)`);
+    });
+
+    rebuild.immediate();
+  } finally {
+    db.pragma("legacy_alter_table = OFF");
+    db.pragma("foreign_keys = ON");
+  }
+}
+
+function referencesTasksOld(db: DatabaseInstance, table: string): boolean {
+  const row = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .get(table) as { sql: string } | undefined;
+  return row?.sql.includes("tasks_old") ?? false;
+}
+
+/**
+ * One-time repair for a DB that already ran `widenTaskStatusCheck`'s rebuild
+ * before the `legacy_alter_table` fix above existed: `task_files`,
+ * `task_dependencies`, and/or `handoff_notes` are left with their FK clause
+ * permanently pointing at the now-dropped `tasks_old`, so any INSERT setting
+ * those FK columns fails with "no such table: tasks_old". Detected the same
+ * way `taskStatusCheckAllowsCancelled` detects its own migration state - by
+ * reading the affected table's stored SQL back from `sqlite_master` - so this
+ * is a no-op (and safe to call unconditionally on every startup) once fixed.
+ * Rebuilt the same way `widenTaskStatusCheck` rebuilds `tasks`: rename,
+ * recreate with the correct `tasks(id)` FK, copy rows, drop the renamed
+ * original, inside one `.immediate()` transaction with `foreign_keys` off for
+ * the same CASCADE-safety reason documented on `widenTaskStatusCheck`.
+ */
+function repairDanglingTasksOldReferences(db: DatabaseInstance): void {
+  const affected = ["task_files", "task_dependencies", "handoff_notes"].filter((table) =>
+    referencesTasksOld(db, table),
+  );
+  if (affected.length === 0) return;
+
+  db.pragma("foreign_keys = OFF");
+  try {
+    const rebuild = db.transaction(() => {
+      if (affected.includes("task_files")) {
+        db.exec(`ALTER TABLE task_files RENAME TO task_files_old`);
+        db.exec(`
+          CREATE TABLE task_files (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            file_path TEXT NOT NULL
+          )
+        `);
+        db.exec(`INSERT INTO task_files (task_id, file_path) SELECT task_id, file_path FROM task_files_old`);
+        db.exec(`DROP TABLE task_files_old`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_task_files_task_id ON task_files(task_id)`);
+      }
+
+      if (affected.includes("task_dependencies")) {
+        db.exec(`ALTER TABLE task_dependencies RENAME TO task_dependencies_old`);
+        db.exec(`
+          CREATE TABLE task_dependencies (
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            PRIMARY KEY (task_id, depends_on_task_id)
+          )
+        `);
+        db.exec(`
+          INSERT INTO task_dependencies (task_id, depends_on_task_id)
+          SELECT task_id, depends_on_task_id FROM task_dependencies_old
+        `);
+        db.exec(`DROP TABLE task_dependencies_old`);
+        db.exec(
+          `CREATE INDEX IF NOT EXISTS idx_task_dependencies_depends_on ON task_dependencies(depends_on_task_id)`,
+        );
+      }
+
+      if (affected.includes("handoff_notes")) {
+        db.exec(`ALTER TABLE handoff_notes RENAME TO handoff_notes_old`);
+        db.exec(`
+          CREATE TABLE handoff_notes (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            decisions TEXT NOT NULL DEFAULT '',
+            remaining_work TEXT NOT NULL DEFAULT '',
+            discoveries TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+          )
+        `);
+        db.exec(`
+          INSERT INTO handoff_notes (id, task_id, session_id, decisions, remaining_work, discoveries, created_at)
+          SELECT id, task_id, session_id, decisions, remaining_work, discoveries, created_at FROM handoff_notes_old
+        `);
+        db.exec(`DROP TABLE handoff_notes_old`);
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_handoff_notes_task_id ON handoff_notes(task_id)`);
+      }
     });
 
     rebuild.immediate();
@@ -209,4 +314,8 @@ export function runMigrations(db: DatabaseInstance): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_release_id ON tasks(release_id)`); // same reasoning as idx_tasks_epic_id above
   ensureColumn(db, "tasks", "completion_summary", "TEXT");
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(name)`);
+  // No ordering constraint relative to widenTaskStatusCheck() above - this
+  // repairs damage from *previous* runs of it (see repairDanglingTasksOldReferences),
+  // it doesn't interact with a fresh run happening in this same call.
+  repairDanglingTasksOldReferences(db);
 }

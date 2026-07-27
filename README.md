@@ -26,6 +26,7 @@ claude mcp add task-tracker -- node /absolute/path/to/task-tracker-mcp/dist/inde
 npm run dev        # run against stdio via tsx, no build step
 npm test           # vitest
 npm run typecheck  # tsc --noEmit
+npm run dashboard  # read-only live web dashboard, see below
 ```
 
 ## Tools
@@ -49,4 +50,15 @@ directly.
 npm run build
 npm run status                        # list every registered project
 npm run status <project_id_or_name>   # that project's status + full task list
+```
+
+## Dashboard
+
+Read-only, live-updating web view of a project's task graph — a project
+picker plus a per-project board (release swimlanes × status columns), polling
+every 1.5s. No write path to the tracker; purely an observability window. See
+the architecture doc's Interfaces section for the underlying API.
+
+```bash
+npm run dashboard   # binds 127.0.0.1:4321 (override with TASK_TRACKER_DASHBOARD_PORT)
 ```
