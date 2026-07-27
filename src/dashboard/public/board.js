@@ -79,13 +79,19 @@ function createCard(task, statusLabel) {
     description.className = "card-description";
     description.textContent = task.description;
 
-    title.classList.add("has-details");
+    // An explicit button, not just a click handler on the title text - a
+    // bare cursor:pointer + CSS-content chevron on the title turned out too
+    // subtle to notice as an interactive element at a glance.
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "card-toggle";
     const applyExpanded = () => {
       const isExpanded = expandedCards.has(task.id);
-      title.classList.toggle("expanded", isExpanded);
+      toggle.textContent = isExpanded ? "▾ Hide details" : "▸ Show details";
+      toggle.setAttribute("aria-expanded", String(isExpanded));
       description.hidden = !isExpanded;
     };
-    title.addEventListener("click", () => {
+    toggle.addEventListener("click", () => {
       if (expandedCards.has(task.id)) {
         expandedCards.delete(task.id);
       } else {
@@ -95,6 +101,7 @@ function createCard(task, statusLabel) {
     });
     applyExpanded();
 
+    card.appendChild(toggle);
     card.appendChild(description);
   }
 
