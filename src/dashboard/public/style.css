@@ -219,6 +219,15 @@ a {
   align-items: start;
 }
 
+/* Without this, the `hidden` attribute set by board.js's collapse logic
+   loses to the plain `.lane-columns` rule above: author-origin CSS always
+   beats the user-agent stylesheet's `[hidden] { display: none }`, regardless
+   of selector specificity - so an explicit `display` on the same element
+   always needs its own [hidden] override to actually hide. */
+.lane-columns[hidden] {
+  display: none;
+}
+
 .column {
   border: 1px solid var(--border);
   border-radius: 0.5rem;

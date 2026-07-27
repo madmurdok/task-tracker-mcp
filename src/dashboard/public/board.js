@@ -14,7 +14,7 @@ const STATUS_COLUMNS = [
 ];
 
 function laneTitle(lane) {
-  if (lane.release_id === null) return "No release";
+  if (lane.release_id === null) return "Backlog";
   const label = `Release-${lane.release_version ?? ""}`;
   return lane.release_name ? `${label} - ${lane.release_name}` : label;
 }
