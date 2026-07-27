@@ -435,8 +435,7 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
 
 ### 8. Real-time web dashboard for task state
 
-- **Status:** planned (approach agreed — mechanism, layout, and process model
-  discussed with the user; no schema/file-level design yet)
+- **Status:** done (see Implemented, v6)
 - **Priority:** medium
 - **Problem:** There's no way to *watch* an agent work on a project. `list_tasks`/
   `get_project_status` are pull-only snapshots a human has to remember to ask for,
@@ -573,6 +572,18 @@ is just an index.
   hash as the new baseline in place (no new project needed). Re-planning itself
   is still manual — the server never diffs doc content or touches the graph on
   its own.
+- **v6 — real-time dashboard** (`npm run dashboard`, `src/domain/board.ts`'s
+  `getBoardData`): a read-only local web server (plain `node:http`, no new
+  dependency, `127.0.0.1`-only) serving a project picker and a per-project
+  board. The board groups tasks into release swimlanes (a "no release" lane
+  first) split into status columns, with cards showing title/description/
+  status/priority/epic tag/owner, a highlighted `is_stale` flag for a task
+  past its lock lease, muted (not hidden) `cancelled` cards, and a `doc_drift`
+  banner reusing Item 5's field. The frontend polls every 1.5s and re-renders,
+  with a "last updated"/disconnected indicator and click-to-collapse
+  swimlanes (in-memory only). No new schema - purely derived from existing
+  tables, and zero write path back into the tracker (see the architecture
+  doc's updated Non-goals).
 
 ## How to use this file
 

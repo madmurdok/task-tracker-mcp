@@ -31,8 +31,13 @@ and hand off work across sessions.
   changed* and applying it to the graph is still a manual, Claude-driven step —
   the server never diffs doc content or generates/edits tasks on its own (see
   Interfaces, Failure Modes).
-- A full UI/viewer — v2 added a minimal read-only status CLI (see Interfaces), but
-  it's a print-and-exit tool, not an interactive viewer.
+- A **writable** UI — v2 added a minimal read-only status CLI, and v6 added a
+  live, auto-refreshing read-only web dashboard (see Interfaces) that closes
+  the original "no interactive viewer" gap, but it still has zero interaction
+  with the tracker itself: no clicking a card to claim/complete/edit anything.
+  Planning and executing tasks stays exclusively Claude's job through the MCP
+  tools above — the dashboard is purely an observability window onto that same
+  state, not a second way to change it.
 - Epics participating in scheduling — v3 added epics as a pure grouping/reporting
   layer (`create_epic`, `list_epics`, `get_epic_status`, `epic_id` on tasks), but
   epics don't enter the dependency graph, can't depend on each other, and
@@ -47,7 +52,9 @@ and hand off work across sessions.
 ## Constraints
 
 - Runs locally as a single long-lived process per machine, connected to Claude Code
-  over the MCP stdio transport — no network exposure, no auth needed.
+  over the MCP stdio transport — no network exposure, no auth needed. (The v6
+  dashboard is a separate opt-in process that does bind a local HTTP port, but
+  only on `127.0.0.1` — see Interfaces.)
 - Must serve multiple projects from one server instance (chosen over one-server-
   per-project) so it can be registered once, like the global `CLAUDE.md`.
 - Stack: TypeScript/Node.js (official MCP SDK, good ecosystem fit) + SQLite (gives
@@ -255,6 +262,7 @@ discoverable.
 - `get_project_status(project_id) -> { total, done, in_progress, blocked, pending, cancelled, percent, doc_drift }` — `doc_drift` mirrors `get_next_task`'s (see `check_doc_sync`).
 - `list_tasks(project_id, status?, epic_id?, release_id?) -> { tasks: [{ id, title, status, estimated_tokens, epic_id, release_id }] }` — summary rows only; use `get_task` for full detail. `epic_id`/`release_id` (both optional, combinable) scope the list to one epic and/or one release.
 - **Status CLI** (outside MCP): `node dist/cli/status.js [project_id_or_name]` — no arg lists every registered project's status; with an arg, prints that project's status plus its full task list. Read-only, opens the DB directly.
+- **Dashboard** (outside MCP): `npm run dashboard` starts a read-only local web server (`src/dashboard/server.ts`, plain `node:http`, no new dependency) bound to `127.0.0.1` only (port from `TASK_TRACKER_DASHBOARD_PORT`, default `4321`) — opens the DB the same way the Status CLI does, no MCP round-trip. Serves a project picker (`/`) and a per-project board (`/board.html?project=<id>`), plus the JSON API they poll: `GET /api/projects -> { projects: [{id, name}] }` and `GET /api/projects/:id/board -> BoardData` (`getBoardData` in `src/domain/board.ts` — tasks grouped into release swimlanes, a "no release" lane first, each shaped with title/description/status/priority/epic_name/owner_session_id/is_stale; no new schema, purely derived from existing tables). The board page polls that endpoint every 1.5s and re-renders, showing a `doc_drift` banner, a "last updated"/disconnected indicator, and click-to-collapse per-release swimlanes (in-memory only, not persisted).
 
 ## Failure Modes & Edge Cases
 
