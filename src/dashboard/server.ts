@@ -48,6 +48,16 @@ function serveStatic(res: http.ServerResponse, pathname: string): void {
   });
 }
 
+export interface CreateServerOptions {
+  /**
+   * Called once the /api/shutdown response has actually been flushed to the
+   * client. Defaults to tearing the real process down - overridable so tests
+   * can assert a shutdown was requested without killing the test process
+   * itself.
+   */
+  onShutdown?: () => void;
+}
+
 /**
  * Read-only dashboard server (REQUIREMENTS.md Item 8): serves the static
  * picker/board pages plus a small JSON API built on the same domain functions
@@ -55,15 +65,29 @@ function serveStatic(res: http.ServerResponse, pathname: string): void {
  * opening one itself so tests can point it at a temp/`:memory:` DB and pick
  * an ephemeral listen port instead of the real one main() uses.
  */
-export function createServer(db: DatabaseInstance): http.Server {
+export function createServer(db: DatabaseInstance, options: CreateServerOptions = {}): http.Server {
   return http.createServer((req, res) => {
+    const url = new URL(req.url ?? "/", "http://localhost");
+
+    // Handled ahead of the GET-only gate below since it's the one
+    // intentional non-GET route - everything else stays read-only.
+    if (req.method === "POST" && url.pathname === "/api/shutdown") {
+      sendJson(res, 200, { ok: true });
+      // This is a single-user local dev tool, not a service with other
+      // clients to protect - a fixed short delay after the response is
+      // flushed (not a graceful server.close() drain) is simple and
+      // deterministic, matching the "no distributed-systems concerns"
+      // reasoning the architecture doc already applies elsewhere.
+      const onShutdown = options.onShutdown ?? (() => setTimeout(() => process.exit(0), 50));
+      res.on("finish", onShutdown);
+      return;
+    }
+
     if (req.method !== "GET") {
       res.writeHead(405, { "Content-Type": "text/plain" });
       res.end("Method not allowed");
       return;
     }
-
-    const url = new URL(req.url ?? "/", "http://localhost");
 
     if (url.pathname === "/api/projects") {
       sendJson(res, 200, { projects: listProjects(db).map(({ id, name }) => ({ id, name })) });

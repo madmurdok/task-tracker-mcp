@@ -15,6 +15,13 @@ function laneTitle(lane) {
   return lane.release_name ? `${version} - ${lane.release_name}` : version;
 }
 
+// Which cards have their description expanded, keyed by task id. Same
+// "outside the render functions" trick as collapsedLanes below - description
+// is hidden by default (too much noise for a glance at the board), but an
+// expanded card needs to stay expanded across the next 1.5s poll's full DOM
+// teardown+rebuild instead of snapping shut again.
+const expandedCards = new Set();
+
 function createCard(task, statusLabel) {
   const card = document.createElement("article");
   card.className = "card";
@@ -71,6 +78,23 @@ function createCard(task, statusLabel) {
     const description = document.createElement("p");
     description.className = "card-description";
     description.textContent = task.description;
+
+    title.classList.add("has-details");
+    const applyExpanded = () => {
+      const isExpanded = expandedCards.has(task.id);
+      title.classList.toggle("expanded", isExpanded);
+      description.hidden = !isExpanded;
+    };
+    title.addEventListener("click", () => {
+      if (expandedCards.has(task.id)) {
+        expandedCards.delete(task.id);
+      } else {
+        expandedCards.add(task.id);
+      }
+      applyExpanded();
+    });
+    applyExpanded();
+
     card.appendChild(description);
   }
 
@@ -265,4 +289,22 @@ function loadBoard() {
   clockTimer = setInterval(tickConnectionLabel, CLOCK_TICK_MS);
 }
 
+function wireShutdownButton() {
+  const button = document.getElementById("shutdown-button");
+  button.addEventListener("click", async () => {
+    if (!window.confirm("Stop the dashboard server?")) return;
+    button.disabled = true;
+    button.textContent = "Stopping...";
+    try {
+      await fetch("/api/shutdown", { method: "POST" });
+    } catch {
+      // Expected once the process actually exits mid-response - the
+      // button's final state below covers this either way.
+    }
+    button.textContent = "Dashboard stopped";
+    stopPolling();
+  });
+}
+
 loadBoard();
+wireShutdownButton();
