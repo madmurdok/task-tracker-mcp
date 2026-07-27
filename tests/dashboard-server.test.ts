@@ -87,4 +87,24 @@ describe("dashboard server", () => {
     const res = await fetch(`${baseUrl}/api/projects`, { method: "POST" });
     expect(res.status).toBe(405);
   });
+
+  it("POST /api/shutdown responds ok and calls the injected onShutdown hook instead of exiting", async () => {
+    let shutdownCalled = false;
+    const shutdownServer = createServer(db, { onShutdown: () => (shutdownCalled = true) });
+    await new Promise<void>((resolve) => shutdownServer.listen(0, "127.0.0.1", resolve));
+    const { port } = shutdownServer.address() as AddressInfo;
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/shutdown`, { method: "POST" });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+
+      // onShutdown fires on the response's "finish" event - asynchronous
+      // relative to the fetch resolving, so give it a tick.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(shutdownCalled).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => shutdownServer.close(() => resolve()));
+    }
+  });
 });

@@ -20,4 +20,21 @@ async function loadProjects() {
   }
 }
 
+function wireShutdownButton() {
+  const button = document.getElementById("shutdown-button");
+  button.addEventListener("click", async () => {
+    if (!window.confirm("Stop the dashboard server?")) return;
+    button.disabled = true;
+    button.textContent = "Stopping...";
+    try {
+      await fetch("/api/shutdown", { method: "POST" });
+    } catch {
+      // Expected once the process actually exits mid-response - the
+      // button's final state below covers this either way.
+    }
+    button.textContent = "Dashboard stopped";
+  });
+}
+
 loadProjects();
+wireShutdownButton();
