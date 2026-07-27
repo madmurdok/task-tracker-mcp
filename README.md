@@ -61,4 +61,5 @@ the architecture doc's Interfaces section for the underlying API.
 
 ```bash
 npm run dashboard   # binds 127.0.0.1:4321 (override with TASK_TRACKER_DASHBOARD_PORT)
+                     # opens your default browser automatically - set TASK_TRACKER_DASHBOARD_NO_OPEN to skip
 ```

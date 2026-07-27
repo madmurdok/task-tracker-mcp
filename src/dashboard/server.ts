@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { openDatabase, type DatabaseInstance } from "../db/connection.js";
 import { getBoardData } from "../domain/board.js";
 import { listProjects } from "../domain/projects.js";
+import { openInBrowser } from "./openBrowser.js";
 
 const DEFAULT_PORT = 4321;
 const PUBLIC_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "public");
@@ -115,7 +116,11 @@ function main(): void {
   // 127.0.0.1 only, never 0.0.0.0 - this server has no auth in front of it
   // and serves project file paths and task descriptions (see Item 8).
   server.listen(port, "127.0.0.1", () => {
-    console.log(`Dashboard running at http://127.0.0.1:${port}/`);
+    const url = `http://127.0.0.1:${port}/`;
+    console.log(`Dashboard running at ${url}`);
+    if (!process.env.TASK_TRACKER_DASHBOARD_NO_OPEN) {
+      openInBrowser(url);
+    }
   });
 }
 
