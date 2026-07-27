@@ -52,6 +52,27 @@ describe("getBoardData", () => {
     expect(board.lanes[2].tasks.map((t) => t.title)).toEqual(["For v0.2"]);
   });
 
+  it("surfaces a release's status and release_notes on its lane; both are null for a planned release and for the no-release lane", () => {
+    const { db, project } = setup();
+    const planned = createRelease(db, { project_id: project.id, version: "0.2" });
+    const released = createRelease(db, { project_id: project.id, version: "0.1" });
+    db.prepare(`UPDATE releases SET status = 'released', release_notes = ? WHERE id = ?`).run(
+      "- Task A\n- Task B",
+      released.id,
+    );
+    createTask(db, noopEstimator, { project_id: project.id, title: "Backlog item", complexity_hint: "normal" });
+
+    const board = getBoardData(db, project.id);
+    const byReleaseId = new Map(board.lanes.map((lane) => [lane.release_id, lane]));
+
+    expect(byReleaseId.get(null)).toMatchObject({ release_status: null, release_notes: null });
+    expect(byReleaseId.get(planned.id)).toMatchObject({ release_status: "planned", release_notes: null });
+    expect(byReleaseId.get(released.id)).toMatchObject({
+      release_status: "released",
+      release_notes: "- Task A\n- Task B",
+    });
+  });
+
   it("omits the 'no release' lane once every task has a release, but keeps it when there are no releases yet", () => {
     const { db, project } = setup();
     const v1 = createRelease(db, { project_id: project.id, version: "0.1" });
@@ -66,7 +87,14 @@ describe("getBoardData", () => {
 
     const { db: db2, project: project2 } = setup();
     expect(getBoardData(db2, project2.id).lanes).toEqual([
-      { release_id: null, release_version: null, release_name: null, tasks: [] },
+      {
+        release_id: null,
+        release_version: null,
+        release_name: null,
+        release_status: null,
+        release_notes: null,
+        tasks: [],
+      },
     ]);
   });
 
