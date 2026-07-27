@@ -1,3 +1,7 @@
+// Read once - board.js is a fresh script load per page navigation, so the
+// URL's query string can't change out from under a running instance of it.
+const PROJECT_ID = new URLSearchParams(window.location.search).get("project");
+
 // Fixed left-to-right column order inside every swimlane. Lanes themselves are
 // rendered in the order the API returns them (already sequence-ordered, with
 // the "no release" lane first), so nothing here re-sorts them.
@@ -10,9 +14,9 @@ const STATUS_COLUMNS = [
 ];
 
 function laneTitle(lane) {
-  if (lane.release_id === null) return "No release";
-  const version = lane.release_version ?? "";
-  return lane.release_name ? `${version} - ${lane.release_name}` : version;
+  if (lane.release_id === null) return "Backlog";
+  const label = `Release-${lane.release_version ?? ""}`;
+  return lane.release_name ? `${label} - ${lane.release_name}` : label;
 }
 
 // Which cards have their description expanded, keyed by task id. Same
@@ -135,19 +139,58 @@ function createColumn(column, tasks) {
 }
 
 // Which release swimlanes are collapsed, keyed by release_id ("__none__" for
-// the no-release lane). Deliberately a plain in-memory Set, not persisted
-// anywhere - purely local UI state that resets on reload, per Item 8's "no
-// interaction with the tracker itself" constraint. Survives across re-renders
-// (each poll tears down and rebuilds every lane from scratch) precisely
-// because it lives outside renderBoard/createLane, not inside the DOM.
+// the no-release lane). Survives across re-renders (each poll tears down and
+// rebuilds every lane from scratch) precisely because it lives outside
+// renderBoard/createLane, not inside the DOM - same trick expandedCards uses.
 const collapsedLanes = new Set();
+// Tracks which lane keys have already had their one-time initial state
+// (from localStorage, or the release_status default) applied this page
+// load, so later polls don't re-run that logic and stomp a live toggle.
+const initializedLaneKeys = new Set();
 
 function laneKey(lane) {
   return lane.release_id ?? "__none__";
 }
 
+function collapseStorageKey(key) {
+  return `ttmcp-dashboard:collapsed:${PROJECT_ID}:${key}`;
+}
+
+// localStorage can throw (private browsing, storage disabled, quota) - this
+// is a nice-to-have persistence layer, not core functionality, so any
+// failure here just falls back to in-memory-only behavior for the session.
+function loadStoredCollapse(key) {
+  try {
+    const raw = localStorage.getItem(collapseStorageKey(key));
+    return raw === null ? null : raw === "true";
+  } catch {
+    return null;
+  }
+}
+
+function storeCollapse(key, isCollapsed) {
+  try {
+    localStorage.setItem(collapseStorageKey(key), String(isCollapsed));
+  } catch {
+    // Ignored - see loadStoredCollapse.
+  }
+}
+
+// A release that's already shipped should default to collapsed (out of the
+// way of active work) the first time it's ever seen; a stored preference
+// (an explicit earlier click, from this session or a previous page load)
+// always wins over that default once one exists.
+function ensureLaneInitialized(lane, key) {
+  if (initializedLaneKeys.has(key)) return;
+  initializedLaneKeys.add(key);
+  const stored = loadStoredCollapse(key);
+  const shouldCollapse = stored !== null ? stored : lane.release_status === "released";
+  if (shouldCollapse) collapsedLanes.add(key);
+}
+
 function createLane(lane) {
   const key = laneKey(lane);
+  ensureLaneInitialized(lane, key);
   const section = document.createElement("section");
   section.className = "lane";
 
@@ -164,6 +207,9 @@ function createLane(lane) {
     );
   }
 
+  const headerRow = document.createElement("div");
+  headerRow.className = "lane-header";
+
   const heading = document.createElement("h2");
   heading.className = "lane-title";
   heading.textContent = laneTitle(lane);
@@ -176,16 +222,30 @@ function createLane(lane) {
     columns.hidden = isCollapsed;
   };
   heading.addEventListener("click", () => {
-    if (collapsedLanes.has(key)) {
-      collapsedLanes.delete(key);
-    } else {
+    const isCollapsed = !collapsedLanes.has(key);
+    if (isCollapsed) {
       collapsedLanes.add(key);
+    } else {
+      collapsedLanes.delete(key);
     }
+    storeCollapse(key, isCollapsed);
     applyCollapsed();
   });
   applyCollapsed();
+  headerRow.appendChild(heading);
 
-  section.appendChild(heading);
+  if (lane.release_notes) {
+    const notesButton = document.createElement("button");
+    notesButton.type = "button";
+    notesButton.className = "lane-notes-button";
+    notesButton.textContent = "Release notes";
+    // A separate click target from the heading, so reading notes doesn't
+    // also toggle the lane's collapse state.
+    notesButton.addEventListener("click", () => showReleaseNotes(laneTitle(lane), lane.release_notes));
+    headerRow.appendChild(notesButton);
+  }
+
+  section.appendChild(headerRow);
   section.appendChild(columns);
 
   return section;
@@ -313,5 +373,17 @@ function wireShutdownButton() {
   });
 }
 
+function showReleaseNotes(title, notes) {
+  document.getElementById("release-notes-title").textContent = title;
+  document.getElementById("release-notes-body").textContent = notes;
+  document.getElementById("release-notes-dialog").showModal();
+}
+
+function wireReleaseNotesDialog() {
+  const dialog = document.getElementById("release-notes-dialog");
+  document.getElementById("release-notes-close").addEventListener("click", () => dialog.close());
+}
+
 loadBoard();
 wireShutdownButton();
+wireReleaseNotesDialog();

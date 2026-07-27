@@ -21,6 +21,8 @@ export interface BoardLane {
   release_id: string | null;
   release_version: string | null;
   release_name: string | null;
+  release_status: "planned" | "released" | null;
+  release_notes: string | null;
   tasks: BoardTask[];
 }
 
@@ -81,7 +83,14 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
   // through releases. Still show it (even empty) when there are no releases
   // at all yet, so the board isn't blank for a brand-new project.
   if (unreleasedTasks.length > 0 || releases.length === 0) {
-    lanes.push({ release_id: null, release_version: null, release_name: null, tasks: unreleasedTasks });
+    lanes.push({
+      release_id: null,
+      release_version: null,
+      release_name: null,
+      release_status: null,
+      release_notes: null,
+      tasks: unreleasedTasks,
+    });
   }
 
   for (const release of releases) {
@@ -89,6 +98,8 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
       release_id: release.id,
       release_version: release.version,
       release_name: release.name,
+      release_status: release.status,
+      release_notes: release.release_notes,
       tasks: tasks.filter((task) => task.release_id === release.id).map(toBoardTask),
     });
   }

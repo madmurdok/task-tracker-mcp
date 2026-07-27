@@ -147,8 +147,15 @@ a {
   overflow-x: auto;
 }
 
-.lane-title {
+.lane-header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
   margin: 0 0 0.5rem;
+}
+
+.lane-title {
+  margin: 0;
   font-size: 0.95rem;
   cursor: pointer;
   user-select: none;
@@ -162,11 +169,63 @@ a {
   content: "\25b8  ";
 }
 
+.lane-notes-button {
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  background: var(--surface);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.lane-notes-button:hover {
+  border-color: var(--accent);
+}
+
+#release-notes-dialog {
+  max-width: 32rem;
+  width: 90vw;
+  max-height: 80vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  color: var(--text);
+  padding: 1.25rem;
+}
+
+#release-notes-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.4);
+}
+
+#release-notes-title {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+}
+
+#release-notes-body {
+  margin: 0 0 1rem;
+  font-family: inherit;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+}
+
 .lane-columns {
   display: grid;
   grid-template-columns: repeat(5, minmax(15rem, 1fr));
   gap: 0.75rem;
   align-items: start;
+}
+
+/* Without this, the `hidden` attribute set by board.js's collapse logic
+   loses to the plain `.lane-columns` rule above: author-origin CSS always
+   beats the user-agent stylesheet's `[hidden] { display: none }`, regardless
+   of selector specificity - so an explicit `display` on the same element
+   always needs its own [hidden] override to actually hide. */
+.lane-columns[hidden] {
+  display: none;
 }
 
 .column {
