@@ -584,6 +584,18 @@ is just an index.
   swimlanes (in-memory only). No new schema - purely derived from existing
   tables, and zero write path back into the tracker (see the architecture
   doc's updated Non-goals).
+- **v7 — task numbering, delete_task, board polish**: projects gain a
+  `code_prefix` (derived from the project name, deduped across projects) and
+  tasks gain a per-project `task_number`, both assigned by an idempotent
+  startup backfill for existing rows; together they form a short `PREFIX-N`
+  display code (e.g. `TTM-52`) now shown on every dashboard card, alongside
+  `project_code_prefix` in `BoardData` and `task_number` in `list_tasks`/
+  `get_task`. `delete_task` hard-deletes a backlog (no-release) task outright
+  (cascading to its files/dependencies/handoff notes) instead of leaving a
+  permanent `cancelled` row for a task that should never have been created.
+  The dashboard board also always shows the Backlog lane first (even when
+  empty), orders release lanes newest-first, and annotates each lane's title
+  with its non-cancelled task count (e.g. "Backlog (5)").
 
 ## How to use this file
 
