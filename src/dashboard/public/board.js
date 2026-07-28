@@ -14,9 +14,16 @@ const STATUS_COLUMNS = [
 ];
 
 function laneTitle(lane) {
-  if (lane.release_id === null) return "Backlog";
-  const label = `Release-${lane.release_version ?? ""}`;
-  return lane.release_name ? `${label} - ${lane.release_name}` : label;
+  // Cancelled tasks are noise for "how much is left in this lane" at a
+  // glance, so they're excluded from the count even though lane.tasks
+  // (from getBoardData) still includes them for the Cancelled column.
+  const count = lane.tasks.filter((task) => task.status !== "cancelled").length;
+  const base = lane.release_id === null
+    ? "Backlog"
+    : lane.release_name
+      ? `Release-${lane.release_version ?? ""} - ${lane.release_name}`
+      : `Release-${lane.release_version ?? ""}`;
+  return `${base} (${count})`;
 }
 
 // Which cards have their description expanded, keyed by task id. Same

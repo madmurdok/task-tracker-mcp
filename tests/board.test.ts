@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import vm from "node:vm";
 import { describe, expect, it } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import { getBoardData } from "../src/domain/board.js";
@@ -9,6 +12,67 @@ import { createTask } from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 
 const noopEstimator: BudgetEstimator = { estimateTokens: () => 0 };
+
+// board.js is a plain browser script (no exports, top-level side effects that
+// run on load) rather than a module, so it can't just be imported. This is a
+// minimal DOM/browser shim - just enough fake globals for the script's
+// top-level calls (loadBoard/wireShutdownButton/wireReleaseNotesDialog) to
+// run without throwing - loaded into its own vm context so its top-level
+// `function` declarations (like laneTitle) come back out as properties on
+// the returned sandbox object, ready to call directly in assertions.
+function domElementStub(): any {
+  const el: any = {
+    className: "",
+    textContent: "",
+    hidden: false,
+    disabled: false,
+    dataset: {},
+    children: [] as any[],
+    classList: { add() {}, toggle() {}, contains: () => false },
+    appendChild(child: any) {
+      el.children.push(child);
+      return child;
+    },
+    removeChild(child: any) {
+      el.children = el.children.filter((c: any) => c !== child);
+      return child;
+    },
+    get firstChild() {
+      return el.children[0] ?? null;
+    },
+    addEventListener() {},
+    setAttribute() {},
+    showModal() {},
+    close() {},
+  };
+  return el;
+}
+
+function loadBoardScript(): any {
+  const src = readFileSync(path.join(process.cwd(), "src/dashboard/public/board.js"), "utf8");
+  const sandbox: any = {
+    document: {
+      title: "",
+      createElement: () => domElementStub(),
+      getElementById: () => domElementStub(),
+    },
+    window: { location: { search: "" } },
+    localStorage: {
+      getItem: () => null,
+      setItem: () => {},
+    },
+    fetch: async () => {
+      throw new Error("fetch is not available in the board.js test shim");
+    },
+    URLSearchParams,
+    setInterval: () => 0,
+    clearInterval: () => {},
+    console,
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(src, sandbox);
+  return sandbox;
+}
 
 function setup() {
   const db = openDatabase(":memory:");
@@ -171,5 +235,41 @@ describe("getBoardData", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("board.js laneTitle (client-side, via DOM shim)", () => {
+  it("appends the non-cancelled task count to a backlog ('no release') lane, excluding the cancelled one", () => {
+    const { laneTitle } = loadBoardScript();
+    const lane = {
+      release_id: null,
+      release_version: null,
+      release_name: null,
+      release_status: null,
+      release_notes: null,
+      tasks: [{ status: "done" }, { status: "pending" }, { status: "cancelled" }],
+    };
+
+    expect(laneTitle(lane)).toBe("Backlog (2)");
+  });
+
+  it("appends the non-cancelled task count to a named release lane, excluding cancelled tasks", () => {
+    const { laneTitle } = loadBoardScript();
+    const lane = {
+      release_id: "release-1",
+      release_version: "0.6.0",
+      release_name: "Name",
+      release_status: "planned",
+      release_notes: null,
+      tasks: [
+        { status: "done" },
+        { status: "pending" },
+        { status: "in_progress" },
+        { status: "cancelled" },
+        { status: "cancelled" },
+      ],
+    };
+
+    expect(laneTitle(lane)).toBe("Release-0.6.0 - Name (3)");
   });
 });
