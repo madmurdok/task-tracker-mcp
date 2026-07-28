@@ -3,6 +3,7 @@ CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   root_path TEXT NOT NULL,
+  code_prefix TEXT,
   design_doc_path TEXT,
   design_doc_hash TEXT,
   created_at TEXT NOT NULL
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   complexity_hint TEXT NOT NULL DEFAULT 'normal' CHECK (complexity_hint IN ('normal', 'high')),
   cancellation_reason TEXT,
   priority INTEGER NOT NULL DEFAULT 0,
+  task_number INTEGER,
   completion_summary TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
@@ -87,6 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_handoff_notes_task_id ON handoff_notes(task_id);
 `;
 
 import type { DatabaseInstance } from "./connection.js";
+import { dedupePrefix, derivePrefix } from "../domain/projects.js";
 
 function ensureColumn(db: DatabaseInstance, table: string, column: string, definition: string): void {
   const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
@@ -279,6 +282,83 @@ function repairDanglingTasksOldReferences(db: DatabaseInstance): void {
 }
 
 /**
+ * Gives every project that predates `code_prefix` one derived from its name,
+ * so task codes (`TTM-42`) work on an existing tracker.db without anyone
+ * having to name a prefix by hand. Projects are walked in creation order, and
+ * the set of prefixes already handed out grows as we go, so a collision
+ * between two *derived* prefixes resolves deterministically in favour of the
+ * older project (`g-mesh` keeps `GM`, a later `game-mode` becomes `GM2`) - a
+ * prefix, once assigned, is a stable public handle and must never shift under
+ * an existing project.
+ *
+ * Cheap enough to call on every startup: the only query that runs on an
+ * already-backfilled DB is the single SELECT below, which finds nothing to do.
+ */
+function backfillProjectPrefixes(db: DatabaseInstance): void {
+  const projects = db
+    .prepare(`SELECT id, name, code_prefix FROM projects ORDER BY created_at ASC, rowid ASC`)
+    .all() as Array<{ id: string; name: string; code_prefix: string | null }>;
+
+  const unprefixed = projects.filter((project) => project.code_prefix === null);
+  if (unprefixed.length === 0) return;
+
+  const taken = new Set(
+    projects
+      .map((project) => project.code_prefix)
+      .filter((prefix): prefix is string => prefix !== null),
+  );
+  const update = db.prepare(`UPDATE projects SET code_prefix = ? WHERE id = ?`);
+
+  db.transaction(() => {
+    for (const project of unprefixed) {
+      const prefix = dedupePrefix(derivePrefix(project.name), taken);
+      taken.add(prefix);
+      update.run(prefix, project.id);
+    }
+  })();
+}
+
+/**
+ * Numbers every pre-existing task 1..N within its project, in creation order,
+ * so the display codes read as a history of the project rather than in
+ * whatever order the backfill happened to visit rows.
+ *
+ * Numbering resumes from the project's current MAX rather than restarting at
+ * 1, which matters for the partially-numbered case: a DB migrated by an older
+ * build and then written to by a newer one would otherwise hand already-taken
+ * numbers to the un-numbered leftovers. `rowid` breaks created_at ties -
+ * create_tasks stamps a whole batch with millisecond-identical timestamps, so
+ * created_at alone leaves the order inside a batch up to SQLite; rowid falls
+ * back to actual insertion order.
+ */
+function backfillTaskNumbers(db: DatabaseInstance): void {
+  const projectIds = (
+    db.prepare(`SELECT DISTINCT project_id FROM tasks WHERE task_number IS NULL`).all() as Array<{
+      project_id: string;
+    }>
+  ).map((row) => row.project_id);
+  if (projectIds.length === 0) return;
+
+  const maxNumber = db.prepare(
+    `SELECT COALESCE(MAX(task_number), 0) AS max FROM tasks WHERE project_id = ?`,
+  );
+  const unnumbered = db.prepare(
+    `SELECT id FROM tasks WHERE project_id = ? AND task_number IS NULL ORDER BY created_at ASC, rowid ASC`,
+  );
+  const update = db.prepare(`UPDATE tasks SET task_number = ? WHERE id = ?`);
+
+  db.transaction(() => {
+    for (const projectId of projectIds) {
+      let next = (maxNumber.get(projectId) as { max: number }).max + 1;
+      for (const task of unnumbered.all(projectId) as Array<{ id: string }>) {
+        update.run(next, task.id);
+        next += 1;
+      }
+    }
+  })();
+}
+
+/**
  * `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL only shapes brand-new databases -
  * it's a no-op against tables that already exist (e.g. this project's own
  * ~/.task-tracker/tracker.db). New nullable columns need an explicit
@@ -313,7 +393,18 @@ export function runMigrations(db: DatabaseInstance): void {
   ensureColumn(db, "tasks", "release_id", "TEXT REFERENCES releases(id) ON DELETE SET NULL");
   db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_release_id ON tasks(release_id)`); // same reasoning as idx_tasks_epic_id above
   ensureColumn(db, "tasks", "completion_summary", "TEXT");
+  ensureColumn(db, "projects", "code_prefix", "TEXT");
+  // Nullable with no default (so the backfill below can tell "never assigned"
+  // from "assigned") and added *after* widenTaskStatusCheck - its rebuild
+  // recreates `tasks` from a fixed column list that doesn't include this one,
+  // so adding it earlier would just be dropped again.
+  ensureColumn(db, "tasks", "task_number", "INTEGER");
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(name)`);
+  // Both no-op after the first run (each starts with a "what's still NULL?"
+  // query that comes back empty), so they're safe on every startup. Order
+  // matters only in that both must follow their ensureColumn above.
+  backfillProjectPrefixes(db);
+  backfillTaskNumbers(db);
   // No ordering constraint relative to widenTaskStatusCheck() above - this
   // repairs damage from *previous* runs of it (see repairDanglingTasksOldReferences),
   // it doesn't interact with a fresh run happening in this same call.

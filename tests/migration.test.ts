@@ -315,6 +315,120 @@ describe("repairDanglingTasksOldReferences (via runMigrations)", () => {
   });
 });
 
+describe("task numbering backfill (via runMigrations)", () => {
+  function seedProject(db: Database.Database, id: string, name: string, createdAt = "now"): void {
+    db.prepare(`INSERT INTO projects (id, name, root_path, created_at) VALUES (?, ?, ?, ?)`).run(
+      id,
+      name,
+      `/tmp/${id}`,
+      createdAt,
+    );
+  }
+
+  function seedTask(db: Database.Database, id: string, projectId: string, createdAt: string): void {
+    db.prepare(
+      `INSERT INTO tasks (id, project_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`,
+    ).run(id, projectId, `Task ${id}`, createdAt, createdAt);
+  }
+
+  function numbersOf(db: Database.Database, projectId: string): Array<{ id: string; task_number: number }> {
+    return db
+      .prepare(`SELECT id, task_number FROM tasks WHERE project_id = ? ORDER BY task_number ASC`)
+      .all(projectId) as Array<{ id: string; task_number: number }>;
+  }
+
+  it("derives a prefix per project and numbers its existing tasks 1..N in created_at order", () => {
+    const db = openPreCancellationDb();
+    seedProject(db, "p1", "task-tracker-mcp");
+    seedProject(db, "p2", "g-mesh");
+    // Deliberately inserted out of chronological order, so passing this test
+    // requires ordering by created_at rather than by insertion order.
+    seedTask(db, "t-third", "p1", "2026-01-03T00:00:00.000Z");
+    seedTask(db, "t-first", "p1", "2026-01-01T00:00:00.000Z");
+    seedTask(db, "t-second", "p1", "2026-01-02T00:00:00.000Z");
+    seedTask(db, "other-1", "p2", "2026-01-05T00:00:00.000Z");
+
+    runMigrations(db);
+
+    expect(db.prepare(`SELECT id, code_prefix FROM projects ORDER BY id`).all()).toEqual([
+      { id: "p1", code_prefix: "TTM" },
+      { id: "p2", code_prefix: "GM" },
+    ]);
+    expect(numbersOf(db, "p1")).toEqual([
+      { id: "t-first", task_number: 1 },
+      { id: "t-second", task_number: 2 },
+      { id: "t-third", task_number: 3 },
+    ]);
+    // Counters are per project, so the second project restarts at 1.
+    expect(numbersOf(db, "p2")).toEqual([{ id: "other-1", task_number: 1 }]);
+  });
+
+  it("de-duplicates a collision between two projects deriving the same prefix, oldest keeping the bare one", () => {
+    const db = openPreCancellationDb();
+    seedProject(db, "p1", "g-mesh", "2026-01-01T00:00:00.000Z");
+    seedProject(db, "p2", "game-mode", "2026-01-02T00:00:00.000Z");
+    seedProject(db, "p3", "grand.machine", "2026-01-03T00:00:00.000Z");
+
+    runMigrations(db);
+
+    expect(db.prepare(`SELECT id, code_prefix FROM projects ORDER BY created_at`).all()).toEqual([
+      { id: "p1", code_prefix: "GM" },
+      { id: "p2", code_prefix: "GM2" },
+      { id: "p3", code_prefix: "GM3" },
+    ]);
+  });
+
+  it("is a no-op on re-run - prefixes and task numbers stay exactly as first assigned", () => {
+    const db = openPreCancellationDb();
+    seedProject(db, "p1", "task-tracker-mcp");
+    seedTask(db, "t1", "p1", "2026-01-01T00:00:00.000Z");
+    seedTask(db, "t2", "p1", "2026-01-02T00:00:00.000Z");
+
+    runMigrations(db);
+    const projectsAfterFirst = db.prepare(`SELECT * FROM projects`).all();
+    const tasksAfterFirst = db.prepare(`SELECT * FROM tasks ORDER BY id`).all();
+
+    expect(() => runMigrations(db)).not.toThrow();
+
+    expect(db.prepare(`SELECT * FROM projects`).all()).toEqual(projectsAfterFirst);
+    expect(db.prepare(`SELECT * FROM tasks ORDER BY id`).all()).toEqual(tasksAfterFirst);
+  });
+
+  it("resumes from the project's highest existing number instead of restarting at 1", () => {
+    // A DB numbered by one build, then written to by an older one that didn't
+    // know about task_number: the leftovers must not collide with 1..N.
+    const db = openPreCancellationDb();
+    seedProject(db, "p1", "task-tracker-mcp");
+    seedTask(db, "t1", "p1", "2026-01-01T00:00:00.000Z");
+    seedTask(db, "t2", "p1", "2026-01-02T00:00:00.000Z");
+
+    runMigrations(db);
+
+    seedTask(db, "t3", "p1", "2026-01-03T00:00:00.000Z");
+    runMigrations(db);
+
+    expect(numbersOf(db, "p1")).toEqual([
+      { id: "t1", task_number: 1 },
+      { id: "t2", task_number: 2 },
+      { id: "t3", task_number: 3 },
+    ]);
+  });
+
+  it("leaves an existing project's prefix alone when a newly added project would derive the same one", () => {
+    const db = openPreCancellationDb();
+    seedProject(db, "p1", "g-mesh", "2026-01-01T00:00:00.000Z");
+    runMigrations(db);
+
+    seedProject(db, "p2", "game-mode", "2026-01-02T00:00:00.000Z");
+    runMigrations(db);
+
+    expect(db.prepare(`SELECT id, code_prefix FROM projects ORDER BY created_at`).all()).toEqual([
+      { id: "p1", code_prefix: "GM" },
+      { id: "p2", code_prefix: "GM2" },
+    ]);
+  });
+});
+
 describe("openDatabase against a genuinely pre-epics (v1) DB file", () => {
   /**
    * Regression test for a real bug: SCHEMA_SQL's `CREATE TABLE IF NOT EXISTS

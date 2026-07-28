@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { openDatabase } from "../src/db/connection.js";
 import { createProject } from "../src/domain/projects.js";
-import { createTask, listTaskFilePaths, requireTask, setTaskPriority } from "../src/domain/tasks.js";
+import {
+  createTask,
+  listTaskFilePaths,
+  requireTask,
+  setTaskPriority,
+  splitTask,
+  taskCode,
+} from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 
 function stubEstimator(tokens: number): BudgetEstimator {
@@ -64,6 +71,90 @@ describe("createTask", () => {
     expect(task.project_id).toBe(project.id);
     const row = db.prepare("SELECT project_id FROM tasks WHERE id = ?").get(task.id);
     expect(row).toMatchObject({ project_id: project.id });
+  });
+
+  it("assigns the next task_number in the project, starting at 1", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+
+    const numbers = ["a", "b", "c"].map(
+      (title) =>
+        createTask(db, stubEstimator(0), {
+          project_id: project.id,
+          title,
+          complexity_hint: "normal",
+        }).task.task_number,
+    );
+
+    expect(numbers).toEqual([1, 2, 3]);
+  });
+
+  it("persists task_number to the row, not just the returned object", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    createTask(db, stubEstimator(0), { project_id: project.id, title: "a", complexity_hint: "normal" });
+
+    const { task } = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "b",
+      complexity_hint: "normal",
+    });
+
+    expect(requireTask(db, task.id).task_number).toBe(2);
+  });
+
+  it("counts task numbers independently per project", () => {
+    const db = openDatabase(":memory:");
+    const first = createProject(db, { name: "First", root_path: "/tmp/first" });
+    const second = createProject(db, { name: "Second", root_path: "/tmp/second" });
+
+    const create = (projectId: string, title: string) =>
+      createTask(db, stubEstimator(0), { project_id: projectId, title, complexity_hint: "normal" }).task
+        .task_number;
+
+    expect(create(first.id, "a")).toBe(1);
+    expect(create(second.id, "a")).toBe(1);
+    expect(create(first.id, "b")).toBe(2);
+    expect(create(second.id, "b")).toBe(2);
+    expect(create(second.id, "c")).toBe(3);
+  });
+
+  it("leaves a split task's number as a gap rather than handing it to a subtask", () => {
+    // splitTask deletes the task it replaces. Its subtasks are created first,
+    // so they take fresh numbers above it and the retired number is never
+    // pointed at different work than the one it was originally quoted for.
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const create = (title: string) =>
+      createTask(db, stubEstimator(0), { project_id: project.id, title, complexity_hint: "normal" }).task;
+    create("first");
+    const doomed = create("second");
+
+    const { new_task_ids } = splitTask(db, stubEstimator(0), doomed.id, [
+      { title: "part a" },
+      { title: "part b" },
+    ]);
+
+    expect(new_task_ids.map((id) => requireTask(db, id).task_number)).toEqual([3, 4]);
+    expect(create("later").task_number).toBe(5);
+  });
+});
+
+describe("taskCode", () => {
+  it("renders a project prefix and task number as PREFIX-N", () => {
+    expect(taskCode("TTM", 42)).toBe("TTM-42");
+  });
+
+  it("builds the code a freshly created task should display", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "task-tracker-mcp", root_path: "/tmp/ttm" });
+    const { task } = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "first",
+      complexity_hint: "normal",
+    });
+
+    expect(taskCode(project.code_prefix, task.task_number)).toBe("TTM-1");
   });
 });
 
