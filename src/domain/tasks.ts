@@ -24,9 +24,38 @@ export interface Task {
   complexity_hint: TaskComplexityHint;
   cancellation_reason: string | null;
   priority: number;
+  task_number: number;
   completion_summary: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/**
+ * Per-project display counter behind the human-facing task code (`TTM-42`).
+ * Same shape as releases.ts's nextSequence, but in steps of 1, not 10: a
+ * release's sequence is a *sort key* that has to leave room for a hotfix to be
+ * slotted between two existing releases (set_release_sequence), whereas a task
+ * number is a plain identity - it's never reordered, and gaps in it would only
+ * make people wonder which task went missing.
+ *
+ * Derived from MAX rather than a stored counter, which is safe against the one
+ * path that deletes tasks (splitTask): it creates the replacement subtasks
+ * *before* dropping the original, so they land above it and the retired number
+ * stays a gap instead of being reissued to different work.
+ */
+export function nextTaskNumber(db: DatabaseInstance, projectId: string): number {
+  const row = db
+    .prepare(`SELECT COALESCE(MAX(task_number), 0) AS max FROM tasks WHERE project_id = ?`)
+    .get(projectId) as { max: number };
+  return row.max + 1;
+}
+
+/**
+ * The one place the `PREFIX-N` display form is spelled out, so every surface
+ * that shows a task code (CLI status, dashboard board) renders it identically.
+ */
+export function taskCode(prefix: string, taskNumber: number): string {
+  return `${prefix}-${taskNumber}`;
 }
 
 export interface CreateTaskInput {
@@ -91,41 +120,45 @@ export function createTask(
   const estimatedTokens = estimator.estimateTokens(project.root_path, filePaths);
   const now = new Date().toISOString();
 
-  const task: Task = {
-    id: randomUUID(),
-    project_id: project.id,
-    epic_id: epicId,
-    release_id: releaseId,
-    title: input.title,
-    description: input.description ?? "",
-    acceptance_criteria: input.acceptance_criteria ?? "",
-    status: "pending",
-    estimated_tokens: estimatedTokens,
-    owner_session_id: null,
-    lock_expires_at: null,
-    complexity_hint: input.complexity_hint,
-    cancellation_reason: null,
-    priority: input.priority ?? 0,
-    completion_summary: null,
-    created_at: now,
-    updated_at: now,
-  };
-
   const insertTask = db.prepare(
-    `INSERT INTO tasks (id, project_id, epic_id, release_id, title, description, acceptance_criteria, status, estimated_tokens, owner_session_id, lock_expires_at, complexity_hint, cancellation_reason, priority, completion_summary, created_at, updated_at)
-     VALUES (@id, @project_id, @epic_id, @release_id, @title, @description, @acceptance_criteria, @status, @estimated_tokens, @owner_session_id, @lock_expires_at, @complexity_hint, @cancellation_reason, @priority, @completion_summary, @created_at, @updated_at)`,
+    `INSERT INTO tasks (id, project_id, epic_id, release_id, title, description, acceptance_criteria, status, estimated_tokens, owner_session_id, lock_expires_at, complexity_hint, cancellation_reason, priority, task_number, completion_summary, created_at, updated_at)
+     VALUES (@id, @project_id, @epic_id, @release_id, @title, @description, @acceptance_criteria, @status, @estimated_tokens, @owner_session_id, @lock_expires_at, @complexity_hint, @cancellation_reason, @priority, @task_number, @completion_summary, @created_at, @updated_at)`,
   );
   const insertFile = db.prepare(`INSERT INTO task_files (task_id, file_path) VALUES (?, ?)`);
 
-  const insertAll = db.transaction(() => {
+  // task_number is read inside the transaction, not before it, so the
+  // MAX(task_number) lookup and the INSERT that consumes it can't be split
+  // apart by another writer handing out the same number.
+  const insertAll = db.transaction((): Task => {
+    const task: Task = {
+      id: randomUUID(),
+      project_id: project.id,
+      epic_id: epicId,
+      release_id: releaseId,
+      title: input.title,
+      description: input.description ?? "",
+      acceptance_criteria: input.acceptance_criteria ?? "",
+      status: "pending",
+      estimated_tokens: estimatedTokens,
+      owner_session_id: null,
+      lock_expires_at: null,
+      complexity_hint: input.complexity_hint,
+      cancellation_reason: null,
+      priority: input.priority ?? 0,
+      task_number: nextTaskNumber(db, project.id),
+      completion_summary: null,
+      created_at: now,
+      updated_at: now,
+    };
+
     insertTask.run(task);
     for (const filePath of filePaths) {
       insertFile.run(task.id, filePath);
     }
+    return task;
   });
-  insertAll();
 
-  return { task, over_budget: isOverBudget(estimatedTokens) };
+  return { task: insertAll(), over_budget: isOverBudget(estimatedTokens) };
 }
 
 export interface SplitSubtaskInput {

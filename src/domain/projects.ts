@@ -7,6 +7,7 @@ export interface Project {
   id: string;
   name: string;
   root_path: string;
+  code_prefix: string;
   design_doc_path: string | null;
   design_doc_hash: string | null;
   created_at: string;
@@ -16,6 +17,52 @@ export interface CreateProjectInput {
   name: string;
   root_path: string;
   design_doc_path?: string;
+}
+
+/**
+ * Short human-facing project code that fronts every task's display number
+ * (`TTM-42`) - a stable handle a person can say out loud, unlike the uuid.
+ * Derived from the name rather than asked for as an input so every existing
+ * project can be backfilled without anyone having to pick one (see
+ * backfillProjectPrefixes in db/schema.ts).
+ *
+ * Multi-word names become their initials (`task-tracker-mcp` -> `TTM`,
+ * `g-mesh` -> `GM`); a single word is truncated to 3 letters (`Demo` ->
+ * `DEM`), since a one-letter code reads as noise. Any non-alphanumeric run
+ * counts as a word separator, so spaces, dots and underscores work the same
+ * as hyphens. A name with no alphanumerics at all has no initials to take -
+ * it falls back to `PRJ` rather than returning an empty prefix that would
+ * render as a bare `-7`.
+ */
+export function derivePrefix(name: string): string {
+  const words = name.split(/[^a-zA-Z0-9]+/).filter((word) => word.length > 0);
+  if (words.length === 0) return "PRJ";
+  if (words.length === 1) return words[0].slice(0, 3).toUpperCase();
+  return words.map((word) => word[0]).join("").toUpperCase();
+}
+
+/**
+ * Makes a derived prefix unique by suffixing 2, 3, ... on collision
+ * (`g-mesh` and `game-mode` both derive to `GM`, so the second becomes
+ * `GM2`). Shared by createProject and the startup backfill so a prefix
+ * assigned at either point plays by the same rules; `taken` is the caller's
+ * view of the prefixes already in use, which the backfill grows as it walks
+ * projects so two freshly-derived collisions don't both win.
+ */
+export function dedupePrefix(prefix: string, taken: ReadonlySet<string>): string {
+  if (!taken.has(prefix)) return prefix;
+  let suffix = 2;
+  while (taken.has(`${prefix}${suffix}`)) {
+    suffix += 1;
+  }
+  return `${prefix}${suffix}`;
+}
+
+export function takenPrefixes(db: DatabaseInstance): Set<string> {
+  const rows = db
+    .prepare(`SELECT code_prefix FROM projects WHERE code_prefix IS NOT NULL`)
+    .all() as Array<{ code_prefix: string }>;
+  return new Set(rows.map((row) => row.code_prefix));
 }
 
 /**
@@ -68,6 +115,7 @@ export function createProject(db: DatabaseInstance, input: CreateProjectInput): 
     id: randomUUID(),
     name: input.name,
     root_path: input.root_path,
+    code_prefix: dedupePrefix(derivePrefix(input.name), takenPrefixes(db)),
     design_doc_path: input.design_doc_path ?? null,
     design_doc_hash: designDocHash,
     created_at: new Date().toISOString(),
@@ -75,8 +123,8 @@ export function createProject(db: DatabaseInstance, input: CreateProjectInput): 
 
   try {
     db.prepare(
-      `INSERT INTO projects (id, name, root_path, design_doc_path, design_doc_hash, created_at)
-       VALUES (@id, @name, @root_path, @design_doc_path, @design_doc_hash, @created_at)`,
+      `INSERT INTO projects (id, name, root_path, code_prefix, design_doc_path, design_doc_hash, created_at)
+       VALUES (@id, @name, @root_path, @code_prefix, @design_doc_path, @design_doc_hash, @created_at)`,
     ).run(project);
   } catch (error) {
     if (error instanceof Error && (error as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") {
