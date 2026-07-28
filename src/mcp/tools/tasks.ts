@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DatabaseInstance } from "../../db/connection.js";
 import type { BudgetEstimator } from "../../domain/budget.js";
-import { createTask, createTasks, setTaskPriority, splitTask } from "../../domain/tasks.js";
+import { createTask, createTasks, deleteTask, setTaskPriority, splitTask } from "../../domain/tasks.js";
 import { jsonResult } from "../toolResult.js";
 
 const complexityHintEnum = z.enum(["normal", "high"]);
@@ -85,6 +85,21 @@ export function registerTaskTools(
       },
     },
     async ({ task_id, subtasks }) => jsonResult(splitTask(db, estimator, task_id, subtasks)),
+  );
+
+  server.registerTool(
+    "delete_task",
+    {
+      description:
+        "Hard-delete a backlog task (no release assigned) - the row plus its file list, dependency edges (both directions), and handoff notes are all removed. Rejects a task that has a release_id; move it out with set_task_release or use cancel_task instead.",
+      inputSchema: {
+        task_id: z.string().min(1),
+      },
+    },
+    async ({ task_id }) => {
+      deleteTask(db, task_id);
+      return jsonResult({ ok: true });
+    },
   );
 
   server.registerTool(

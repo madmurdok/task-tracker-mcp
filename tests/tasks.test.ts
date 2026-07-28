@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { openDatabase } from "../src/db/connection.js";
+import { addDependency } from "../src/domain/dependencies.js";
+import { addHandoffNote } from "../src/domain/handoffNotes.js";
 import { createProject } from "../src/domain/projects.js";
+import { createRelease } from "../src/domain/releases.js";
 import {
   createTask,
+  deleteTask,
   listTaskFilePaths,
   requireTask,
   setTaskPriority,
@@ -223,5 +227,69 @@ describe("setTaskPriority", () => {
   it("rejects an unknown task_id", () => {
     const db = openDatabase(":memory:");
     expect(() => setTaskPriority(db, "missing", 5)).toThrow(/Unknown task_id: missing/);
+  });
+});
+
+describe("deleteTask", () => {
+  it("removes a backlog task's row plus its task_files, task_dependencies (both directions), and handoff_notes", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const prerequisite = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "prerequisite",
+      complexity_hint: "normal",
+    }).task;
+    const dependent = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "dependent",
+      complexity_hint: "normal",
+    }).task;
+    const target = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "target",
+      file_paths: ["src/a.ts"],
+      complexity_hint: "normal",
+    }).task;
+
+    addDependency(db, target.id, prerequisite.id);
+    addDependency(db, dependent.id, target.id);
+    addHandoffNote(db, { task_id: target.id, session_id: "session-1", decisions: "did stuff" });
+
+    deleteTask(db, target.id);
+
+    expect(db.prepare("SELECT * FROM tasks WHERE id = ?").get(target.id)).toBeUndefined();
+    expect(db.prepare("SELECT * FROM task_files WHERE task_id = ?").all(target.id)).toEqual([]);
+    expect(
+      db
+        .prepare("SELECT * FROM task_dependencies WHERE task_id = ? OR depends_on_task_id = ?")
+        .all(target.id, target.id),
+    ).toEqual([]);
+    expect(db.prepare("SELECT * FROM handoff_notes WHERE task_id = ?").all(target.id)).toEqual([]);
+
+    // unrelated rows survive
+    expect(db.prepare("SELECT * FROM tasks WHERE id = ?").get(prerequisite.id)).toBeDefined();
+    expect(db.prepare("SELECT * FROM tasks WHERE id = ?").get(dependent.id)).toBeDefined();
+  });
+
+  it("rejects a task that has a release_id, without deleting anything", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const release = createRelease(db, { project_id: project.id, version: "1.0.0" });
+    const task = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "in a release",
+      release_id: release.id,
+      complexity_hint: "normal",
+    }).task;
+
+    expect(() => deleteTask(db, task.id)).toThrow(
+      /is in a release; only backlog tasks \(no release\) can be deleted/,
+    );
+    expect(db.prepare("SELECT * FROM tasks WHERE id = ?").get(task.id)).toBeDefined();
+  });
+
+  it("rejects an unknown task_id", () => {
+    const db = openDatabase(":memory:");
+    expect(() => deleteTask(db, "missing")).toThrow(/Unknown task_id: missing/);
   });
 });

@@ -161,6 +161,29 @@ export function createTask(
   return { task: insertAll(), over_budget: isOverBudget(estimatedTokens) };
 }
 
+/**
+ * Hard-deletes a task: the row plus its task_files, both directions of
+ * task_dependencies, and its handoff_notes, all via schema.ts's ON DELETE
+ * CASCADE against tasks(id) - no explicit cleanup needed here. Restricted to
+ * backlog tasks (release_id null) because a released/planned release's task
+ * membership is meant to be a stable record (see requireAssignableRelease);
+ * deleting a task out from under a release would silently corrupt that
+ * record, whereas moving it out first (set_task_release) or cancelling it
+ * (cancel_task, which just flips status) both leave an audit trail behind.
+ * Deliberately no lock/ownership guard beyond that - unlike claim/complete,
+ * deleting a mis-created backlog task isn't gated by who has it locked.
+ */
+export function deleteTask(db: DatabaseInstance, taskId: string): void {
+  const task = requireTask(db, taskId);
+  if (task.release_id !== null) {
+    throw new Error(
+      `Task ${taskId} is in a release; only backlog tasks (no release) can be deleted. Move it out with set_task_release or use cancel_task instead.`,
+    );
+  }
+
+  db.prepare(`DELETE FROM tasks WHERE id = ?`).run(taskId);
+}
+
 export interface SplitSubtaskInput {
   title: string;
   description?: string;
