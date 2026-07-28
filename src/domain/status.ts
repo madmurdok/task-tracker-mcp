@@ -14,6 +14,7 @@ export interface TaskSummary {
   estimated_tokens: number;
   epic_id: string | null;
   release_id: string | null;
+  task_number: number;
 }
 
 export interface ProjectStatus {
@@ -204,6 +205,7 @@ export function listTasks(
     estimated_tokens: task.estimated_tokens,
     epic_id: task.epic_id,
     release_id: task.release_id,
+    task_number: task.task_number,
   }));
 
   return statusFilter ? summaries.filter((s) => s.status === statusFilter) : summaries;

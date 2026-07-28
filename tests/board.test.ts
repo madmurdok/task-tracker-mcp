@@ -113,13 +113,20 @@ describe("getBoardData", () => {
 
     expect(board.project_id).toBe(project.id);
     expect(board.project_name).toBe("Demo");
+    // Emitted once per board (not repeated per task) - together with each
+    // task's task_number this is what lets the dashboard render the
+    // PREFIX-N code (e.g. "DEM-1") on a card.
+    expect(board.project_code_prefix).toBe("DEM");
     expect(board.lanes).toHaveLength(3);
     expect(board.lanes[0]).toMatchObject({ release_id: null });
     expect(board.lanes[0].tasks.map((t) => t.title)).toEqual(["Backlog item"]);
+    expect(board.lanes[0].tasks.map((t) => t.task_number)).toEqual([1]);
     expect(board.lanes[1]).toMatchObject({ release_id: v2.id, release_version: "0.2" });
     expect(board.lanes[1].tasks.map((t) => t.title)).toEqual(["For v0.2"]);
+    expect(board.lanes[1].tasks.map((t) => t.task_number)).toEqual([3]);
     expect(board.lanes[2]).toMatchObject({ release_id: v1.id, release_version: "0.1" });
     expect(board.lanes[2].tasks.map((t) => t.title)).toEqual(["For v0.1"]);
+    expect(board.lanes[2].tasks.map((t) => t.task_number)).toEqual([2]);
   });
 
   it("surfaces a release's status and release_notes on its lane; both are null for a planned release and for the no-release lane", () => {
