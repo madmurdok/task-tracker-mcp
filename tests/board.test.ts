@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import vm from "node:vm";
 import { describe, expect, it } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
@@ -48,8 +49,13 @@ function domElementStub(): any {
   return el;
 }
 
+// Resolved relative to this test file (not process.cwd()) so it always reads
+// the board.js sitting next to it in this checkout/worktree, regardless of
+// what directory the test runner itself was launched from.
+const BOARD_JS_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src/dashboard/public/board.js");
+
 function loadBoardScript(): any {
-  const src = readFileSync(path.join(process.cwd(), "src/dashboard/public/board.js"), "utf8");
+  const src = readFileSync(BOARD_JS_PATH, "utf8");
   const sandbox: any = {
     document: {
       title: "",
