@@ -15,6 +15,7 @@ export interface BoardTask {
   epic_name: string | null;
   owner_session_id: string | null;
   is_stale: boolean;
+  task_number: number;
 }
 
 export interface BoardLane {
@@ -29,6 +30,7 @@ export interface BoardLane {
 export interface BoardData {
   project_id: string;
   project_name: string;
+  project_code_prefix: string;
   doc_drift: boolean;
   lanes: BoardLane[];
 }
@@ -73,6 +75,7 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
     epic_name: task.epic_id ? (epicNameById.get(task.epic_id) ?? null) : null,
     owner_session_id: task.owner_session_id,
     is_stale: isStale(task, nowIso),
+    task_number: task.task_number,
   });
 
   const lanes: BoardLane[] = [];
@@ -107,6 +110,7 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
   return {
     project_id: project.id,
     project_name: project.name,
+    project_code_prefix: project.code_prefix,
     doc_drift: isDocDrifted(project),
     lanes,
   };

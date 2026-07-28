@@ -26,7 +26,7 @@ function laneTitle(lane) {
 // teardown+rebuild instead of snapping shut again.
 const expandedCards = new Set();
 
-function createCard(task, statusLabel) {
+function createCard(task, statusLabel, codePrefix) {
   const card = document.createElement("article");
   card.className = "card";
   card.dataset.status = task.status;
@@ -37,7 +37,9 @@ function createCard(task, statusLabel) {
 
   const title = document.createElement("h4");
   title.className = "card-title";
-  title.textContent = task.title;
+  // PREFIX-N prefix (e.g. "TTM-52") so a card can be pointed to as a stable
+  // human-facing handle, matching the code get_task/list_tasks surface.
+  title.textContent = `${codePrefix}-${task.task_number} - ${task.title}`;
   card.appendChild(title);
 
   const meta = document.createElement("div");
@@ -112,7 +114,7 @@ function createCard(task, statusLabel) {
   return card;
 }
 
-function createColumn(column, tasks) {
+function createColumn(column, tasks, codePrefix) {
   const section = document.createElement("section");
   section.className = "column";
   section.dataset.status = column.status;
@@ -131,7 +133,7 @@ function createColumn(column, tasks) {
   const cards = document.createElement("div");
   cards.className = "column-cards";
   for (const task of tasks) {
-    cards.appendChild(createCard(task, column.label));
+    cards.appendChild(createCard(task, column.label, codePrefix));
   }
   section.appendChild(cards);
 
@@ -188,7 +190,7 @@ function ensureLaneInitialized(lane, key) {
   if (shouldCollapse) collapsedLanes.add(key);
 }
 
-function createLane(lane) {
+function createLane(lane, codePrefix) {
   const key = laneKey(lane);
   ensureLaneInitialized(lane, key);
   const section = document.createElement("section");
@@ -203,6 +205,7 @@ function createLane(lane) {
       createColumn(
         column,
         lane.tasks.filter((task) => task.status === column.status),
+        codePrefix,
       ),
     );
   }
@@ -264,7 +267,7 @@ function renderBoard(board) {
   // each time rather than trying to patch the existing DOM in place.
   while (container.firstChild) container.removeChild(container.firstChild);
   for (const lane of board.lanes) {
-    container.appendChild(createLane(lane));
+    container.appendChild(createLane(lane, board.project_code_prefix));
   }
 }
 

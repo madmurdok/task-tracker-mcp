@@ -304,6 +304,7 @@ describe("listTasks release_id filter", () => {
         estimated_tokens: 0,
         epic_id: null,
         release_id: release.id,
+        task_number: inRelease.task_number,
       },
     ]);
 
