@@ -10,6 +10,14 @@
   --warning-bg: #fff2d9;
   --success: #2f7d4f;
   --success-bg: #e3f4e8;
+  --danger: #b3261e;
+  --danger-bg: #fbe2e0;
+  --info: #0f766e;
+  --info-bg: #d9f2ef;
+  --pending: #52606d;
+  --pending-bg: #eceef1;
+  --neutral: #6b6b6b;
+  --neutral-bg: #ececec;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -24,6 +32,14 @@
     --warning-bg: #3a2f14;
     --success: #7fd9a0;
     --success-bg: #1c3324;
+    --danger: #ff9b93;
+    --danger-bg: #3a1f1d;
+    --info: #5eead4;
+    --info-bg: #123330;
+    --pending: #aab4bf;
+    --pending-bg: #262a30;
+    --neutral: #9a9a9a;
+    --neutral-bg: #2a2a2a;
   }
 }
 
@@ -229,6 +245,7 @@ a {
 }
 
 .column {
+  min-width: 0;
   border: 1px solid var(--border);
   border-radius: 0.5rem;
   background: var(--surface);
@@ -266,6 +283,7 @@ a {
 .card-title {
   margin: 0;
   font-size: 0.875rem;
+  overflow-wrap: break-word;
 }
 
 .card-meta {
@@ -287,6 +305,30 @@ a {
   border-color: var(--success);
   background: var(--success-bg);
   color: var(--success);
+}
+
+.card-status[data-status="blocked"] {
+  border-color: var(--danger);
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.card-status[data-status="in_progress"] {
+  border-color: var(--info);
+  background: var(--info-bg);
+  color: var(--info);
+}
+
+.card-status[data-status="pending"] {
+  border-color: var(--pending);
+  background: var(--pending-bg);
+  color: var(--pending);
+}
+
+.card-status[data-status="cancelled"] {
+  border-color: var(--neutral);
+  background: var(--neutral-bg);
+  color: var(--neutral);
 }
 
 /* Only present when the task has a description to show - a plain card
