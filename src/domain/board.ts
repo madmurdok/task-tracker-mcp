@@ -46,8 +46,8 @@ function isStale(task: Task, nowIso: string): boolean {
 
 /**
  * Read-only aggregation for the dashboard (REQUIREMENTS.md Item 8): groups a
- * project's tasks into swimlanes by release (a "no release" lane first, then
- * one per release in listReleases' sequence order), and shapes each task with
+ * project's tasks into swimlanes by release (a "no release"/Backlog lane
+ * always first, then one per release newest-sequence-first), and shapes each task with
  * exactly the fields the board needs - between TaskSummary (too little: no
  * priority/description/ownership) and TaskDetail (too much: drags in
  * file_paths/handoff_notes/acceptance_criteria, which are agent-facing detail
@@ -78,22 +78,23 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
   const lanes: BoardLane[] = [];
 
   const unreleasedTasks = tasks.filter((task) => task.release_id === null).map(toBoardTask);
-  // Skip an empty "no release" lane once every task has a release - no point
-  // rendering a permanently-empty swimlane on a project that ships everything
-  // through releases. Still show it (even empty) when there are no releases
-  // at all yet, so the board isn't blank for a brand-new project.
-  if (unreleasedTasks.length > 0 || releases.length === 0) {
-    lanes.push({
-      release_id: null,
-      release_version: null,
-      release_name: null,
-      release_status: null,
-      release_notes: null,
-      tasks: unreleasedTasks,
-    });
-  }
+  // Always show the "no release" (Backlog) lane first, even when empty - it's
+  // a fixed landmark at the top of the board, not something that should
+  // appear/disappear as tasks get assigned to releases.
+  lanes.push({
+    release_id: null,
+    release_version: null,
+    release_name: null,
+    release_status: null,
+    release_notes: null,
+    tasks: unreleasedTasks,
+  });
 
-  for (const release of releases) {
+  // listReleases orders oldest/lowest-sequence first (needed as-is for
+  // list_releases and status aggregation); the board instead wants the most
+  // recent release directly under Backlog, so reverse a local copy just for
+  // lane ordering.
+  for (const release of [...releases].reverse()) {
     lanes.push({
       release_id: release.id,
       release_version: release.version,

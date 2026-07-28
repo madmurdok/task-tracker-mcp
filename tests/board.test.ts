@@ -17,7 +17,7 @@ function setup() {
 }
 
 describe("getBoardData", () => {
-  it("puts unreleased tasks in a 'no release' lane and released ones in their own release lane, in sequence order", () => {
+  it("puts unreleased tasks in a 'no release' lane and released ones in their own release lane, newest release first", () => {
     const { db, project } = setup();
     const v1 = createRelease(db, { project_id: project.id, version: "0.1", name: "First" });
     const v2 = createRelease(db, { project_id: project.id, version: "0.2", name: "Second" });
@@ -46,10 +46,10 @@ describe("getBoardData", () => {
     expect(board.lanes).toHaveLength(3);
     expect(board.lanes[0]).toMatchObject({ release_id: null });
     expect(board.lanes[0].tasks.map((t) => t.title)).toEqual(["Backlog item"]);
-    expect(board.lanes[1]).toMatchObject({ release_id: v1.id, release_version: "0.1" });
-    expect(board.lanes[1].tasks.map((t) => t.title)).toEqual(["For v0.1"]);
-    expect(board.lanes[2]).toMatchObject({ release_id: v2.id, release_version: "0.2" });
-    expect(board.lanes[2].tasks.map((t) => t.title)).toEqual(["For v0.2"]);
+    expect(board.lanes[1]).toMatchObject({ release_id: v2.id, release_version: "0.2" });
+    expect(board.lanes[1].tasks.map((t) => t.title)).toEqual(["For v0.2"]);
+    expect(board.lanes[2]).toMatchObject({ release_id: v1.id, release_version: "0.1" });
+    expect(board.lanes[2].tasks.map((t) => t.title)).toEqual(["For v0.1"]);
   });
 
   it("surfaces a release's status and release_notes on its lane; both are null for a planned release and for the no-release lane", () => {
@@ -73,7 +73,7 @@ describe("getBoardData", () => {
     });
   });
 
-  it("omits the 'no release' lane once every task has a release, but keeps it when there are no releases yet", () => {
+  it("always shows the 'no release' (Backlog) lane first, even when empty - both for a brand-new project and one where every task has a release", () => {
     const { db, project } = setup();
     const v1 = createRelease(db, { project_id: project.id, version: "0.1" });
     createTask(db, noopEstimator, {
@@ -83,7 +83,9 @@ describe("getBoardData", () => {
       release_id: v1.id,
     });
 
-    expect(getBoardData(db, project.id).lanes.map((l) => l.release_id)).toEqual([v1.id]);
+    const board = getBoardData(db, project.id);
+    expect(board.lanes.map((l) => l.release_id)).toEqual([null, v1.id]);
+    expect(board.lanes[0]).toMatchObject({ release_id: null, tasks: [] });
 
     const { db: db2, project: project2 } = setup();
     expect(getBoardData(db2, project2.id).lanes).toEqual([
@@ -96,6 +98,17 @@ describe("getBoardData", () => {
         tasks: [],
       },
     ]);
+  });
+
+  it("orders multiple release lanes highest-sequence-first, with Backlog always on top", () => {
+    const { db, project } = setup();
+    const v1 = createRelease(db, { project_id: project.id, version: "0.1" });
+    const v2 = createRelease(db, { project_id: project.id, version: "0.2" });
+    const v3 = createRelease(db, { project_id: project.id, version: "0.3" });
+
+    const board = getBoardData(db, project.id);
+
+    expect(board.lanes.map((l) => l.release_id)).toEqual([null, v3.id, v2.id, v1.id]);
   });
 
   it("derives 'blocked' status for a task with an unmet dependency", () => {
