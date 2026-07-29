@@ -596,6 +596,19 @@ is just an index.
   The dashboard board also always shows the Backlog lane first (even when
   empty), orders release lanes newest-first, and annotates each lane's title
   with its non-cancelled task count (e.g. "Backlog (5)").
+- **v8 — `claim_task` starts pending work directly**: previously `claim_task`
+  only ever touched `owner_session_id`/`lock_expires_at`, so calling it directly
+  on a still-`pending` task silently left `status` unchanged — only
+  `get_next_task`'s queue-pull actually flipped a task to `in_progress`. Now
+  `claim_task` is a full direct-pick counterpart to `get_next_task`'s
+  queue-pull (for a human/orchestrator assigning a specific task to a specific
+  parallel worker, e.g. by epic/file area): it moves a `pending` task to
+  `in_progress` itself, gated by the same unmet-dependency check `get_next_task`
+  applies (rejects with a new `blocked` error otherwise), and rejects with a new
+  `not_claimable` error for an already `done`/`cancelled` task. `get_next_task`
+  itself is unchanged (no `session_id` param) — the two tools stay orthogonal:
+  pull-the-next-one vs. take-this-specific-one, both converging on the same
+  `in_progress` + owner + lease state.
 
 ## How to use this file
 

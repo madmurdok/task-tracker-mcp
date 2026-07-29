@@ -32,3 +32,17 @@ export function notAllDoneResult(details: { message: string; pending_task_ids: s
     isError: true,
   };
 }
+
+export function blockedResult(details: { message: string }): CallToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify({ error: "blocked", ...details }) }],
+    isError: true,
+  };
+}
+
+export function notClaimableResult(details: { message: string; status: string }): CallToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify({ error: "not_claimable", ...details }) }],
+    isError: true,
+  };
+}

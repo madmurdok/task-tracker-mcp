@@ -13,7 +13,9 @@ import {
   releaseIt,
   ReleaseNotAllDoneError,
   releaseTask,
+  TaskBlockedError,
   TaskConflictError,
+  TaskNotClaimableError,
 } from "../src/domain/lifecycle.js";
 import { addHandoffNote } from "../src/domain/handoffNotes.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
@@ -94,6 +96,69 @@ describe("full task lifecycle (matches the doc's sequence diagram)", () => {
   it("complete_task rejects an unknown task", () => {
     const db = openDatabase(":memory:");
     expect(() => completeTask(db, noopVerifier, { task_id: "missing" })).toThrow(/Unknown task_id/);
+  });
+});
+
+describe("claim_task as direct take-into-work (no prior get_next_task)", () => {
+  it("moves a fresh, unblocked pending task straight to in_progress", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Build schema",
+      complexity_hint: "normal",
+    });
+
+    claimTask(db, task.id, "session-1");
+
+    const row = db.prepare(`SELECT status, owner_session_id FROM tasks WHERE id = ?`).get(task.id);
+    expect(row).toMatchObject({ status: "in_progress", owner_session_id: "session-1" });
+  });
+
+  it("rejects claiming a pending task with unmet dependencies", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const { task: taskA } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Build schema",
+      complexity_hint: "normal",
+    });
+    const { task: taskB } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Build domain layer",
+      complexity_hint: "normal",
+    });
+    addDependency(db, taskB.id, taskA.id); // B depends on A
+
+    expect(() => claimTask(db, taskB.id, "session-1")).toThrow(TaskBlockedError);
+    const row = db.prepare(`SELECT status, owner_session_id FROM tasks WHERE id = ?`).get(taskB.id);
+    expect(row).toMatchObject({ status: "pending", owner_session_id: null });
+  });
+
+  it("rejects claiming an already-done task", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Build schema",
+      complexity_hint: "normal",
+    });
+    completeTask(db, noopVerifier, { task_id: task.id });
+
+    expect(() => claimTask(db, task.id, "session-1")).toThrow(TaskNotClaimableError);
+  });
+
+  it("rejects claiming a cancelled task", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Build schema",
+      complexity_hint: "normal",
+    });
+    cancelTask(db, { task_id: task.id });
+
+    expect(() => claimTask(db, task.id, "session-1")).toThrow(TaskNotClaimableError);
   });
 });
 
