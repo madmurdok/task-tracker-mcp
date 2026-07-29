@@ -1,7 +1,7 @@
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireProject } from "./projects.js";
 import { requireRelease } from "./releases.js";
-import { findUnblockedDependents, LOCK_LEASE_MS } from "./status.js";
+import { findUnblockedDependents, hasUnmetDependencies, LOCK_LEASE_MS } from "./status.js";
 import type { CompletionVerifier } from "./verification.js";
 
 /**
@@ -21,15 +21,51 @@ export class TaskConflictError extends Error {
   }
 }
 
+/**
+ * Raised when claim_task is called directly on a task that's done/cancelled -
+ * there's nothing left to claim.
+ */
+export class TaskNotClaimableError extends Error {
+  constructor(
+    message: string,
+    public readonly status: string,
+  ) {
+    super(message);
+    this.name = "TaskNotClaimableError";
+  }
+}
+
+/**
+ * Raised when claim_task is called directly on a pending task that still has
+ * unmet dependencies - the same gate get_next_task applies to its own
+ * candidate query, so a direct claim can't bypass the dependency graph.
+ */
+export class TaskBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TaskBlockedError";
+  }
+}
+
 function isLockActive(lockExpiresAt: string | null, nowIso: string): boolean {
   return lockExpiresAt !== null && lockExpiresAt >= nowIso;
 }
 
 /**
- * Records ownership and renews the stale-lock lease (see LOCK_LEASE_MS) so an
- * actively-worked task isn't reclaimed out from under its session by a later
- * get_next_task call. Rejects with TaskConflictError if a different session
- * currently holds an active (non-expired) lock.
+ * Takes a task into work directly, by id: records ownership, renews the
+ * stale-lock lease (see LOCK_LEASE_MS), and - unlike the pre-fix version of
+ * this function - moves a still-`pending` task to `in_progress` itself
+ * (mirroring what get_next_task's handOut does), gated by the same
+ * hasUnmetDependencies check so a direct claim can't skip ahead of an
+ * unresolved dependency. This is the direct-pick counterpart to
+ * get_next_task's queue-pull: an orchestrator/human assigning a *specific*
+ * task to a *specific* parallel worker, instead of taking whatever's next in
+ * priority order.
+ *
+ * Rejects with TaskNotClaimableError if the task is done/cancelled, with
+ * TaskBlockedError if it's pending with unmet dependencies, and with
+ * TaskConflictError if a different session currently holds an active
+ * (non-expired) lock on it.
  */
 export function claimTask(db: DatabaseInstance, taskId: string, sessionId: string): void {
   const now = new Date().toISOString();
@@ -37,11 +73,21 @@ export function claimTask(db: DatabaseInstance, taskId: string, sessionId: strin
 
   const run = db.transaction(() => {
     const task = db
-      .prepare(`SELECT owner_session_id, lock_expires_at FROM tasks WHERE id = ?`)
-      .get(taskId) as { owner_session_id: string | null; lock_expires_at: string | null } | undefined;
+      .prepare(`SELECT status, owner_session_id, lock_expires_at FROM tasks WHERE id = ?`)
+      .get(taskId) as
+      | { status: string; owner_session_id: string | null; lock_expires_at: string | null }
+      | undefined;
 
     if (!task) {
       throw new Error(`Unknown task_id: ${taskId}`);
+    }
+
+    if (task.status === "done" || task.status === "cancelled") {
+      throw new TaskNotClaimableError(`Task ${taskId} is already ${task.status}, nothing to claim`, task.status);
+    }
+
+    if (task.status === "pending" && hasUnmetDependencies(db, taskId)) {
+      throw new TaskBlockedError(`Task ${taskId} is blocked by unmet dependencies`);
     }
 
     if (
@@ -57,7 +103,7 @@ export function claimTask(db: DatabaseInstance, taskId: string, sessionId: strin
     }
 
     db.prepare(
-      `UPDATE tasks SET owner_session_id = ?, lock_expires_at = ?, updated_at = ? WHERE id = ?`,
+      `UPDATE tasks SET status = 'in_progress', owner_session_id = ?, lock_expires_at = ?, updated_at = ? WHERE id = ?`,
     ).run(sessionId, lockExpiresAt, now, taskId);
   });
 

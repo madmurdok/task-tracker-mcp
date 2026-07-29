@@ -8,10 +8,12 @@ import {
   completeTask,
   CompletionVerificationError,
   releaseTask,
+  TaskBlockedError,
   TaskConflictError,
+  TaskNotClaimableError,
 } from "../../domain/lifecycle.js";
 import type { CompletionVerifier } from "../../domain/verification.js";
-import { conflictResult, jsonResult, verificationFailedResult } from "../toolResult.js";
+import { blockedResult, conflictResult, jsonResult, notClaimableResult, verificationFailedResult } from "../toolResult.js";
 
 export function registerLifecycleTools(
   server: McpServer,
@@ -22,7 +24,7 @@ export function registerLifecycleTools(
     "claim_task",
     {
       description:
-        "Record which session is working a task. Rejects with a conflict error if another session's lock on it is still active.",
+        "Take a specific task into work: moves a pending, unblocked task straight to in_progress, or attaches/renews ownership on a task already in_progress (e.g. right after get_next_task). Use this to hand a specific task to a specific session instead of pulling from the priority queue. Rejects with a conflict error if another session's lock is still active, a blocked error if the task has unmet dependencies, or a not_claimable error if it's already done/cancelled.",
       inputSchema: {
         task_id: z.string().min(1),
         session_id: z.string().min(1),
@@ -38,6 +40,12 @@ export function registerLifecycleTools(
             current_owner_session_id: error.currentOwnerSessionId,
             lock_expires_at: error.lockExpiresAt,
           });
+        }
+        if (error instanceof TaskBlockedError) {
+          return blockedResult({ message: error.message });
+        }
+        if (error instanceof TaskNotClaimableError) {
+          return notClaimableResult({ message: error.message, status: error.status });
         }
         throw error;
       }
