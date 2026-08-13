@@ -47,7 +47,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 27 registered tools over the same transport", async () => {
+  it("exercises all 28 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -82,6 +82,7 @@ describe("MCP server smoke test", () => {
         "list_releases",
         "get_release_status",
         "release_it",
+        "cancel_release",
         "set_task_release",
         "set_release_sequence",
         "create_tasks",
@@ -418,4 +419,73 @@ async function releaseLifecycleScenario(db: DatabaseInstance, rootPath: string):
     expect(reordered.isError).toBeFalsy();
     const { payload: reListed } = await call("list_releases", { project_id: project.project_id });
     expect(reListed.releases[0].id).toBe(nextRelease.release_id); // sequence 5 now sorts first
+
+    // cancel_release: a third release that gets built but deliberately never
+    // shipped. Rejections here come back as a bare error string rather than
+    // one of the structured error payloads (not_all_done / verification_failed
+    // / conflict), so they're read as text.
+    const callText = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      const content = result.content as Array<{ type: string; text: string }>;
+      return { isError: result.isError, text: content[0].text };
+    };
+
+    const { payload: abandoned } = await call("create_release", {
+      project_id: project.project_id,
+      version: "0.3",
+    });
+    const { payload: salvageable } = await call("create_task", {
+      project_id: project.project_id,
+      release_id: "0.3",
+      title: "Repo map (unshipped)",
+      complexity_hint: "normal",
+    });
+
+    const cancelled = await call("cancel_release", {
+      project_id: project.project_id,
+      release_id: "0.3",
+      reason: "bench gate said the feature isn't worth shipping",
+    });
+    expect(cancelled.isError).toBeFalsy();
+    expect(cancelled.payload.ok).toBe(true);
+
+    const { payload: withCancelled } = await call("list_releases", { project_id: project.project_id });
+    expect(withCancelled.releases.find((r: { id: string }) => r.id === abandoned.release_id)).toMatchObject({
+      status: "cancelled",
+      cancellation_reason: "bench gate said the feature isn't worth shipping",
+      released_at: null,
+    });
+
+    // Closed to new tasks in both directions of creation...
+    const assignInto = await callText("create_task", {
+      project_id: project.project_id,
+      release_id: "0.3",
+      title: "More work on a dead batch",
+      complexity_hint: "normal",
+    });
+    expect(assignInto.isError).toBe(true);
+    expect(assignInto.text).toMatch(/is cancelled; cannot assign new tasks to it/);
+
+    // ...but deliberately open outbound, so salvageable work can be rescued.
+    const rescued = await call("set_task_release", {
+      task_id: salvageable.task_id,
+      release_id: nextRelease.release_id,
+    });
+    expect(rescued.isError).toBeFalsy();
+
+    const shipCancelled = await callText("release_it", {
+      project_id: project.project_id,
+      release_id: "0.3",
+      force: true,
+    });
+    expect(shipCancelled.isError).toBe(true);
+    expect(shipCancelled.text).toMatch(/already cancelled/);
+
+    const cancelTwice = await callText("cancel_release", {
+      project_id: project.project_id,
+      release_id: "0.3",
+      reason: "again",
+    });
+    expect(cancelTwice.isError).toBe(true);
+    expect(cancelTwice.text).toMatch(/already cancelled, nothing to cancel/);
 }

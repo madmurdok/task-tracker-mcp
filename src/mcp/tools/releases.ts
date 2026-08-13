@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DatabaseInstance } from "../../db/connection.js";
 import {
+  cancelRelease,
   CompletionVerificationError,
   releaseIt,
   ReleaseNotAllDoneError,
@@ -61,7 +62,7 @@ export function registerReleaseTools(
     "release_it",
     {
       description:
-        "Ship a release: rejects unless every task in it is done or cancelled (not force-skippable), then requires test_command or force:true (force skips the test gate, not the all-done gate), runs test_command through the same verifier complete_task uses, generates release_notes from the done tasks (plus a Cancelled section for cancelled ones), and marks the release released. One-shot, like complete_task.",
+        "Ship a release: rejects unless every task in it is done or cancelled (not force-skippable), then requires test_command or force:true (force skips the test gate, not the all-done gate), runs test_command through the same verifier complete_task uses, generates release_notes from the done tasks (plus a Cancelled section for cancelled ones), and marks the release released. One-shot, like complete_task - rejects a release that is already released or cancelled.",
       inputSchema: {
         project_id: z.string().min(1),
         release_id: z.string().min(1),
@@ -87,10 +88,27 @@ export function registerReleaseTools(
   );
 
   server.registerTool(
+    "cancel_release",
+    {
+      description:
+        "Record a release as cancelled - built but deliberately not shipped (a gate said don't ship it, a branch that will never be merged) - so it stops sitting on the board as an unfinished 'planned' release. reason is mandatory: it's the whole point of the record, and the only thing the dashboard has to show for that lane (a cancelled release never reaches release_it, so it has no release_notes). project_id accepts a project id or its unique name; release_id accepts a release id or its version within that project. Rejects a release that is already released or already cancelled; one-shot, there is no un-cancel. Leaves the release's tasks untouched - salvageable work is moved into a later release with set_task_release, which is allowed *out of* a cancelled release even though no new task can be assigned *into* one.",
+      inputSchema: {
+        project_id: z.string().min(1),
+        release_id: z.string().min(1),
+        reason: z.string().min(1),
+      },
+    },
+    async ({ project_id, release_id, reason }) => {
+      cancelRelease(db, { project_id, release_id, reason });
+      return jsonResult({ ok: true });
+    },
+  );
+
+  server.registerTool(
     "set_task_release",
     {
       description:
-        "Move a task to a different release, or clear it (pass null) - e.g. when a task turns out not to belong in a release. Rejects if either the task's current release or its target release is already released.",
+        "Move a task to a different release, or clear it (pass null) - e.g. when a task turns out not to belong in a release. Rejects if either the task's current release or its target release is already released, and rejects a cancelled release as a target. Moving a task *out of* a cancelled release is deliberately allowed - that's how salvageable work is rescued into a later release.",
       inputSchema: {
         task_id: z.string().min(1),
         release_id: z.string().nullable(),
@@ -106,7 +124,7 @@ export function registerReleaseTools(
     "set_release_sequence",
     {
       description:
-        "Reorder where a release shows up in list_releases (e.g. slot a hotfix between two existing releases). Not blocked by the release already being released. project_id accepts a project id or its unique name; release_id accepts a release id or its version within that project.",
+        "Reorder where a release shows up in list_releases (e.g. slot a hotfix between two existing releases). Not blocked by the release already being released or cancelled. project_id accepts a project id or its unique name; release_id accepts a release id or its version within that project.",
       inputSchema: {
         project_id: z.string().min(1),
         release_id: z.string().min(1),

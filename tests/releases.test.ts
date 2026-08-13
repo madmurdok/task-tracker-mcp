@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import { createEpic } from "../src/domain/epics.js";
+import { cancelRelease } from "../src/domain/lifecycle.js";
 import { createProject } from "../src/domain/projects.js";
 import {
   createRelease,
@@ -26,6 +27,16 @@ function markReleased(db: DatabaseInstance, releaseId: string): void {
   db.prepare(`UPDATE releases SET status = 'released' WHERE id = ?`).run(releaseId);
 }
 
+// Sets the status directly rather than going through cancelRelease, matching
+// markReleased above: these helpers exist to put a release into a given state
+// for the *assignment rules* under test, so they shouldn't also depend on the
+// lifecycle function's own guards passing.
+function markCancelled(db: DatabaseInstance, releaseId: string): void {
+  db.prepare(`UPDATE releases SET status = 'cancelled', cancellation_reason = 'bench gate said no' WHERE id = ?`).run(
+    releaseId,
+  );
+}
+
 describe("createRelease", () => {
   it("inserts and returns a release with a generated id, planned status, and sequence 10", () => {
     const { db, project } = setup();
@@ -41,6 +52,7 @@ describe("createRelease", () => {
     expect(release.sequence).toBe(10);
     expect(release.release_notes).toBeNull();
     expect(release.released_at).toBeNull();
+    expect(release.cancellation_reason).toBeNull();
 
     const row = db.prepare("SELECT * FROM releases WHERE id = ?").get(release.id);
     expect(row).toMatchObject({ version: "0.1", project_id: project.id, status: "planned" });
@@ -191,6 +203,21 @@ describe("createTask with release_id", () => {
         complexity_hint: "normal",
       }),
     ).toThrow(/is already released; cannot assign new tasks to it/);
+  });
+
+  it("rejects assigning a task to a cancelled release", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "0.1" });
+    markCancelled(db, release.id);
+
+    expect(() =>
+      createTask(db, noopEstimator, {
+        project_id: project.id,
+        release_id: release.id,
+        title: "x",
+        complexity_hint: "normal",
+      }),
+    ).toThrow(/is cancelled; cannot assign new tasks to it/);
   });
 
   it("defaults release_id to null when not given", () => {
@@ -404,9 +431,136 @@ describe("setTaskRelease", () => {
     expect(() => setTaskRelease(db, task.id, null)).toThrow(/already released/);
   });
 
+  it("rejects moving a task into a cancelled release", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "0.1" });
+    markCancelled(db, release.id);
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "x",
+      complexity_hint: "normal",
+    });
+
+    expect(() => setTaskRelease(db, task.id, release.id)).toThrow(/is cancelled/);
+  });
+
+  it("allows moving a task *out of* a cancelled release, unlike a released one", () => {
+    // The deliberate asymmetry: rescuing salvageable work out of an abandoned
+    // batch into a later release is a real workflow, and a cancelled release
+    // has no generated release_notes for the membership to drift away from -
+    // which is the only reason the outbound direction is frozen for shipped
+    // releases at all. If someone ever "fixes" the inconsistency by adding
+    // cancelled to setTaskRelease's outbound check, this test is what says no.
+    const { db, project } = setup();
+    const cancelled = createRelease(db, { project_id: project.id, version: "0.1" });
+    const next = createRelease(db, { project_id: project.id, version: "0.2" });
+    const { task: rescued } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      release_id: cancelled.id,
+      title: "salvageable",
+      complexity_hint: "normal",
+    });
+    const { task: dropped } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      release_id: cancelled.id,
+      title: "back to backlog",
+      complexity_hint: "normal",
+    });
+    markCancelled(db, cancelled.id);
+
+    expect(() => setTaskRelease(db, rescued.id, next.id)).not.toThrow();
+    expect(() => setTaskRelease(db, dropped.id, null)).not.toThrow();
+
+    expect(db.prepare("SELECT release_id FROM tasks WHERE id = ?").get(rescued.id)).toMatchObject({
+      release_id: next.id,
+    });
+    expect(db.prepare("SELECT release_id FROM tasks WHERE id = ?").get(dropped.id)).toMatchObject({
+      release_id: null,
+    });
+  });
+
   it("rejects an unknown task_id", () => {
     const { db } = setup();
     expect(() => setTaskRelease(db, "missing", null)).toThrow(/Unknown task_id: missing/);
+  });
+});
+
+describe("cancelRelease", () => {
+  it("marks a planned release cancelled and persists the reason", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "2.2.0" });
+
+    cancelRelease(db, {
+      project_id: project.id,
+      release_id: release.id,
+      reason: "bench gate said the feature isn't worth shipping",
+    });
+
+    expect(requireRelease(db, project.id, release.id)).toMatchObject({
+      status: "cancelled",
+      cancellation_reason: "bench gate said the feature isn't worth shipping",
+      released_at: null,
+      release_notes: null,
+    });
+  });
+
+  it("resolves the release by version and the project by name, like its sibling tools", () => {
+    const { db, project } = setup();
+    createRelease(db, { project_id: project.id, version: "2.2.0" });
+
+    expect(() =>
+      cancelRelease(db, { project_id: "Demo", release_id: "2.2.0", reason: "never merged" }),
+    ).not.toThrow();
+    expect(getRelease(db, project.id, "2.2.0")).toMatchObject({ status: "cancelled" });
+  });
+
+  it("leaves the release's tasks exactly as they were, including still-open ones", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "0.1" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      release_id: release.id,
+      title: "half-finished",
+      complexity_hint: "normal",
+    });
+
+    cancelRelease(db, { project_id: project.id, release_id: release.id, reason: "descoped" });
+
+    expect(db.prepare("SELECT status, release_id FROM tasks WHERE id = ?").get(task.id)).toMatchObject({
+      status: "pending",
+      release_id: release.id,
+    });
+  });
+
+  it("rejects a release that is already released", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "0.1" });
+    markReleased(db, release.id);
+
+    expect(() =>
+      cancelRelease(db, { project_id: project.id, release_id: release.id, reason: "too late" }),
+    ).toThrow(/is already released, nothing to cancel/);
+  });
+
+  it("rejects a release that is already cancelled - one-shot, no un-cancel", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "0.1" });
+    cancelRelease(db, { project_id: project.id, release_id: release.id, reason: "first" });
+
+    expect(() =>
+      cancelRelease(db, { project_id: project.id, release_id: release.id, reason: "second" }),
+    ).toThrow(/is already cancelled, nothing to cancel/);
+    expect(requireRelease(db, project.id, release.id).cancellation_reason).toBe("first");
+  });
+
+  it("rejects unknown project and release refs", () => {
+    const { db, project } = setup();
+    expect(() => cancelRelease(db, { project_id: "missing", release_id: "0.1", reason: "x" })).toThrow(
+      /Unknown project: missing/,
+    );
+    expect(() =>
+      cancelRelease(db, { project_id: project.id, release_id: "missing", reason: "x" }),
+    ).toThrow(/Unknown release: missing/);
   });
 });
 

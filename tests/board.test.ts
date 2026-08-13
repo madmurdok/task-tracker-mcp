@@ -8,6 +8,7 @@ import { getBoardData } from "../src/domain/board.js";
 import { addDependency } from "../src/domain/dependencies.js";
 import { createEpic } from "../src/domain/epics.js";
 import { createProject } from "../src/domain/projects.js";
+import { cancelRelease } from "../src/domain/lifecycle.js";
 import { createRelease } from "../src/domain/releases.js";
 import { createTask } from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
@@ -129,24 +130,46 @@ describe("getBoardData", () => {
     expect(board.lanes[2].tasks.map((t) => t.task_number)).toEqual([2]);
   });
 
-  it("surfaces a release's status and release_notes on its lane; both are null for a planned release and for the no-release lane", () => {
+  it("surfaces a release's status, release_notes and cancellation reason on its lane; all null for a planned release and for the no-release lane", () => {
     const { db, project } = setup();
     const planned = createRelease(db, { project_id: project.id, version: "0.2" });
     const released = createRelease(db, { project_id: project.id, version: "0.1" });
+    const cancelled = createRelease(db, { project_id: project.id, version: "0.3" });
     db.prepare(`UPDATE releases SET status = 'released', release_notes = ? WHERE id = ?`).run(
       "- Task A\n- Task B",
       released.id,
     );
+    cancelRelease(db, {
+      project_id: project.id,
+      release_id: cancelled.id,
+      reason: "bench gate said don't ship it",
+    });
     createTask(db, noopEstimator, { project_id: project.id, title: "Backlog item", complexity_hint: "normal" });
 
     const board = getBoardData(db, project.id);
     const byReleaseId = new Map(board.lanes.map((lane) => [lane.release_id, lane]));
 
-    expect(byReleaseId.get(null)).toMatchObject({ release_status: null, release_notes: null });
-    expect(byReleaseId.get(planned.id)).toMatchObject({ release_status: "planned", release_notes: null });
+    expect(byReleaseId.get(null)).toMatchObject({
+      release_status: null,
+      release_notes: null,
+      release_cancellation_reason: null,
+    });
+    expect(byReleaseId.get(planned.id)).toMatchObject({
+      release_status: "planned",
+      release_notes: null,
+      release_cancellation_reason: null,
+    });
     expect(byReleaseId.get(released.id)).toMatchObject({
       release_status: "released",
       release_notes: "- Task A\n- Task B",
+      release_cancellation_reason: null,
+    });
+    // A cancelled lane carries the reason where a shipped one carries notes -
+    // it never reached release_it, so it has none of the latter.
+    expect(byReleaseId.get(cancelled.id)).toMatchObject({
+      release_status: "cancelled",
+      release_notes: null,
+      release_cancellation_reason: "bench gate said don't ship it",
     });
   });
 
@@ -172,6 +195,7 @@ describe("getBoardData", () => {
         release_name: null,
         release_status: null,
         release_notes: null,
+        release_cancellation_reason: null,
         tasks: [],
       },
     ]);
@@ -297,5 +321,81 @@ describe("board.js laneTitle (client-side, via DOM shim)", () => {
     };
 
     expect(laneTitle(lane)).toBe("Release-0.6.0 - Name (3)");
+  });
+});
+
+describe("board.js createLane for a cancelled release (client-side, via DOM shim)", () => {
+  function laneStub(overrides: Record<string, unknown> = {}): any {
+    return {
+      release_id: "r1",
+      release_version: "2.2.0",
+      release_name: "",
+      release_status: "planned",
+      release_notes: null,
+      release_cancellation_reason: null,
+      tasks: [],
+      ...overrides,
+    };
+  }
+
+  // createLane returns the <section>, whose children are [headerRow, columns]
+  // in that order (see board.js); headerRow's own children are the heading
+  // followed by whichever of badge/notes/reason buttons apply.
+  function partsOf(section: any) {
+    const [headerRow, columns] = section.children;
+    return { headerRow, columns };
+  }
+
+  it("tags the lane with its release status and badges a cancelled one, defaulting it to collapsed", () => {
+    const { createLane } = loadBoardScript();
+    const section = createLane(
+      laneStub({ release_status: "cancelled", release_cancellation_reason: "bench gate said no" }),
+      "DEM",
+    );
+    const { headerRow, columns } = partsOf(section);
+
+    // The dataset attribute is the only hook style.css has for the red lane
+    // header - CSS can't see release_status any other way.
+    expect(section.dataset.releaseStatus).toBe("cancelled");
+    expect(headerRow.children.map((child: any) => child.textContent)).toContain("Cancelled");
+    // Same default a shipped release gets: finished work, out of the way.
+    expect(columns.hidden).toBe(true);
+  });
+
+  it("offers the cancellation reason through the same dialog button release notes use", () => {
+    const { createLane } = loadBoardScript();
+    const { headerRow } = partsOf(
+      createLane(
+        laneStub({ release_status: "cancelled", release_cancellation_reason: "bench gate said no" }),
+        "DEM",
+      ),
+    );
+
+    const reasonButton = headerRow.children.find(
+      (child: any) => child.textContent === "Cancellation reason",
+    );
+    expect(reasonButton).toBeDefined();
+    expect(reasonButton.className).toBe("lane-notes-button");
+  });
+
+  it("leaves a planned lane unbadged, expanded, and with no cancellation button", () => {
+    const { createLane } = loadBoardScript();
+    const { headerRow, columns } = partsOf(createLane(laneStub(), "DEM"));
+
+    expect(headerRow.children.map((child: any) => child.textContent)).not.toContain("Cancelled");
+    expect(
+      headerRow.children.some((child: any) => child.textContent === "Cancellation reason"),
+    ).toBe(false);
+    expect(columns.hidden).toBe(false);
+  });
+
+  it("leaves the Backlog lane's release-status dataset unset rather than the string 'null'", () => {
+    const { createLane } = loadBoardScript();
+    const section = createLane(
+      laneStub({ release_id: null, release_version: null, release_status: null }),
+      "DEM",
+    );
+
+    expect(section.dataset.releaseStatus).toBeUndefined();
   });
 });

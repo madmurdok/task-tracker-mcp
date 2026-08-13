@@ -1,7 +1,7 @@
 import type { DatabaseInstance } from "../db/connection.js";
 import { listEpics } from "./epics.js";
 import { isDocDrifted, requireProject } from "./projects.js";
-import { listReleases } from "./releases.js";
+import { listReleases, type ReleaseStatus } from "./releases.js";
 import { displayStatus, type DisplayStatus } from "./status.js";
 import type { Task } from "./tasks.js";
 
@@ -22,8 +22,12 @@ export interface BoardLane {
   release_id: string | null;
   release_version: string | null;
   release_name: string | null;
-  release_status: "planned" | "released" | null;
+  // Imported rather than re-spelled as a literal union: this field used to
+  // duplicate ReleaseStatus by hand and silently fell behind it when a third
+  // status was added.
+  release_status: ReleaseStatus | null;
   release_notes: string | null;
+  release_cancellation_reason: string | null;
   tasks: BoardTask[];
 }
 
@@ -90,6 +94,7 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
     release_name: null,
     release_status: null,
     release_notes: null,
+    release_cancellation_reason: null,
     tasks: unreleasedTasks,
   });
 
@@ -104,6 +109,11 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
       release_name: release.name,
       release_status: release.status,
       release_notes: release.release_notes,
+      // Mutually exclusive with release_notes in practice (a cancelled
+      // release never reaches release_it, which is what generates those), but
+      // carried as its own field rather than folded into release_notes so the
+      // dashboard can label it as what it is.
+      release_cancellation_reason: release.cancellation_reason,
       tasks: tasks.filter((task) => task.release_id === release.id).map(toBoardTask),
     });
   }

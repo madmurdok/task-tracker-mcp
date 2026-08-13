@@ -193,6 +193,229 @@ describe("widenTaskStatusCheck (via runMigrations)", () => {
   });
 });
 
+describe("widenReleaseStatusCheck (via runMigrations)", () => {
+  /**
+   * The schema exactly as it stood before release cancellation: `releases`
+   * carries the baked-in 2-value status CHECK and no cancellation_reason, and
+   * `tasks` is already fully migrated (4-value CHECK, release_id FK) so this
+   * fixture isolates the releases rebuild from widenTaskStatusCheck's.
+   *
+   * The 2-value CHECK is the whole point of a separate fixture:
+   * openPreCancellationDb above declares releases.status with *no* CHECK at
+   * all, which the sniff reads as "not migrated" and rebuilds anyway - so it
+   * exercises the code path but never the thing that actually needs proving,
+   * that an existing constraint rejecting 'cancelled' gets replaced by one
+   * that accepts it.
+   */
+  function openPreReleaseCancellationDb(): Database.Database {
+    const db = new Database(":memory:");
+    db.pragma("foreign_keys = ON");
+    db.exec(`
+      CREATE TABLE projects (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, root_path TEXT NOT NULL, code_prefix TEXT,
+        design_doc_path TEXT, design_doc_hash TEXT, created_at TEXT NOT NULL
+      );
+      CREATE TABLE epics (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+      );
+      CREATE TABLE releases (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        version TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'released')),
+        sequence INTEGER NOT NULL,
+        release_notes TEXT, released_at TEXT, created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_releases_project_id ON releases(project_id);
+      CREATE UNIQUE INDEX idx_releases_project_version ON releases(project_id, version);
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        epic_id TEXT REFERENCES epics(id) ON DELETE SET NULL,
+        release_id TEXT REFERENCES releases(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        acceptance_criteria TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'done', 'cancelled')),
+        estimated_tokens INTEGER NOT NULL DEFAULT 0,
+        owner_session_id TEXT,
+        lock_expires_at TEXT,
+        complexity_hint TEXT NOT NULL DEFAULT 'normal' CHECK (complexity_hint IN ('normal', 'high')),
+        cancellation_reason TEXT,
+        priority INTEGER NOT NULL DEFAULT 0,
+        task_number INTEGER,
+        completion_summary TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE task_files (
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, file_path TEXT NOT NULL
+      );
+      CREATE TABLE task_dependencies (
+        task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        PRIMARY KEY (task_id, depends_on_task_id)
+      );
+      CREATE TABLE handoff_notes (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL, decisions TEXT NOT NULL DEFAULT '', remaining_work TEXT NOT NULL DEFAULT '',
+        discoveries TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+      );
+    `);
+    db.prepare(
+      `INSERT INTO projects (id, name, root_path, code_prefix, created_at) VALUES ('p1', 'Demo', '/tmp/demo', 'DEM', 'now')`,
+    ).run();
+    return db;
+  }
+
+  function seedRelease(db: Database.Database, id: string, version: string, sequence: number): void {
+    db.prepare(
+      `INSERT INTO releases (id, project_id, version, name, description, status, sequence, created_at)
+       VALUES (?, 'p1', ?, 'Batch', 'notes here', 'planned', ?, 'now')`,
+    ).run(id, version, sequence);
+  }
+
+  function seedTaskInRelease(db: Database.Database, id: string, releaseId: string | null): void {
+    db.prepare(
+      `INSERT INTO tasks (id, project_id, release_id, title, task_number, created_at, updated_at)
+       VALUES (?, 'p1', ?, ?, 1, 'now', 'now')`,
+    ).run(id, releaseId, `Task ${id}`);
+  }
+
+  it("rebuilds a 2-value-CHECK releases table in place, preserving rows, then accepts 'cancelled'", () => {
+    const db = openPreReleaseCancellationDb();
+    seedRelease(db, "r1", "0.1", 10);
+    db.prepare(
+      `UPDATE releases SET status = 'released', release_notes = '- shipped it', released_at = 'then' WHERE id = 'r1'`,
+    ).run();
+    seedRelease(db, "r2", "0.2", 20);
+
+    runMigrations(db);
+
+    expect(db.prepare(`SELECT * FROM releases ORDER BY sequence`).all()).toEqual([
+      {
+        id: "r1",
+        project_id: "p1",
+        version: "0.1",
+        name: "Batch",
+        description: "notes here",
+        status: "released",
+        sequence: 10,
+        release_notes: "- shipped it",
+        released_at: "then",
+        cancellation_reason: null,
+        created_at: "now",
+      },
+      {
+        id: "r2",
+        project_id: "p1",
+        version: "0.2",
+        name: "Batch",
+        description: "notes here",
+        status: "planned",
+        sequence: 20,
+        release_notes: null,
+        released_at: null,
+        cancellation_reason: null,
+        created_at: "now",
+      },
+    ]);
+
+    expect(() =>
+      db.prepare(`UPDATE releases SET status = 'cancelled', cancellation_reason = 'bench gate' WHERE id = 'r2'`).run(),
+    ).not.toThrow();
+    expect(() => db.prepare(`UPDATE releases SET status = 'nonsense' WHERE id = 'r2'`).run()).toThrow(
+      /CHECK constraint failed/,
+    );
+  });
+
+  it("preserves every task's release_id through the rebuild", () => {
+    // The data-loss regression this whole migration is written around:
+    // tasks.release_id is `REFERENCES releases(id) ON DELETE SET NULL`, so a
+    // rebuild that drops the renamed original with foreign_keys still ON
+    // silently clears the release assignment of every task in the database -
+    // no error, no constraint failure, nothing in the result to notice. The
+    // rows all still exist afterwards either way, which is exactly why a
+    // "preserves rows" assertion alone doesn't catch it.
+    const db = openPreReleaseCancellationDb();
+    seedRelease(db, "r1", "0.1", 10);
+    seedRelease(db, "r2", "0.2", 20);
+    seedTaskInRelease(db, "t1", "r1");
+    seedTaskInRelease(db, "t2", "r1");
+    seedTaskInRelease(db, "t3", "r2");
+    seedTaskInRelease(db, "t4", null); // backlog task, unaffected either way
+
+    const assignedBefore = db
+      .prepare(`SELECT COUNT(*) AS n FROM tasks WHERE release_id IS NOT NULL`)
+      .get() as { n: number };
+    expect(assignedBefore.n).toBe(3);
+
+    runMigrations(db);
+
+    expect(db.prepare(`SELECT id, release_id FROM tasks ORDER BY id`).all()).toEqual([
+      { id: "t1", release_id: "r1" },
+      { id: "t2", release_id: "r1" },
+      { id: "t3", release_id: "r2" },
+      { id: "t4", release_id: null },
+    ]);
+
+    // The FK itself has to survive too, not just the column values: with
+    // legacy_alter_table off, RENAME would have rewritten this clause to point
+    // at releases_old, leaving every later write to tasks failing with "no
+    // such table: releases_old".
+    expect(() => seedTaskInRelease(db, "t5", "r1")).not.toThrow();
+    expect(() => seedTaskInRelease(db, "t6", "no-such-release")).toThrow(/FOREIGN KEY constraint failed/);
+  });
+
+  it("recreates both releases indexes, so version stays unique per project", () => {
+    const db = openPreReleaseCancellationDb();
+    seedRelease(db, "r1", "0.1", 10);
+
+    runMigrations(db);
+
+    const indexes = (
+      db
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'releases' ORDER BY name`)
+        .all() as Array<{ name: string }>
+    ).map((row) => row.name);
+    expect(indexes).toContain("idx_releases_project_id");
+    expect(indexes).toContain("idx_releases_project_version");
+
+    expect(() => seedRelease(db, "r-dup", "0.1", 30)).toThrow(/UNIQUE constraint failed/);
+  });
+
+  it("is idempotent - a second runMigrations call on an already-migrated DB is a clean no-op", () => {
+    const db = openPreReleaseCancellationDb();
+    seedRelease(db, "r1", "0.1", 10);
+    seedTaskInRelease(db, "t1", "r1");
+
+    runMigrations(db);
+    const releasesAfterFirst = db.prepare(`SELECT * FROM releases`).all();
+    const tasksAfterFirst = db.prepare(`SELECT * FROM tasks ORDER BY id`).all();
+
+    expect(() => runMigrations(db)).not.toThrow();
+
+    expect(db.prepare(`SELECT * FROM releases`).all()).toEqual(releasesAfterFirst);
+    expect(db.prepare(`SELECT * FROM tasks ORDER BY id`).all()).toEqual(tasksAfterFirst);
+  });
+
+  it("already-current DBs are untouched - runMigrations leaves a fresh :memory: releases table as SCHEMA_SQL wrote it", async () => {
+    const { openDatabase } = await import("../src/db/connection.js");
+    const db = openDatabase(":memory:");
+
+    const before = (
+      db.prepare(`SELECT sql FROM sqlite_master WHERE name = 'releases'`).get() as { sql: string }
+    ).sql;
+    runMigrations(db);
+    const after = (
+      db.prepare(`SELECT sql FROM sqlite_master WHERE name = 'releases'`).get() as { sql: string }
+    ).sql;
+
+    expect(after).toBe(before);
+    expect(before).toContain("'cancelled'");
+  });
+});
+
 describe("repairDanglingTasksOldReferences (via runMigrations)", () => {
   /**
    * Builds a DB in the exact broken end-state widenTaskStatusCheck's rebuild
@@ -209,6 +432,19 @@ describe("repairDanglingTasksOldReferences (via runMigrations)", () => {
       CREATE TABLE projects (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, root_path TEXT NOT NULL,
         design_doc_path TEXT, design_doc_hash TEXT, created_at TEXT NOT NULL
+      );
+      /* Present for the same reason openPreCancellationDb's is (SCHEMA_SQL
+         creates it unconditionally before runMigrations, so it exists on every
+         real upgrade), and given the *current* shape - already carrying the
+         3-value CHECK and cancellation_reason - so this fixture keeps testing
+         only the dangling-tasks_old repair rather than also dragging in the
+         releases rebuild. */
+      CREATE TABLE releases (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        version TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'released', 'cancelled')),
+        sequence INTEGER NOT NULL, release_notes TEXT, released_at TEXT,
+        cancellation_reason TEXT, created_at TEXT NOT NULL
       );
       CREATE TABLE tasks (
         id TEXT PRIMARY KEY,
