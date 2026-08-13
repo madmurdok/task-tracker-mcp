@@ -285,8 +285,11 @@ export function releaseIt(
   const project = requireProject(db, projectRef);
   const release = requireRelease(db, project.id, releaseRef);
 
-  if (release.status === "released") {
-    throw new Error(`Release ${releaseRef} is already released`);
+  // Both terminal statuses are one-shot: a shipped release can't ship twice,
+  // and a cancelled one was deliberately taken off the table (cancelRelease
+  // below has no un-cancel, so this isn't a state anything can back out of).
+  if (release.status === "released" || release.status === "cancelled") {
+    throw new Error(`Release ${releaseRef} is already ${release.status}`);
   }
 
   const notDone = db
@@ -346,6 +349,56 @@ export function releaseIt(
   run();
 
   return { release_notes: notes, released_at: releasedAt };
+}
+
+export interface CancelReleaseInput {
+  project_id: string;
+  release_id: string;
+  reason: string;
+}
+
+/**
+ * Records a release as built-but-deliberately-not-shipped: the release_it
+ * counterpart to cancel_task's relationship with complete_task. Without it a
+ * batch that was measured and rejected (or a branch that will never be merged)
+ * sits at 100% done and `planned` forever, and the only honest-looking way to
+ * clear it off the board is to lie about it with release_it.
+ *
+ * `reason` is mandatory here, unlike cancelTask's optional one: a cancelled
+ * *task* usually reads as self-explanatory next to its siblings, while a
+ * cancelled *release* is a whole batch of finished work being written off, and
+ * "why" is the entire value of the record afterwards. It's also all the
+ * dashboard has to show for that lane - a cancelled release never reaches
+ * release_it, so it has no generated release_notes.
+ *
+ * One-shot in both directions: rejects a release that already shipped (its
+ * notes are published, cancelling after the fact would be a false record) and
+ * one already cancelled, mirroring cancelTask's "already X, nothing to
+ * cancel". There is deliberately no un-cancel, same as cancel_task.
+ *
+ * Note what this does *not* do: nothing happens to the release's tasks. A
+ * cancelled release keeps its membership as the record of what was abandoned,
+ * and its still-open tasks stay claimable - work that turns out salvageable is
+ * moved into a later release with set_task_release (allowed outbound; see
+ * setTaskRelease), not resurrected here.
+ */
+export function cancelRelease(db: DatabaseInstance, input: CancelReleaseInput): void {
+  const { project_id: projectRef, release_id: releaseRef, reason } = input;
+
+  const project = requireProject(db, projectRef);
+  const release = requireRelease(db, project.id, releaseRef);
+
+  if (release.status === "released" || release.status === "cancelled") {
+    throw new Error(`Release ${releaseRef} is already ${release.status}, nothing to cancel`);
+  }
+
+  const run = db.transaction(() => {
+    db.prepare(`UPDATE releases SET status = 'cancelled', cancellation_reason = ? WHERE id = ?`).run(
+      reason,
+      release.id,
+    );
+  });
+  run();
 }
 
 export interface CancelTaskInput {

@@ -185,6 +185,43 @@ a {
   content: "\25b8  ";
 }
 
+/* A cancelled release lane is deliberately loud, and deliberately the
+   opposite of how a cancelled *task* is styled further down (grey, faded,
+   struck through). That contrast is intended, not an inconsistency to
+   "fix": a cancelled task is one dropped item among its siblings, so
+   de-emphasizing it is right, while a cancelled release is a whole batch of
+   finished work that will never ship - the single most surprising thing on
+   the board, and the thing a reader most needs to spot before wondering why
+   those tasks look done but nothing shipped.
+
+   Both --danger and --danger-bg are already defined in the light and dark
+   blocks at the top of this file, so the variables carry the theme here -
+   never hard-code either color. */
+.lane[data-release-status="cancelled"] .lane-header {
+  padding: 0.25rem 0.5rem;
+  border-left: 3px solid var(--danger);
+  border-radius: 0.25rem;
+  background: var(--danger-bg);
+}
+
+.lane[data-release-status="cancelled"] .lane-title {
+  color: var(--danger);
+}
+
+.lane-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border-radius: 0.25rem;
+  padding: 0.05rem 0.375rem;
+}
+
+.lane-badge-cancelled {
+  border: 1px solid var(--danger);
+  color: var(--danger);
+}
+
 .lane-notes-button {
   font: inherit;
   font-size: 0.75rem;

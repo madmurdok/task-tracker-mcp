@@ -183,6 +183,16 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
     release is exactly the same drift, just backwards). `splitTask` needs no extra
     code for this — it already creates subtasks via `createTask`, so the same guard
     applies for free.
+    *Extended by v9 (release cancellation, see the Done/changelog list below):*
+    a `cancelled` release
+    gets a second, deliberately **narrower** version of this freeze — closed to
+    inbound tasks (same "don't add work to a closed batch" reason, distinct error
+    message naming the status), but **open outbound**, so a task can still be moved
+    or cleared *out of* one. The outbound half of the rule above exists purely to
+    stop generated `release_notes` drifting from the membership they were built
+    from, and a cancelled release never reached `release_it`, so it has none — while
+    rescuing salvageable work out of an abandoned batch into a later release is a
+    real workflow worth keeping open.
   - **Domain — persisting completion summary:** `CompleteTaskInput` gets
     `summary?: string`; `completeTask`'s transaction sets
     `completion_summary = summary ?? null` alongside the existing `status = 'done'`
@@ -609,6 +619,28 @@ is just an index.
   itself is unchanged (no `session_id` param) — the two tools stay orthogonal:
   pull-the-next-one vs. take-this-specific-one, both converging on the same
   `in_progress` + owner + lease state.
+- **v9 — release cancellation** (`cancel_release`, `cancelled` release status):
+  a release could only ever be `planned` or `released`, so a batch that was
+  built but deliberately not shipped — a measured gate saying don't ship it, a
+  branch that will never be merged — had nowhere to go: every task `done`, the
+  release stuck at 100% `planned` forever, and the only way to clear it off the
+  board was to lie about it with `release_it`. `cancel_release(project_id,
+  release_id, reason)` records it honestly, with `reason` **mandatory** (unlike
+  `cancel_task`'s optional one — writing off a whole batch of finished work is
+  only worth recording *with* the why, and it's also all the dashboard has for
+  that lane, since a cancelled release never generates `release_notes`).
+  One-shot in both directions, like `cancel_task`: no un-cancel, and
+  `release_it` now rejects a cancelled release too. Assigning *new* tasks into
+  one is rejected, but moving a task *out* stays allowed — see the deliberate
+  asymmetry documented under Item 4's freeze rule. On the dashboard a cancelled
+  lane defaults to collapsed and renders in `--danger` with a `Cancelled` badge
+  and its reason behind the release-notes dialog: deliberately louder than a
+  cancelled *task*'s muted, struck-through card, since an abandoned batch is
+  the thing a reader most needs to spot. Required the same
+  CHECK-widening table rebuild `cancelled` tasks needed in v4, with an extra
+  hazard — `tasks.release_id` is `ON DELETE SET NULL`, so the rebuild has to
+  run with `foreign_keys` off or it silently clears every task's release
+  assignment (asserted against in `tests/migration.test.ts`).
 
 ## How to use this file
 

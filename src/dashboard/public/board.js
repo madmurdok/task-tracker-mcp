@@ -185,15 +185,17 @@ function storeCollapse(key, isCollapsed) {
   }
 }
 
-// A release that's already shipped should default to collapsed (out of the
-// way of active work) the first time it's ever seen; a stored preference
-// (an explicit earlier click, from this session or a previous page load)
-// always wins over that default once one exists.
+// A release that's already shipped - or one that was cancelled, which is just
+// as finished from "what's left to work on" - should default to collapsed
+// (out of the way of active work) the first time it's ever seen; a stored
+// preference (an explicit earlier click, from this session or a previous page
+// load) always wins over that default once one exists.
 function ensureLaneInitialized(lane, key) {
   if (initializedLaneKeys.has(key)) return;
   initializedLaneKeys.add(key);
   const stored = loadStoredCollapse(key);
-  const shouldCollapse = stored !== null ? stored : lane.release_status === "released";
+  const shouldCollapse =
+    stored !== null ? stored : lane.release_status === "released" || lane.release_status === "cancelled";
   if (shouldCollapse) collapsedLanes.add(key);
 }
 
@@ -202,6 +204,10 @@ function createLane(lane, codePrefix) {
   ensureLaneInitialized(lane, key);
   const section = document.createElement("section");
   section.className = "lane";
+  // Only set when there actually is a status (the Backlog lane has none):
+  // assigning null would stringify to the literal "null" in the DOM, which
+  // reads as a real status to any future [data-release-status="..."] rule.
+  if (lane.release_status) section.dataset.releaseStatus = lane.release_status;
 
   const columns = document.createElement("div");
   columns.className = "lane-columns";
@@ -244,6 +250,16 @@ function createLane(lane, codePrefix) {
   applyCollapsed();
   headerRow.appendChild(heading);
 
+  // A collapsed cancelled lane looks like any other collapsed lane, so the
+  // badge (not just the red header) is what says *why* it's parked - it stays
+  // legible whether the lane is open or shut.
+  if (lane.release_status === "cancelled") {
+    const badge = document.createElement("span");
+    badge.className = "lane-badge lane-badge-cancelled";
+    badge.textContent = "Cancelled";
+    headerRow.appendChild(badge);
+  }
+
   if (lane.release_notes) {
     const notesButton = document.createElement("button");
     notesButton.type = "button";
@@ -253,6 +269,21 @@ function createLane(lane, codePrefix) {
     // also toggle the lane's collapse state.
     notesButton.addEventListener("click", () => showReleaseNotes(laneTitle(lane), lane.release_notes));
     headerRow.appendChild(notesButton);
+  }
+
+  // Reuses the release-notes button and dialog rather than inventing a second
+  // read-more mechanism: it's the same "long text that doesn't belong in a
+  // lane header" problem, and the two can't collide - a cancelled release
+  // never reached release_it, so it has no release_notes to show.
+  if (lane.release_cancellation_reason) {
+    const reasonButton = document.createElement("button");
+    reasonButton.type = "button";
+    reasonButton.className = "lane-notes-button";
+    reasonButton.textContent = "Cancellation reason";
+    reasonButton.addEventListener("click", () =>
+      showReleaseNotes(`${laneTitle(lane)} - cancellation reason`, lane.release_cancellation_reason),
+    );
+    headerRow.appendChild(reasonButton);
   }
 
   section.appendChild(headerRow);

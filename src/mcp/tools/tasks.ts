@@ -38,7 +38,7 @@ export function registerTaskTools(
     "create_task",
     {
       description:
-        "Create a task under a project, with its file list and an estimated context cost. project_id accepts a project id or its unique name. epic_id (optional) accepts an epic id or its name within that project. release_id (optional) accepts a release id or its version within that project - rejects an already-released release. complexity_hint is required - 'high' flags a task as worth delegating to a stronger subagent (see CLAUDE.md's Task delegation section). priority (optional, default 0) - higher sorts first in get_next_task.",
+        "Create a task under a project, with its file list and an estimated context cost. project_id accepts a project id or its unique name. epic_id (optional) accepts an epic id or its name within that project. release_id (optional) accepts a release id or its version within that project - rejects an already-released or cancelled release. complexity_hint is required - 'high' flags a task as worth delegating to a stronger subagent (see CLAUDE.md's Task delegation section). priority (optional, default 0) - higher sorts first in get_next_task.",
       inputSchema: {
         project_id: z.string().min(1),
         epic_id: z.string().optional(),

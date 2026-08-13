@@ -6,6 +6,7 @@ import { createTask } from "../src/domain/tasks.js";
 import { addDependency } from "../src/domain/dependencies.js";
 import { getNextTask } from "../src/domain/status.js";
 import {
+  cancelRelease,
   cancelTask,
   claimTask,
   completeTask,
@@ -454,6 +455,19 @@ describe("releaseIt", () => {
     expect(() =>
       releaseIt(db, noopVerifier, { project_id: project.id, release_id: release.id, force: true }),
     ).toThrow(/already released/);
+  });
+
+  it("rejects a cancelled release - the other terminal status is just as one-shot", () => {
+    const { db, project, release } = setup();
+    cancelRelease(db, {
+      project_id: project.id,
+      release_id: release.id,
+      reason: "bench gate said don't ship it",
+    });
+
+    expect(() =>
+      releaseIt(db, noopVerifier, { project_id: project.id, release_id: release.id, force: true }),
+    ).toThrow(/already cancelled/);
   });
 
   it("generates release notes from done tasks plus a Cancelled section, and marks the release released", () => {

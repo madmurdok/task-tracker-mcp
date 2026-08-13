@@ -26,10 +26,11 @@ CREATE TABLE IF NOT EXISTS releases (
   version TEXT NOT NULL,
   name TEXT NOT NULL DEFAULT '',
   description TEXT NOT NULL DEFAULT '',
-  status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'released')),
+  status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'released', 'cancelled')),
   sequence INTEGER NOT NULL,
   release_notes TEXT,
   released_at TEXT,
+  cancellation_reason TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -182,6 +183,102 @@ function widenTaskStatusCheck(db: DatabaseInstance): void {
       db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id)`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)`);
       db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_epic_id ON tasks(epic_id)`);
+    });
+
+    rebuild.immediate();
+  } finally {
+    db.pragma("legacy_alter_table = OFF");
+    db.pragma("foreign_keys = ON");
+  }
+}
+
+/**
+ * Same sniff as taskStatusCheckAllowsCancelled, with one deliberate
+ * difference: it matches the *quoted* literal `'cancelled'` rather than the
+ * bare word. `releases` also carries a `cancellation_reason` column, and while
+ * that string happens not to contain "cancelled" today ("cancella-tion" vs
+ * "cancell-ed"), depending on that near-miss to tell a CHECK constraint apart
+ * from a column name is one rename away from silently reporting a DB as
+ * already migrated - which would leave its CHECK permanently rejecting
+ * `cancelled` with no error anywhere to explain why.
+ */
+function releaseStatusCheckAllowsCancelled(db: DatabaseInstance): boolean {
+  const row = db
+    .prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'releases'`)
+    .get() as { sql: string } | undefined;
+  return row?.sql.includes("'cancelled'") ?? true;
+}
+
+/**
+ * The releases-table counterpart of widenTaskStatusCheck, needed for the same
+ * reason: every existing tracker.db has the 2-value `status` CHECK
+ * (`'planned', 'released'`) baked into its `releases` table, and SQLite has no
+ * ALTER that widens one - only a full rename -> recreate -> copy -> drop
+ * rebuild.
+ *
+ * The pragma handling is copied verbatim from widenTaskStatusCheck rather than
+ * re-derived, because the failure mode here is worse than the one there.
+ * `tasks.release_id` is `REFERENCES releases(id) ON DELETE SET NULL`, so:
+ *
+ * 1. `foreign_keys = OFF` *before* the transaction opens and back ON *after*
+ *    it commits (SQLite ignores the pragma mid-transaction). Left on, dropping
+ *    the renamed original is treated as deleting every release row and fires
+ *    ON DELETE SET NULL across `tasks` - every task in the project silently
+ *    loses its release assignment, with no error and nothing in the data to
+ *    show it ever had one. See the "task->release links survive" case in
+ *    tests/migration.test.ts.
+ * 2. `legacy_alter_table = ON` so `RENAME TO releases_old` doesn't rewrite
+ *    `tasks`' stored FK clause to point at the renamed table (which would both
+ *    leave tasks dangling once it's dropped and, combined with (1) being
+ *    forgotten, aim that SET NULL squarely at the rows we're protecting).
+ *
+ * The `.immediate()` transaction and the re-check of the sniff *inside* it are
+ * likewise deliberate: the MCP server and the Status CLI each call
+ * openDatabase() independently, so the second one to arrive waits on the write
+ * lock (see busy_timeout in connection.ts) and then sees the rebuild is
+ * already done instead of running it twice.
+ */
+function widenReleaseStatusCheck(db: DatabaseInstance): void {
+  if (releaseStatusCheckAllowsCancelled(db)) return;
+
+  db.pragma("foreign_keys = OFF");
+  db.pragma("legacy_alter_table = ON");
+  try {
+    const rebuild = db.transaction(() => {
+      if (releaseStatusCheckAllowsCancelled(db)) return; // someone else won the race while we waited for the lock
+
+      db.exec(`ALTER TABLE releases RENAME TO releases_old`);
+      db.exec(`
+        CREATE TABLE releases (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          version TEXT NOT NULL,
+          name TEXT NOT NULL DEFAULT '',
+          description TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'released', 'cancelled')),
+          sequence INTEGER NOT NULL,
+          release_notes TEXT,
+          released_at TEXT,
+          cancellation_reason TEXT,
+          created_at TEXT NOT NULL
+        )
+      `);
+      db.exec(`
+        INSERT INTO releases (id, project_id, version, name, description, status, sequence, release_notes, released_at, cancellation_reason, created_at)
+        SELECT id, project_id, version, name, description, status, sequence, release_notes, released_at, cancellation_reason, created_at
+        FROM releases_old
+      `);
+      db.exec(`DROP TABLE releases_old`);
+
+      // After the DROP, never before: the old table's indexes are renamed
+      // along with it and keep their names, so recreating them while
+      // releases_old still exists would silently no-op on `IF NOT EXISTS` and
+      // leave the new table unindexed - including the UNIQUE one that enforces
+      // one version per project.
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_releases_project_id ON releases(project_id)`);
+      db.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_releases_project_version ON releases(project_id, version)`,
+      );
     });
 
     rebuild.immediate();
@@ -392,6 +489,16 @@ export function runMigrations(db: DatabaseInstance): void {
   // reasoning as priority above.
   ensureColumn(db, "tasks", "release_id", "TEXT REFERENCES releases(id) ON DELETE SET NULL");
   db.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_release_id ON tasks(release_id)`); // same reasoning as idx_tasks_epic_id above
+  // Must run before widenReleaseStatusCheck(), for the same reason tasks'
+  // cancellation_reason has to precede widenTaskStatusCheck(): the rebuild
+  // copies this column out of releases_old, which only has it once this
+  // ensureColumn has already added it.
+  ensureColumn(db, "releases", "cancellation_reason", "TEXT");
+  // Order relative to the tasks.release_id lines above doesn't matter (the
+  // rebuild preserves that FK either way - see widenReleaseStatusCheck), but
+  // they're kept adjacent since they're the two halves of the same
+  // task<->release relationship.
+  widenReleaseStatusCheck(db);
   ensureColumn(db, "tasks", "completion_summary", "TEXT");
   ensureColumn(db, "projects", "code_prefix", "TEXT");
   // Nullable with no default (so the backfill below can tell "never assigned"

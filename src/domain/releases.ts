@@ -2,7 +2,15 @@ import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireProject } from "./projects.js";
 
-export type ReleaseStatus = "planned" | "released";
+/**
+ * `cancelled` is the terminal status for a batch that was built but
+ * deliberately never shipped (a gate said don't ship it, a branch that will
+ * never be merged) - without it such a release sits at 100% done and
+ * `planned` forever, misrepresenting the board. Set only via cancelRelease
+ * (see lifecycle.ts), and one-shot like a cancelled task: there is no
+ * un-cancel.
+ */
+export type ReleaseStatus = "planned" | "released" | "cancelled";
 
 export interface Release {
   id: string;
@@ -14,6 +22,7 @@ export interface Release {
   sequence: number;
   release_notes: string | null;
   released_at: string | null;
+  cancellation_reason: string | null;
   created_at: string;
 }
 
@@ -51,13 +60,14 @@ export function createRelease(db: DatabaseInstance, input: CreateReleaseInput): 
     sequence: nextSequence(db, project.id),
     release_notes: null,
     released_at: null,
+    cancellation_reason: null,
     created_at: new Date().toISOString(),
   };
 
   try {
     db.prepare(
-      `INSERT INTO releases (id, project_id, version, name, description, status, sequence, release_notes, released_at, created_at)
-       VALUES (@id, @project_id, @version, @name, @description, @status, @sequence, @release_notes, @released_at, @created_at)`,
+      `INSERT INTO releases (id, project_id, version, name, description, status, sequence, release_notes, released_at, cancellation_reason, created_at)
+       VALUES (@id, @project_id, @version, @name, @description, @status, @sequence, @release_notes, @released_at, @cancellation_reason, @created_at)`,
     ).run(release);
   } catch (error) {
     if (error instanceof Error && (error as { code?: string }).code === "SQLITE_CONSTRAINT_UNIQUE") {
@@ -106,11 +116,19 @@ export function requireRelease(db: DatabaseInstance, projectId: string, ref: str
  * what's actually in the release, with nothing to detect it (unlike
  * check_doc_sync's drift detection for design docs). Used by createTask and
  * setTaskRelease (the latter also checks the release being moved *out of*).
+ *
+ * A cancelled release is closed to *inbound* tasks for a different reason:
+ * it's a terminal record of work that was abandoned, so adding fresh work to
+ * it would say something untrue about that work. Note the asymmetry this
+ * creates against setTaskRelease's outbound check, explained there.
  */
 export function requireAssignableRelease(db: DatabaseInstance, projectId: string, ref: string): Release {
   const release = requireRelease(db, projectId, ref);
   if (release.status === "released") {
     throw new Error(`Release ${ref} is already released; cannot assign new tasks to it`);
+  }
+  if (release.status === "cancelled") {
+    throw new Error(`Release ${ref} is cancelled; cannot assign new tasks to it`);
   }
   return release;
 }
@@ -142,6 +160,14 @@ function requireTaskProjectAndRelease(
  * already released (see requireAssignableRelease) - moving a task out of a
  * released release is the same membership drift as moving one in, just
  * backwards.
+ *
+ * The outbound check below is keyed on `released` only, deliberately: moving a
+ * task *out of* a cancelled release is allowed, even though moving one *in* is
+ * not. That asymmetry is the point, not an oversight - rescuing the
+ * salvageable parts of an abandoned batch into a later release is a real
+ * workflow, and unlike a released release there are no generated
+ * release_notes for the membership to drift away from, which is the only
+ * reason the outbound direction is frozen for shipped releases at all.
  */
 export function setTaskRelease(db: DatabaseInstance, taskId: string, releaseRef: string | null): void {
   const { projectId, releaseId: currentReleaseId } = requireTaskProjectAndRelease(db, taskId);
@@ -164,9 +190,9 @@ export function setTaskRelease(db: DatabaseInstance, taskId: string, releaseRef:
 
 /**
  * Manual reordering of a release's position in list_releases - not blocked
- * by `released` status (unlike setTaskRelease's freeze rule), since where a
- * past release *shows up* in a list is unrelated to the task-membership-drift
- * problem that rule exists for.
+ * by `released` or `cancelled` status (unlike setTaskRelease's freeze rule),
+ * since where a past release *shows up* in a list is unrelated to the
+ * task-membership-drift problem that rule exists for.
  */
 export function setReleaseSequence(
   db: DatabaseInstance,
