@@ -195,8 +195,8 @@ export function completeTask(
 ): CompleteTaskResult {
   const { task_id: taskId, summary, test_command: testCommand, force = false } = input;
 
-  const task = db.prepare(`SELECT project_id FROM tasks WHERE id = ?`).get(taskId) as
-    | { project_id: string }
+  const task = db.prepare(`SELECT project_id, created_at FROM tasks WHERE id = ?`).get(taskId) as
+    | { project_id: string; created_at: string }
     | undefined;
   if (!task) {
     throw new Error(`Unknown task_id: ${taskId}`);
@@ -212,7 +212,15 @@ export function completeTask(
       }>
     ).map((row) => row.file_path);
 
-    const result = verifier.verify({ rootPath: project.root_path, filePaths, testCommand });
+    // created_at, not the claim timestamp: it's the one task timestamp that
+    // never moves forward, so it can't end up after the commits it bounds
+    // (see GitDiffCompletionVerifier.checkFilesChanged).
+    const result = verifier.verify({
+      rootPath: project.root_path,
+      filePaths,
+      testCommand,
+      changesSinceIso: task.created_at,
+    });
     if (!result.passed) {
       throw new CompletionVerificationError(
         `Verification failed for task ${taskId}: ${result.reason}`,
