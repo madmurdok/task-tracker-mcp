@@ -276,8 +276,11 @@ describe("completion verification (B2)", () => {
     expect(row).toMatchObject({ status: "done" });
   });
 
-  it("passes the task's root_path, file_paths, and test_command through to the verifier", () => {
+  it("passes the task's root_path, file_paths, created_at, and test_command to the verifier", () => {
     const { db, project, task } = setup();
+    const { created_at: createdAt } = db
+      .prepare(`SELECT created_at FROM tasks WHERE id = ?`)
+      .get(task.id) as { created_at: string };
     let received: unknown;
     const spyVerifier: CompletionVerifier = {
       verify: (input) => {
@@ -292,6 +295,9 @@ describe("completion verification (B2)", () => {
       rootPath: project.root_path,
       filePaths: ["src/db/schema.ts"],
       testCommand: "npm test",
+      // The bound on which commits count as this task's work - created_at,
+      // the one task timestamp that never moves forward.
+      changesSinceIso: createdAt,
     });
   });
 
