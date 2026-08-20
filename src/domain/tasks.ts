@@ -52,7 +52,8 @@ export function nextTaskNumber(db: DatabaseInstance, projectId: string): number 
 
 /**
  * The one place the `PREFIX-N` display form is spelled out, so every surface
- * that shows a task code (CLI status, dashboard board) renders it identically.
+ * that shows a task code (CLI status, dashboard board, and every task row the
+ * MCP tools return) renders it identically.
  */
 export function taskCode(prefix: string, taskNumber: number): string {
   return `${prefix}-${taskNumber}`;
@@ -75,12 +76,97 @@ export interface CreateTaskResult {
   over_budget: boolean;
 }
 
+/**
+ * A task code as a person writes it: the project's `code_prefix` and the
+ * task's own `task_number`, e.g. `TTM-63`.
+ *
+ * Anchored and case-insensitive on the prefix, with a trailing integer. A uuid
+ * also contains dashes, so the shape - not the presence of a `-` - is what
+ * tells the two apart, and anything that is not this shape is treated as a
+ * uuid and produces the error it always did.
+ */
+const TASK_CODE = /^([A-Za-z]+)-(\d+)$/;
+
+/**
+ * Turns whatever a caller passed for a task id into the uuid the rest of the
+ * code expects: a uuid passes straight through, a task code is looked up.
+ *
+ * The uuid attempt comes first so no existing caller changes behaviour, and so
+ * that a project which ever took a code-shaped uuid could not be shadowed.
+ *
+ * This exists because a uuid is unreadable, unsayable, and says nothing about
+ * which project it belongs to - while the codes have been on the dashboard's
+ * cards since `code_prefix` was added. Mirrors `requireProject`, which is the
+ * single point every project-scoped function routes through so `project_id`
+ * can be an id or a name.
+ */
+export function resolveTaskId(db: DatabaseInstance, ref: string): string {
+  const direct = db.prepare(`SELECT id FROM tasks WHERE id = ?`).get(ref) as
+    | { id: string }
+    | undefined;
+  if (direct) return direct.id;
+
+  const match = TASK_CODE.exec(ref);
+  if (!match) return ref;
+
+  const byCode = db
+    .prepare(
+      `SELECT t.id FROM tasks t
+       JOIN projects p ON p.id = t.project_id
+       WHERE p.code_prefix = ? COLLATE NOCASE AND t.task_number = ?`,
+    )
+    .get(match[1], Number(match[2])) as { id: string } | undefined;
+
+  // Deliberately returns `ref` rather than throwing: every caller already
+  // reports its own "unknown task" in its own words, and a code that matches
+  // nothing is not a different failure from a uuid that matches nothing.
+  return byCode?.id ?? ref;
+}
+
 export function requireTask(db: DatabaseInstance, taskId: string): Task {
-  const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(taskId) as Task | undefined;
+  const resolved = resolveTaskId(db, taskId);
+  const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(resolved) as Task | undefined;
   if (!task) {
     throw new Error(`Unknown task_id: ${taskId}`);
   }
   return task;
+}
+
+/**
+ * Attaches each task's code to rows on their way out of this layer.
+ *
+ * One prefix lookup per call rather than per row: the join would otherwise
+ * have to be added to every `SELECT * FROM tasks` in the codebase, and there
+ * are many. Returning the code matters more than accepting one - a client that
+ * has to assemble `GM-231` from a prefix it must already know will get it
+ * wrong the first time a project is renamed, and did get it wrong once by
+ * hand before this existed.
+ */
+export function withCodes<T extends { project_id: string; task_number: number }>(
+  db: DatabaseInstance,
+  rows: T[],
+): Array<T & { code: string }> {
+  if (rows.length === 0) return [];
+  const prefixes = new Map(
+    (
+      db.prepare(`SELECT id, code_prefix FROM projects`).all() as Array<{
+        id: string;
+        code_prefix: string | null;
+      }>
+    ).map((row) => [row.id, row.code_prefix]),
+  );
+  return rows.map((row) => ({
+    ...row,
+    code: taskCode(prefixes.get(row.project_id) ?? "?", row.task_number),
+  }));
+}
+
+/** Single-row [`withCodes`], for the tools that answer with one task. */
+export function withCode<T extends { project_id: string; task_number: number }>(
+  db: DatabaseInstance,
+  row: T,
+): T & { code: string } {
+  return withCodes(db, [row])[0]!;
 }
 
 export function listTaskFilePaths(db: DatabaseInstance, taskId: string): string[] {
@@ -270,6 +356,8 @@ export interface CreateTasksSpec {
 export interface CreateTasksResultItem {
   temp_id?: string;
   task_id: string;
+  /** How a person refers to this task: `TTM-63` - see `withCodes`. */
+  code: string;
   estimated_tokens: number;
   over_budget: boolean;
 }
@@ -320,7 +408,13 @@ export function createTasks(
       if (temp_id) {
         tempIdToTaskId.set(temp_id, task.id);
       }
-      results.push({ temp_id, task_id: task.id, estimated_tokens: task.estimated_tokens, over_budget });
+      results.push({
+        temp_id,
+        task_id: task.id,
+        code: withCode(db, task).code,
+        estimated_tokens: task.estimated_tokens,
+        over_budget,
+      });
     }
 
     specs.forEach((spec, i) => {

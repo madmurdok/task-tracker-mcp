@@ -1,4 +1,5 @@
 import type { DatabaseInstance } from "../db/connection.js";
+import { resolveTaskId } from "./tasks.js";
 
 function isReachable(db: DatabaseInstance, fromTaskId: string, toTaskId: string): boolean {
   const visited = new Set<string>();
@@ -25,7 +26,13 @@ function isReachable(db: DatabaseInstance, fromTaskId: string, toTaskId: string)
  * Adds `taskId depends on dependsOnTaskId`. Rejects self-deps and anything that
  * would create a cycle (i.e. dependsOnTaskId can already, transitively, reach taskId).
  */
-export function addDependency(db: DatabaseInstance, taskId: string, dependsOnTaskId: string): void {
+export function addDependency(db: DatabaseInstance, taskRef: string, dependsOnRef: string): void {
+  // Resolved before the self-check below, not after: `TTM-63` and that task's
+  // own uuid are the same task, and comparing the two raw strings would let a
+  // self-dependency through the one guard that exists to stop it.
+  const taskId = resolveTaskId(db, taskRef);
+  const dependsOnTaskId = resolveTaskId(db, dependsOnRef);
+
   if (taskId === dependsOnTaskId) {
     throw new Error("A task cannot depend on itself");
   }

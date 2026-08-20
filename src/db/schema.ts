@@ -507,6 +507,11 @@ export function runMigrations(db: DatabaseInstance): void {
   // so adding it earlier would just be dropped again.
   ensureColumn(db, "tasks", "task_number", "INTEGER");
   db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_name ON projects(name)`);
+  // A task code (`TTM-63`) is only a unique handle if prefixes are unique.
+  // `dedupePrefix` already guarantees that at assignment time, in both
+  // createProject and the backfill - but that is application code, and a code
+  // is now something branches, commits and summaries are written against.
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_code_prefix ON projects(code_prefix)`);
   // Both no-op after the first run (each starts with a "what's still NULL?"
   // query that comes back empty), so they're safe on every startup. Order
   // matters only in that both must follow their ensureColumn above.

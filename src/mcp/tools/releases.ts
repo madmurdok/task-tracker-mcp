@@ -108,7 +108,7 @@ export function registerReleaseTools(
     "set_task_release",
     {
       description:
-        "Move a task to a different release, or clear it (pass null) - e.g. when a task turns out not to belong in a release. Rejects if either the task's current release or its target release is already released, and rejects a cancelled release as a target. Moving a task *out of* a cancelled release is deliberately allowed - that's how salvageable work is rescued into a later release.",
+        "Move a task to a different release, or clear it (pass null) - e.g. when a task turns out not to belong in a release. Rejects if either the task's current release or its target release is already released, and rejects a cancelled release as a target. Moving a task *out of* a cancelled release is deliberately allowed - that's how salvageable work is rescued into a later release. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         release_id: z.string().nullable(),

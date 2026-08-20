@@ -1,5 +1,6 @@
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireProject } from "./projects.js";
+import { resolveTaskId } from "./tasks.js";
 import { requireRelease } from "./releases.js";
 import { findUnblockedDependents, hasUnmetDependencies, LOCK_LEASE_MS } from "./status.js";
 import type { CompletionVerifier } from "./verification.js";
@@ -67,7 +68,8 @@ function isLockActive(lockExpiresAt: string | null, nowIso: string): boolean {
  * TaskConflictError if a different session currently holds an active
  * (non-expired) lock on it.
  */
-export function claimTask(db: DatabaseInstance, taskId: string, sessionId: string): void {
+export function claimTask(db: DatabaseInstance, taskRef: string, sessionId: string): void {
+  const taskId = resolveTaskId(db, taskRef);
   const now = new Date().toISOString();
   const lockExpiresAt = new Date(Date.parse(now) + LOCK_LEASE_MS).toISOString();
 
@@ -123,7 +125,8 @@ export interface ReleaseTaskInput {
  * with TaskConflictError if another session's lock is still active.
  */
 export function releaseTask(db: DatabaseInstance, input: ReleaseTaskInput): void {
-  const { task_id: taskId, session_id: sessionId, force = false } = input;
+  const { task_id: taskRef, session_id: sessionId, force = false } = input;
+  const taskId = resolveTaskId(db, taskRef);
   const now = new Date().toISOString();
 
   const run = db.transaction(() => {
@@ -193,7 +196,8 @@ export function completeTask(
   verifier: CompletionVerifier,
   input: CompleteTaskInput,
 ): CompleteTaskResult {
-  const { task_id: taskId, summary, test_command: testCommand, force = false } = input;
+  const { task_id: taskRef, summary, test_command: testCommand, force = false } = input;
+  const taskId = resolveTaskId(db, taskRef);
 
   const task = db.prepare(`SELECT project_id, created_at FROM tasks WHERE id = ?`).get(taskId) as
     | { project_id: string; created_at: string }
@@ -431,7 +435,8 @@ export interface CancelTaskResult {
  * who holds it.
  */
 export function cancelTask(db: DatabaseInstance, input: CancelTaskInput): CancelTaskResult {
-  const { task_id: taskId, reason, force = false } = input;
+  const { task_id: taskRef, reason, force = false } = input;
+  const taskId = resolveTaskId(db, taskRef);
   const now = new Date().toISOString();
 
   const run = db.transaction((): CancelTaskResult => {

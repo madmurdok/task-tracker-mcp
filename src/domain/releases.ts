@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireProject } from "./projects.js";
+import { resolveTaskId } from "./tasks.js";
 
 /**
  * `cancelled` is the terminal status for a batch that was built but
@@ -144,7 +145,9 @@ function requireTaskProjectAndRelease(
   db: DatabaseInstance,
   taskId: string,
 ): { projectId: string; releaseId: string | null } {
-  const row = db.prepare(`SELECT project_id, release_id FROM tasks WHERE id = ?`).get(taskId) as
+  const row = db
+    .prepare(`SELECT project_id, release_id FROM tasks WHERE id = ?`)
+    .get(resolveTaskId(db, taskId)) as
     | { project_id: string; release_id: string | null }
     | undefined;
   if (!row) {

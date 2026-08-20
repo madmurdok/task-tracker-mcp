@@ -326,6 +326,7 @@ describe("listTasks release_id filter", () => {
     expect(filtered).toEqual([
       {
         id: inRelease.id,
+        code: `${project.code_prefix}-${inRelease.task_number}`,
         title: "In release",
         status: "pending",
         estimated_tokens: 0,

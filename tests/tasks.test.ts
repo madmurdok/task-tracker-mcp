@@ -12,6 +12,8 @@ import {
   setTaskPriority,
   splitTask,
   taskCode,
+  resolveTaskId,
+  withCode,
 } from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 
@@ -291,5 +293,81 @@ describe("deleteTask", () => {
   it("rejects an unknown task_id", () => {
     const db = openDatabase(":memory:");
     expect(() => deleteTask(db, "missing")).toThrow(/Unknown task_id: missing/);
+  });
+});
+
+describe("addressing a task by its code", () => {
+  it("resolves PREFIX-N to the same task as its uuid, and leaves a uuid alone", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "task-tracker-mcp", root_path: "/tmp/ttm" });
+    const { task } = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "Anything",
+      complexity_hint: "normal",
+    });
+
+    const code = taskCode(project.code_prefix, task.task_number);
+    expect(resolveTaskId(db, code)).toBe(task.id);
+    expect(resolveTaskId(db, task.id)).toBe(task.id);
+    expect(requireTask(db, code).id).toBe(task.id);
+  });
+
+  it("matches a prefix case-insensitively, since a code gets retyped by hand", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "g-mesh", root_path: "/tmp/gm" });
+    const { task } = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "Anything",
+      complexity_hint: "normal",
+    });
+
+    expect(resolveTaskId(db, `gm-${task.task_number}`)).toBe(task.id);
+  });
+
+  it("keeps the same number in two projects apart", () => {
+    // task_number is unique per project, so the prefix is the whole of what
+    // makes a code globally unique - and a resolver that ignored it would
+    // silently act on the wrong project's task.
+    const db = openDatabase(":memory:");
+    const gm = createProject(db, { name: "g-mesh", root_path: "/tmp/gm" });
+    const bench = createProject(db, { name: "g-mesh-bench", root_path: "/tmp/gmb" });
+    const first = createTask(db, stubEstimator(0), {
+      project_id: gm.id,
+      title: "In g-mesh",
+      complexity_hint: "normal",
+    }).task;
+    const second = createTask(db, stubEstimator(0), {
+      project_id: bench.id,
+      title: "In bench",
+      complexity_hint: "normal",
+    }).task;
+
+    expect(first.task_number).toBe(second.task_number);
+    expect(resolveTaskId(db, taskCode(gm.code_prefix, first.task_number))).toBe(first.id);
+    expect(resolveTaskId(db, taskCode(bench.code_prefix, second.task_number))).toBe(second.id);
+  });
+
+  it("hands anything that is not a code straight back, so callers report their own error", () => {
+    const db = openDatabase(":memory:");
+    createProject(db, { name: "g-mesh", root_path: "/tmp/gm" });
+
+    // A well-formed code for a task that does not exist, and three shapes that
+    // are not codes at all. All fall through to the caller's own "unknown
+    // task" message rather than inventing a second failure mode.
+    for (const ref of ["GM-9999", "GM-", "-7", "GM-x", "not-a-code"]) {
+      expect(resolveTaskId(db, ref)).toBe(ref);
+    }
+  });
+
+  it("puts the code on the row, so a caller never assembles one by hand", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "g-mesh", root_path: "/tmp/gm" });
+    const { task } = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "Anything",
+      complexity_hint: "normal",
+    });
+
+    expect(withCode(db, task).code).toBe(taskCode(project.code_prefix, task.task_number));
   });
 });

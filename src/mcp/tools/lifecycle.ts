@@ -24,7 +24,7 @@ export function registerLifecycleTools(
     "claim_task",
     {
       description:
-        "Take a specific task into work: moves a pending, unblocked task straight to in_progress, or attaches/renews ownership on a task already in_progress (e.g. right after get_next_task). Use this to hand a specific task to a specific session instead of pulling from the priority queue. Rejects with a conflict error if another session's lock is still active, a blocked error if the task has unmet dependencies, or a not_claimable error if it's already done/cancelled.",
+        "Take a specific task into work: moves a pending, unblocked task straight to in_progress, or attaches/renews ownership on a task already in_progress (e.g. right after get_next_task). Use this to hand a specific task to a specific session instead of pulling from the priority queue. Rejects with a conflict error if another session's lock is still active, a blocked error if the task has unmet dependencies, or a not_claimable error if it's already done/cancelled. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         session_id: z.string().min(1),
@@ -57,7 +57,7 @@ export function registerLifecycleTools(
     "release_task",
     {
       description:
-        "Release ownership of a task so it's immediately available again, instead of waiting for its lock to expire. Pass force to override another session's still-active lock.",
+        "Release ownership of a task so it's immediately available again, instead of waiting for its lock to expire. Pass force to override another session's still-active lock. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         session_id: z.string().min(1),
@@ -84,7 +84,7 @@ export function registerLifecycleTools(
   server.registerTool(
     "add_handoff_note",
     {
-      description: "Persist decisions/remaining-work/discoveries for a task so a fresh session can resume.",
+      description: "Persist decisions/remaining-work/discoveries for a task so a fresh session can resume. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         session_id: z.string().min(1),
@@ -103,7 +103,7 @@ export function registerLifecycleTools(
     "complete_task",
     {
       description:
-        "Mark a task done and report which dependent tasks are now unblocked. Verifies the task's declared files actually changed (and runs test_command, if given) before accepting the completion; pass force to skip verification.",
+        "Mark a task done and report which dependent tasks are now unblocked. Verifies the task's declared files actually changed (and runs test_command, if given) before accepting the completion; pass force to skip verification. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         summary: z.string().optional(),
@@ -129,7 +129,7 @@ export function registerLifecycleTools(
     "cancel_task",
     {
       description:
-        "Abandon a task that turns out unnecessary, instead of dishonestly force-completing it. Unblocks dependents the same way complete_task does. Rejects with a conflict error if another session's lock on it is still active, unless force is given.",
+        "Abandon a task that turns out unnecessary, instead of dishonestly force-completing it. Unblocks dependents the same way complete_task does. Rejects with a conflict error if another session's lock on it is still active, unless force is given. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         reason: z.string().optional(),

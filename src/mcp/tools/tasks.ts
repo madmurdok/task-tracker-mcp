@@ -78,7 +78,7 @@ export function registerTaskTools(
     "split_task",
     {
       description:
-        "Replace a task with subtasks; dependents and prerequisites are rewired onto them.",
+        "Replace a task with subtasks; dependents and prerequisites are rewired onto them. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         subtasks: z.array(subtaskShape).min(1),
@@ -91,7 +91,7 @@ export function registerTaskTools(
     "delete_task",
     {
       description:
-        "Hard-delete a backlog task (no release assigned) - the row plus its file list, dependency edges (both directions), and handoff notes are all removed. Rejects a task that has a release_id; move it out with set_task_release or use cancel_task instead.",
+        "Hard-delete a backlog task (no release assigned) - the row plus its file list, dependency edges (both directions), and handoff notes are all removed. Rejects a task that has a release_id; move it out with set_task_release or use cancel_task instead. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
       },
@@ -106,7 +106,7 @@ export function registerTaskTools(
     "set_task_priority",
     {
       description:
-        "Adjust a task's priority after creation, once its importance turns out different than assumed. Higher sorts first in get_next_task.",
+        "Adjust a task's priority after creation, once its importance turns out different than assumed. Higher sorts first in get_next_task. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         priority: z.number().int(),

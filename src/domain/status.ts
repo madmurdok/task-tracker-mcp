@@ -3,12 +3,14 @@ import { requireEpic, listEpics, type Epic } from "./epics.js";
 import { listHandoffNotes, type HandoffNote } from "./handoffNotes.js";
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, requireRelease, type Release } from "./releases.js";
-import { listTaskFilePaths, requireTask, type Task } from "./tasks.js";
+import { listTaskFilePaths, requireTask, type Task, withCode, taskCode} from "./tasks.js";
 
 export type DisplayStatus = "pending" | "in_progress" | "blocked" | "done" | "cancelled";
 
 export interface TaskSummary {
   id: string;
+  /** How a person refers to this task: `TTM-63`. See tasks.ts's `withCodes`. */
+  code: string;
   title: string;
   status: DisplayStatus;
   estimated_tokens: number;
@@ -35,6 +37,8 @@ type NextTaskOutcome =
 export type GetNextTaskResult = NextTaskOutcome & { doc_drift: boolean };
 
 export interface TaskDetail extends Task {
+  /** How a person refers to this task: `TTM-63`. See tasks.ts's `withCodes`. */
+  code: string;
   file_paths: string[];
   handoff_notes: HandoffNote[];
 }
@@ -47,10 +51,12 @@ export interface TaskDetail extends Task {
  */
 export function getTaskDetail(db: DatabaseInstance, taskId: string): TaskDetail {
   const task = requireTask(db, taskId);
+  // `task.id`, not the caller's `taskId`: the caller may have named this task
+  // by its code, and everything below addresses rows by uuid.
   return {
-    ...task,
-    file_paths: listTaskFilePaths(db, taskId),
-    handoff_notes: listHandoffNotes(db, taskId),
+    ...withCode(db, task),
+    file_paths: listTaskFilePaths(db, task.id),
+    handoff_notes: listHandoffNotes(db, task.id),
   };
 }
 
@@ -198,8 +204,14 @@ export function listTasks(
     .prepare(`SELECT * FROM tasks WHERE ${conditions.join(" AND ")} ORDER BY created_at ASC`)
     .all(...params) as Task[];
 
+  // `code` beside `task_number`, not instead of it: the number is the datum,
+  // the code is how a person says it, and a caller quoting a task in a branch
+  // name or a commit should never have to assemble one from a prefix it had to
+  // learn elsewhere.
+  const prefix = requireProject(db, projectId).code_prefix;
   const summaries = tasks.map((task) => ({
     id: task.id,
+    code: taskCode(prefix, task.task_number),
     title: task.title,
     status: displayStatus(db, task),
     estimated_tokens: task.estimated_tokens,
