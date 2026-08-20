@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireProject } from "./projects.js";
-import { resolveTaskId } from "./tasks.js";
+import { resolveTaskId, runOne } from "./tasks.js";
 
 /**
  * `cancelled` is the terminal status for a batch that was built but
@@ -147,7 +147,7 @@ function requireTaskProjectAndRelease(
 ): { projectId: string; releaseId: string | null } {
   const row = db
     .prepare(`SELECT project_id, release_id FROM tasks WHERE id = ?`)
-    .get(resolveTaskId(db, taskId)) as
+    .get(taskId) as
     | { project_id: string; release_id: string | null }
     | undefined;
   if (!row) {
@@ -172,7 +172,11 @@ function requireTaskProjectAndRelease(
  * release_notes for the membership to drift away from, which is the only
  * reason the outbound direction is frozen for shipped releases at all.
  */
-export function setTaskRelease(db: DatabaseInstance, taskId: string, releaseRef: string | null): void {
+export function setTaskRelease(db: DatabaseInstance, taskRef: string, releaseRef: string | null): void {
+  // Resolved once, at the top, and used for both the lookup and the write.
+  // Wrapping only the lookup is what made this silently do nothing when given
+  // a task code: the UPDATE below still bound the caller's raw reference.
+  const taskId = resolveTaskId(db, taskRef);
   const { projectId, releaseId: currentReleaseId } = requireTaskProjectAndRelease(db, taskId);
 
   if (currentReleaseId) {
@@ -184,7 +188,9 @@ export function setTaskRelease(db: DatabaseInstance, taskId: string, releaseRef:
 
   const newReleaseId = releaseRef ? requireAssignableRelease(db, projectId, releaseRef).id : null;
 
-  db.prepare(`UPDATE tasks SET release_id = ?, updated_at = ? WHERE id = ?`).run(
+  runOne(
+    db.prepare(`UPDATE tasks SET release_id = ?, updated_at = ? WHERE id = ?`),
+    `set_task_release ${taskRef}`,
     newReleaseId,
     new Date().toISOString(),
     taskId,

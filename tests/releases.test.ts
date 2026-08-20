@@ -12,7 +12,7 @@ import {
   setTaskRelease,
 } from "../src/domain/releases.js";
 import { getReleaseStatus, listReleasesWithStatus, listTasks } from "../src/domain/status.js";
-import { createTask, splitTask } from "../src/domain/tasks.js";
+import { createTask, requireTask, splitTask, taskCode } from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 
 const noopEstimator: BudgetEstimator = { estimateTokens: () => 0 };
@@ -583,5 +583,34 @@ describe("setReleaseSequence", () => {
     markReleased(db, release.id);
 
     expect(() => setReleaseSequence(db, project.id, release.id, 5)).not.toThrow();
+  });
+});
+
+describe("set_task_release given a task code", () => {
+  it("actually moves the task, asserted on the row rather than on the absence of a throw", () => {
+    // The regression this exists for: the code was resolved for the lookup and
+    // the UPDATE still bound the caller's raw reference, so SQLite matched no
+    // row, raised nothing, and the tool answered ok. Eleven calls in a row
+    // reported success and moved nothing.
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "g-mesh", root_path: "/tmp/gm" });
+    const release = createRelease(db, { project_id: project.id, version: "2.10.0" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Anything",
+      complexity_hint: "normal",
+    });
+
+    setTaskRelease(db, taskCode(project.code_prefix, task.task_number), release.id);
+
+    expect(requireTask(db, task.id).release_id).toBe(release.id);
+  });
+
+  it("refuses a reference that matches nothing instead of reporting success", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "g-mesh", root_path: "/tmp/gm" });
+    createRelease(db, { project_id: project.id, version: "2.10.0" });
+
+    expect(() => setTaskRelease(db, "GM-9999", "2.10.0")).toThrow(/Unknown task_id/);
   });
 });

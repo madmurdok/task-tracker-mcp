@@ -123,6 +123,34 @@ export function resolveTaskId(db: DatabaseInstance, ref: string): string {
   return byCode?.id ?? ref;
 }
 
+/**
+ * Runs a statement that is supposed to change exactly one row, and refuses to
+ * pass silently when it changed none.
+ *
+ * SQLite matches no row and raises nothing, so an `UPDATE ... WHERE id = ?`
+ * given a reference that was resolved for a *read* four lines earlier and left
+ * raw here updates nothing, returns void, and is reported to the caller as
+ * success. That is how `set_task_release` accepted eleven task codes in a row,
+ * answered `ok` to each, and moved none of them - visible only by looking at
+ * the board afterwards.
+ *
+ * The wrong row count is the one thing a caller can never see and the one
+ * thing the driver already knows, so it is worth one check at the write.
+ */
+export function runOne(
+  // Typed loosely on purpose: better-sqlite3's `Statement` is generic over its
+  // bind parameters, and pinning that here would make every call site spell
+  // the tuple out for a helper whose whole job is the row count.
+  statement: { run: (...params: never[]) => { changes: number } },
+  what: string,
+  ...params: unknown[]
+): void {
+  const { changes } = (statement.run as (...p: unknown[]) => { changes: number })(...params);
+  if (changes !== 1) {
+    throw new Error(`${what} matched ${changes} rows, expected exactly 1`);
+  }
+}
+
 export function requireTask(db: DatabaseInstance, taskId: string): Task {
   const resolved = resolveTaskId(db, taskId);
   const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(resolved) as Task | undefined;
