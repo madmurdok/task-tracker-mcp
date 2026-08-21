@@ -8,7 +8,7 @@ export function registerDependencyTools(server: McpServer, db: DatabaseInstance)
   server.registerTool(
     "add_dependency",
     {
-      description: "Declare that a task depends on another task. Rejects cycles.",
+      description: "Declare that a task depends on another task. Rejects cycles. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         depends_on_task_id: z.string().min(1),

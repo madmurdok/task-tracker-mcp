@@ -232,6 +232,7 @@ describe("listTasks epic_id filter", () => {
     expect(filtered).toEqual([
       {
         id: inEpic.id,
+        code: `${project.code_prefix}-${inEpic.task_number}`,
         title: "In epic",
         status: "pending",
         estimated_tokens: 0,

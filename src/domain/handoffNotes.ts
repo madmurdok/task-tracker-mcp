@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { requireTask } from "./tasks.js";
 import type { DatabaseInstance } from "../db/connection.js";
 
 export interface HandoffNote {
@@ -20,9 +21,11 @@ export interface AddHandoffNoteInput {
 }
 
 export function addHandoffNote(db: DatabaseInstance, input: AddHandoffNoteInput): HandoffNote {
+  // Resolved, not trusted: a code reaching the INSERT lands in a foreign key
+  // and fails there, naming the constraint rather than the task.
   const note: HandoffNote = {
     id: randomUUID(),
-    task_id: input.task_id,
+    task_id: requireTask(db, input.task_id).id,
     session_id: input.session_id,
     decisions: input.decisions ?? "",
     remaining_work: input.remaining_work ?? "",

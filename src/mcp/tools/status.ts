@@ -37,7 +37,7 @@ export function registerStatusTools(server: McpServer, db: DatabaseInstance): vo
     "get_task",
     {
       description:
-        "Fetch a single task's full detail (including file_paths and handoff_notes) by id, with no claim/lock side effect - unlike get_next_task, safe to call anytime just to re-inspect a task.",
+        "Fetch a single task's full detail (including file_paths and handoff_notes) by id, with no claim/lock side effect - unlike get_next_task, safe to call anytime just to re-inspect a task. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: { task_id: z.string().min(1) },
     },
     async ({ task_id }) => jsonResult(getTaskDetail(db, task_id)),
