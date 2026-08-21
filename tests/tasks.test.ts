@@ -14,6 +14,7 @@ import {
   taskCode,
   resolveTaskId,
   withCode,
+  runOne,
 } from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 
@@ -369,5 +370,50 @@ describe("addressing a task by its code", () => {
     });
 
     expect(withCode(db, task).code).toBe(taskCode(project.code_prefix, task.task_number));
+  });
+});
+
+describe("a task-mutating call given a code changes the row it names", () => {
+  // The class this guards: a reference resolved for the *read* and left raw in
+  // the write. SQLite matches nothing, raises nothing, and the tool reports
+  // success - which is how set_task_release accepted eleven codes and moved
+  // none. Each of these asserts the row afterwards, never the absence of a
+  // throw, because the absence of a throw was exactly the bug.
+  function projectWithTask() {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "g-mesh", root_path: "/tmp/gm" });
+    const { task } = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "Anything",
+      complexity_hint: "normal",
+    });
+    return { db, project, task, code: taskCode(project.code_prefix, task.task_number) };
+  }
+
+  it("set_task_priority", () => {
+    const { db, task, code } = projectWithTask();
+    setTaskPriority(db, code, 7);
+    expect(requireTask(db, task.id).priority).toBe(7);
+  });
+
+  it("add_handoff_note", () => {
+    const { db, task, code } = projectWithTask();
+    const note = addHandoffNote(db, { task_id: code, session_id: "s1", decisions: "d" });
+    // Stored against the uuid, or the foreign key would have rejected it and
+    // the note would be addressed by something no other query can find.
+    expect(note.task_id).toBe(task.id);
+  });
+
+  it("delete_task", () => {
+    const { db, task, code } = projectWithTask();
+    deleteTask(db, code);
+    expect(() => requireTask(db, task.id)).toThrow(/Unknown task_id/);
+  });
+
+  it("runOne refuses a write that matched nothing", () => {
+    const { db } = projectWithTask();
+    expect(() =>
+      runOne(db.prepare(`UPDATE tasks SET priority = ? WHERE id = ?`), "probe", 1, "no-such-row"),
+    ).toThrow(/matched 0 rows/);
   });
 });

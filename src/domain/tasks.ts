@@ -210,9 +210,11 @@ export function listTaskFilePaths(db: DatabaseInstance, taskId: string): string[
  * "update_task" tool - priority is the only field that turns out to need
  * adjusting after the fact once a task's importance becomes clearer mid-project.
  */
-export function setTaskPriority(db: DatabaseInstance, taskId: string, priority: number): void {
-  requireTask(db, taskId);
-  db.prepare(`UPDATE tasks SET priority = ?, updated_at = ? WHERE id = ?`).run(
+export function setTaskPriority(db: DatabaseInstance, taskRef: string, priority: number): void {
+  const taskId = requireTask(db, taskRef).id;
+  runOne(
+    db.prepare(`UPDATE tasks SET priority = ?, updated_at = ? WHERE id = ?`),
+    `set_task_priority ${taskRef}`,
     priority,
     new Date().toISOString(),
     taskId,
@@ -287,15 +289,15 @@ export function createTask(
  * Deliberately no lock/ownership guard beyond that - unlike claim/complete,
  * deleting a mis-created backlog task isn't gated by who has it locked.
  */
-export function deleteTask(db: DatabaseInstance, taskId: string): void {
-  const task = requireTask(db, taskId);
+export function deleteTask(db: DatabaseInstance, taskRef: string): void {
+  const task = requireTask(db, taskRef);
   if (task.release_id !== null) {
     throw new Error(
-      `Task ${taskId} is in a release; only backlog tasks (no release) can be deleted. Move it out with set_task_release or use cancel_task instead.`,
+      `Task ${taskRef} is in a release; only backlog tasks (no release) can be deleted. Move it out with set_task_release or use cancel_task instead.`,
     );
   }
 
-  db.prepare(`DELETE FROM tasks WHERE id = ?`).run(taskId);
+  runOne(db.prepare(`DELETE FROM tasks WHERE id = ?`), `delete_task ${taskRef}`, task.id);
 }
 
 export interface SplitSubtaskInput {
@@ -318,13 +320,16 @@ export interface SplitTaskResult {
 export function splitTask(
   db: DatabaseInstance,
   estimator: BudgetEstimator,
-  taskId: string,
+  taskRef: string,
   subtasks: SplitSubtaskInput[],
 ): SplitTaskResult {
   const run = db.transaction((): SplitTaskResult => {
-    const original = requireTask(db, taskId);
+    const original = requireTask(db, taskRef);
+    // Everything below addresses rows by id - the dependency queries included,
+    // which would silently find none for a code.
+    const taskId = original.id;
     if (original.status === "done" || original.status === "cancelled") {
-      throw new Error(`Cannot split task ${taskId}: already ${original.status}`);
+      throw new Error(`Cannot split task ${taskRef}: already ${original.status}`);
     }
     if (subtasks.length === 0) {
       throw new Error("split_task requires at least one subtask");
