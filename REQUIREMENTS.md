@@ -514,6 +514,45 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
     interactive viewer") — once built, that Non-goal needs updating the same way
     Item 5 updated the doc-sync one.
 
+### 9. A plan per release batch, so one approval covers the whole batch
+
+- **Status:** done (see Implemented, v10)
+- **Priority:** high
+- **Problem:** working a release batch stalls. Claude finishes two or three tasks
+  and then stops to ask what to take next — not because the order is unknown, but
+  because it has no standing approval for the batch. CLAUDE.md requires explicit
+  approval before starting execution, and nothing in the tracker records that an
+  approval was ever given, so it gets re-earned every few tasks.
+  The ordering data already existed: `tasks.priority` plus `task_dependencies`.
+  Three things did not, and none of them is expressible as an integer:
+  1. **An approval.** A priority cannot be approved. A plan can, once, for a batch.
+  2. **Scope.** `get_next_task` was project-wide and could not be told "work the
+     1.3.0 batch".
+  3. **A computable answer to "in the batch but not in the plan"**, so a task added
+     later cannot be silently missed. That requirement alone ruled out storing the
+     plan as free text.
+- **Confirmed with the user:**
+  - **Approval happens in chat, recorded through an MCP tool** — the dashboard stays
+    read-only, so Item 8's "pure visualization, not a second write path" is not
+    reversed. Stated plainly and accepted: the tool recording the approval is called
+    by the party the approval authorises, so this is an audit trail rather than an
+    enforcement boundary, which is why `approval_note` stores the approver's
+    verbatim words. The *ordering*, unlike the approval, is genuinely enforced —
+    `get_next_task` refuses to hand out release-scoped work against an unapproved
+    plan.
+  - **A task added to (or removed from) the batch reverts the plan to `draft`**, and
+    new work is not handed out until it is re-approved. Chosen over the looser
+    options knowing it reintroduces a pause; the design's job is to make that pause
+    cheap, which is why an added task is auto-appended as a final step — "it goes
+    last" is the common case, so re-approval is one word.
+  - **CLAUDE.md is in scope.** Without a rule that reads the plan, the tracker gains
+    a table nobody's behaviour consults.
+- **Design:** two tables (`release_plans`, `release_plan_items`), a `plans.ts`
+  domain module, revert hooks on `createTask`/`createTasks`/`setTaskRelease`,
+  `release_id` on `get_next_task`, three MCP tools, and a read-only Plan popup on
+  the board. Drift and "new since approval" are computed at read time, never
+  stored, for the same reason `blocked` is. Full contract in the architecture doc.
+
 ## Implemented
 
 What's already shipped, so a new idea can be checked against it before being added
@@ -641,6 +680,21 @@ is just an index.
   hazard — `tasks.release_id` is `ON DELETE SET NULL`, so the rebuild has to
   run with `foreign_keys` off or it silently clears every task's release
   assignment (asserted against in `tests/migration.test.ts`).
+
+- **v10 — a plan per release batch** (`create_plan`, `get_plan`, `approve_plan`,
+  `release_id` on `get_next_task`, `release_plans`/`release_plan_items`): a batch
+  carries its execution order plus the record that a human approved it, so an
+  approved batch is worked end to end instead of re-earning approval every few
+  tasks. Items sit at a `step` (parallel within one) and a `position`; drift in
+  both directions and "new since approval" are computed at read time, never
+  stored. `get_next_task(project_id, release_id)` walks an approved plan and
+  returns `plan_not_approved` while it is `draft` or drifted — that refusal is the
+  enforced half, since the approval itself is recorded by the party it authorises.
+  Adding or removing a batch task reverts the plan to `draft`, auto-appending the
+  new task so re-approval is one word. The board gains a read-only Plan popup
+  beside Release notes, with finished items struck through. Reverses v4's
+  "releases don't participate in scheduling" non-goal; the unscoped
+  `get_next_task` is unchanged.
 
 ## How to use this file
 

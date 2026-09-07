@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
+import { appendTaskToPlan, removeTaskFromPlan } from "./planWrites.js";
 import { requireProject } from "./projects.js";
 import { resolveTaskId, runOne } from "./tasks.js";
 
@@ -122,14 +123,27 @@ export function requireRelease(db: DatabaseInstance, projectId: string, ref: str
  * it's a terminal record of work that was abandoned, so adding fresh work to
  * it would say something untrue about that work. Note the asymmetry this
  * creates against setTaskRelease's outbound check, explained there.
+ *
+ * `action` names what the caller was trying to do, because this guard is no
+ * longer only about task assignment: writing and approving a release plan
+ * (plans.ts) go through it for the same "a finished batch is a frozen record"
+ * reason. Defaulted rather than required so the task-assignment callers read
+ * as they always did, and worth passing because "cannot assign new tasks to
+ * it" is actively misleading in answer to an approve_plan call - it sends
+ * someone looking for a task they never touched.
  */
-export function requireAssignableRelease(db: DatabaseInstance, projectId: string, ref: string): Release {
+export function requireAssignableRelease(
+  db: DatabaseInstance,
+  projectId: string,
+  ref: string,
+  action = "assign new tasks to it",
+): Release {
   const release = requireRelease(db, projectId, ref);
   if (release.status === "released") {
-    throw new Error(`Release ${ref} is already released; cannot assign new tasks to it`);
+    throw new Error(`Release ${ref} is already released; cannot ${action}`);
   }
   if (release.status === "cancelled") {
-    throw new Error(`Release ${ref} is cancelled; cannot assign new tasks to it`);
+    throw new Error(`Release ${ref} is cancelled; cannot ${action}`);
   }
   return release;
 }
@@ -156,6 +170,8 @@ function requireTaskProjectAndRelease(
   return { projectId: row.project_id, releaseId: row.release_id };
 }
 
+
+
 /**
  * Escape valve for a task that turns out not to belong in a release (or
  * belongs in a different one) - move it, or clear release_id with `null`.
@@ -171,6 +187,14 @@ function requireTaskProjectAndRelease(
  * workflow, and unlike a released release there are no generated
  * release_notes for the membership to drift away from, which is the only
  * reason the outbound direction is frozen for shipped releases at all.
+ *
+ * TTM-68: this one function carries both directions of the plan-revert rule -
+ * `currentReleaseId` is the outbound side (dropped from its old release's
+ * plan, if any), `newReleaseId` the inbound side (appended to its new
+ * release's plan, if any). Both run inside the same transaction as the
+ * `tasks` write itself, and only when the release actually changes - calling
+ * setTaskRelease with the release a task is already in is not membership
+ * drift and must not shuffle it to the end of anyone's plan.
  */
 export function setTaskRelease(db: DatabaseInstance, taskRef: string, releaseRef: string | null): void {
   // Resolved once, at the top, and used for both the lookup and the write.
@@ -188,13 +212,24 @@ export function setTaskRelease(db: DatabaseInstance, taskRef: string, releaseRef
 
   const newReleaseId = releaseRef ? requireAssignableRelease(db, projectId, releaseRef).id : null;
 
-  runOne(
-    db.prepare(`UPDATE tasks SET release_id = ?, updated_at = ? WHERE id = ?`),
-    `set_task_release ${taskRef}`,
-    newReleaseId,
-    new Date().toISOString(),
-    taskId,
-  );
+  const run = db.transaction((): void => {
+    runOne(
+      db.prepare(`UPDATE tasks SET release_id = ?, updated_at = ? WHERE id = ?`),
+      `set_task_release ${taskRef}`,
+      newReleaseId,
+      new Date().toISOString(),
+      taskId,
+    );
+
+    if (currentReleaseId && currentReleaseId !== newReleaseId) {
+      removeTaskFromPlan(db, currentReleaseId, taskId);
+    }
+    if (newReleaseId && newReleaseId !== currentReleaseId) {
+      appendTaskToPlan(db, newReleaseId, taskId);
+    }
+  });
+
+  run();
 }
 
 /**

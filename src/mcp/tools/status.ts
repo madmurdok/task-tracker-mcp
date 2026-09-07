@@ -11,10 +11,10 @@ export function registerStatusTools(server: McpServer, db: DatabaseInstance): vo
     "get_next_task",
     {
       description:
-        "Atomically pick the next unblocked pending task for a project and mark it in_progress. project_id accepts a project id or its unique name. doc_drift:true means the project's tracked design doc changed since it was last hashed - re-check the plan and call check_doc_sync(acknowledge:true) once reconciled.",
-      inputSchema: { project_id: z.string().min(1) },
+        "Atomically pick the next unblocked pending task for a project and mark it in_progress. project_id accepts a project id or its unique name. Pass release_id to work one release batch instead of the whole project: it accepts a release id or its version within that project, and the batch's plan then decides the order - an approved plan is followed step by step (plan_status:'approved'), a draft or drifted one refuses with reason:'plan_not_approved' until it is fixed and approved, and a batch with no plan falls back to priority order (plan_status:'none'). Without release_id the pick is project-wide and in priority order as always, and plan_pending lists any batches whose plan is still draft or drifted - a task handed out from one of those is work whose order nobody approved. doc_drift:true means the project's tracked design doc changed since it was last hashed - re-check the plan and call check_doc_sync(acknowledge:true) once reconciled.",
+      inputSchema: { project_id: z.string().min(1), release_id: z.string().optional() },
     },
-    async ({ project_id }) => jsonResult(getNextTask(db, project_id)),
+    async ({ project_id, release_id }) => jsonResult(getNextTask(db, project_id, release_id)),
   );
 
   server.registerTool(

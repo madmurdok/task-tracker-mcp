@@ -4,6 +4,7 @@ import { isOverBudget, type BudgetEstimator } from "./budget.js";
 import { addDependency } from "./dependencies.js";
 import { requireEpic } from "./epics.js";
 import { requireProject } from "./projects.js";
+import { appendTaskToPlan } from "./planWrites.js";
 import { requireAssignableRelease } from "./releases.js";
 
 export type TaskStatus = "pending" | "in_progress" | "done" | "cancelled";
@@ -160,6 +161,7 @@ export function requireTask(db: DatabaseInstance, taskId: string): Task {
   return task;
 }
 
+
 /**
  * Attaches each task's code to rows on their way out of this layer.
  *
@@ -270,6 +272,11 @@ export function createTask(
     insertTask.run(task);
     for (const filePath of filePaths) {
       insertFile.run(task.id, filePath);
+    }
+    // TTM-68: created straight into a planned batch, so its plan (if any)
+    // needs this task appended and, if approved, sent back to draft.
+    if (releaseId) {
+      appendTaskToPlan(db, releaseId, task.id);
     }
     return task;
   });
@@ -411,6 +418,20 @@ export interface CreateTasksResult {
  * dependency order. Whole call runs in one transaction - a bad epic/release
  * ref or a cyclic edge rolls back the entire batch instead of leaving a
  * half-planned graph.
+ *
+ * TTM-68: each createTask call below carries its own plan-append (see
+ * appendToPlanAndRevert), so a batch of several tasks into one planned
+ * release lands every one of them as its own final step, each computing the
+ * next step number fresh off the previous insert - not fighting itself, just
+ * N inserts in a row. The revert side of that hook is a
+ * `WHERE status = 'approved'` UPDATE, so only the first call (if the plan
+ * started approved) actually changes a row; every call after it is a
+ * no-op against an already-draft plan, which is what makes the whole batch
+ * revert once in effect rather than thrash. And because every call happens
+ * inside this function's own transaction, a spec that fails partway (a bad
+ * epic/release ref, a cyclic dependency) rolls the whole thing back -
+ * appended plan items included - so there is no half-appended plan left
+ * behind by a batch that didn't fully land.
  */
 export function createTasks(
   db: DatabaseInstance,

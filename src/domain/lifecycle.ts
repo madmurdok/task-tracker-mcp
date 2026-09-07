@@ -2,7 +2,8 @@ import type { DatabaseInstance } from "../db/connection.js";
 import { requireProject } from "./projects.js";
 import { resolveTaskId } from "./tasks.js";
 import { requireRelease } from "./releases.js";
-import { findUnblockedDependents, hasUnmetDependencies, LOCK_LEASE_MS } from "./status.js";
+import { LOCK_LEASE_MS } from "./status.js";
+import { findUnblockedDependents, hasUnmetDependencies } from "./taskStatus.js";
 import type { CompletionVerifier } from "./verification.js";
 
 /**
@@ -234,8 +235,26 @@ export function completeTask(
   }
 
   const run = db.transaction((): CompleteTaskResult => {
+    // lock_expires_at cleared, owner_session_id deliberately KEPT - the two
+    // columns mean different things and only one of them is untrue here.
+    //
+    // A lease means "may be reclaimed once this passes". On a finished task
+    // there is nothing to reclaim, so leaving it set states something false
+    // that goes on expiring forever. `owner_session_id` is the opposite: on a
+    // done task it is real provenance - which session finished this - and the
+    // dashboard already renders it on the card. So this is not the same write
+    // as cancelTask's, which clears both: a cancelled task has no completion
+    // to attribute.
+    //
+    // Left set, the falsehood was reachable rather than theoretical. Nothing
+    // exploits it today (getNextTask's reclaim branch and board.ts's isStale
+    // both filter `status = 'in_progress'`), but the plan walker in status.ts
+    // is a single pass whose lease check has no status filter of its own - its
+    // explicit done/cancelled skip was the only thing standing between a
+    // lapsed lease on a completed task and that task being handed straight
+    // back out. This restores that skip to belt-and-braces; both stay.
     db.prepare(
-      `UPDATE tasks SET status = 'done', completion_summary = ?, updated_at = ? WHERE id = ?`,
+      `UPDATE tasks SET status = 'done', completion_summary = ?, lock_expires_at = NULL, updated_at = ? WHERE id = ?`,
     ).run(summary ?? null, new Date().toISOString(), taskId);
 
     return { unblocked_task_ids: findUnblockedDependents(db, taskId) };
@@ -429,7 +448,7 @@ export interface CancelTaskResult {
  * releaseTask does (a cancelled task isn't being worked by anyone), and
  * unblocks dependents the same way completeTask does - a cancelled
  * prerequisite is resolved, not stuck, from a dependent's point of view (see
- * hasUnmetDependencies in status.ts). There's no session_id parameter here
+ * hasUnmetDependencies in taskStatus.ts). There's no session_id parameter here
  * (unlike claim/release), so the conflict check is owner-agnostic: any active
  * lock blocks a plain cancel_task call, `force` overrides it regardless of
  * who holds it.

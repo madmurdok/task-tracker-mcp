@@ -737,3 +737,224 @@ describe("openDatabase against a genuinely pre-epics (v1) DB file", () => {
     }
   });
 });
+
+describe("release_plans / release_plan_items (via SCHEMA_SQL)", () => {
+  /**
+   * These two tables are created by SCHEMA_SQL rather than by a
+   * runMigrations entry, and that is the thing worth testing: a *table* that
+   * doesn't exist anywhere yet is created by `CREATE TABLE IF NOT EXISTS` on
+   * an existing database just as much as on a fresh one, so unlike
+   * tasks.priority or tasks.release_id it needs no ensureColumn. Every case
+   * below goes through the real openDatabase(), because that is what execs
+   * SCHEMA_SQL before runMigrations - calling runMigrations() directly, as
+   * most fixtures in this file do, would test nothing here.
+   */
+
+  async function openFresh() {
+    const { openDatabase } = await import("../src/db/connection.js");
+    return openDatabase(":memory:");
+  }
+
+  function tableColumns(db: Database.Database, table: string): string[] {
+    return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+      .map((c) => c.name)
+      .sort();
+  }
+
+  it("creates both tables and the item index on a brand-new DB", async () => {
+    const db = await openFresh();
+
+    expect(tableColumns(db, "release_plans")).toEqual([
+      "approval_note",
+      "approved_at",
+      "approved_by",
+      "created_at",
+      "id",
+      "rationale",
+      "release_id",
+      "status",
+      "updated_at",
+    ]);
+    expect(tableColumns(db, "release_plan_items")).toEqual([
+      "added_at",
+      "note",
+      "plan_id",
+      "position",
+      "step",
+      "task_id",
+    ]);
+
+    const indexes = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'release_plan_items'`)
+      .all() as Array<{ name: string }>;
+    expect(indexes.map((i) => i.name)).toContain("idx_release_plan_items_task_id");
+
+    db.close();
+  });
+
+  it("defaults a plan to draft and rejects a status outside the CHECK", async () => {
+    const db = await openFresh();
+    db.exec(`
+      INSERT INTO projects (id, name, root_path, created_at) VALUES ('p1', 'Demo', '/tmp/demo', 'now');
+      INSERT INTO releases (id, project_id, version, sequence, created_at) VALUES ('r1', 'p1', '1.0.0', 10, 'now');
+      INSERT INTO release_plans (id, release_id, created_at, updated_at) VALUES ('pl1', 'r1', 'now', 'now');
+    `);
+
+    expect(db.prepare(`SELECT status, rationale, approved_at FROM release_plans WHERE id = 'pl1'`).get()).toEqual({
+      status: "draft",
+      rationale: "",
+      approved_at: null,
+    });
+
+    expect(() =>
+      db.exec(`UPDATE release_plans SET status = 'approved' WHERE id = 'pl1'`),
+    ).not.toThrow();
+    expect(() =>
+      db.exec(`UPDATE release_plans SET status = 'superseded' WHERE id = 'pl1'`),
+    ).toThrow(/CHECK constraint failed/);
+
+    db.close();
+  });
+
+  it("allows only one plan per release", async () => {
+    const db = await openFresh();
+    db.exec(`
+      INSERT INTO projects (id, name, root_path, created_at) VALUES ('p1', 'Demo', '/tmp/demo', 'now');
+      INSERT INTO releases (id, project_id, version, sequence, created_at) VALUES ('r1', 'p1', '1.0.0', 10, 'now');
+      INSERT INTO release_plans (id, release_id, created_at, updated_at) VALUES ('pl1', 'r1', 'now', 'now');
+    `);
+
+    expect(() =>
+      db.exec(`INSERT INTO release_plans (id, release_id, created_at, updated_at) VALUES ('pl2', 'r1', 'now', 'now')`),
+    ).toThrow(/UNIQUE constraint failed/);
+
+    db.close();
+  });
+
+  it("cascades: dropping a release takes its plan and items, dropping a task takes only its item", async () => {
+    const db = await openFresh();
+    db.exec(`
+      INSERT INTO projects (id, name, root_path, created_at) VALUES ('p1', 'Demo', '/tmp/demo', 'now');
+      INSERT INTO releases (id, project_id, version, sequence, created_at) VALUES ('r1', 'p1', '1.0.0', 10, 'now');
+      INSERT INTO tasks (id, project_id, title, created_at, updated_at) VALUES ('t1', 'p1', 'A', 'now', 'now');
+      INSERT INTO tasks (id, project_id, title, created_at, updated_at) VALUES ('t2', 'p1', 'B', 'now', 'now');
+      INSERT INTO release_plans (id, release_id, created_at, updated_at) VALUES ('pl1', 'r1', 'now', 'now');
+      INSERT INTO release_plan_items (plan_id, task_id, step, position, added_at) VALUES ('pl1', 't1', 1, 0, 'now');
+      INSERT INTO release_plan_items (plan_id, task_id, step, position, added_at) VALUES ('pl1', 't2', 2, 0, 'now');
+    `);
+
+    db.exec(`DELETE FROM tasks WHERE id = 't1'`);
+    expect(
+      (db.prepare(`SELECT task_id FROM release_plan_items WHERE plan_id = 'pl1'`).all() as Array<{ task_id: string }>)
+        .map((r) => r.task_id),
+    ).toEqual(["t2"]);
+    // The plan itself outlives one of its tasks - a task leaving the batch is
+    // an item's problem, not the plan's.
+    expect(db.prepare(`SELECT COUNT(*) AS cnt FROM release_plans`).get()).toEqual({ cnt: 1 });
+
+    db.exec(`DELETE FROM releases WHERE id = 'r1'`);
+    expect(db.prepare(`SELECT COUNT(*) AS cnt FROM release_plans`).get()).toEqual({ cnt: 0 });
+    expect(db.prepare(`SELECT COUNT(*) AS cnt FROM release_plan_items`).get()).toEqual({ cnt: 0 });
+
+    db.close();
+  });
+
+  it("adds both tables to a real pre-plan DB file without disturbing a single existing row", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "ttmcp-pre-plan-"));
+    const dbPath = path.join(dir, "tracker.db");
+    try {
+      // The shape on disk at 0.6.0: everything the current SCHEMA_SQL has
+      // except the two plan tables.
+      const seed = new Database(dbPath);
+      seed.exec(`
+        CREATE TABLE projects (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, root_path TEXT NOT NULL, code_prefix TEXT,
+          design_doc_path TEXT, design_doc_hash TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE releases (
+          id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          version TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'released', 'cancelled')),
+          sequence INTEGER NOT NULL, release_notes TEXT, released_at TEXT,
+          cancellation_reason TEXT, created_at TEXT NOT NULL
+        );
+        CREATE TABLE tasks (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          epic_id TEXT, release_id TEXT REFERENCES releases(id) ON DELETE SET NULL,
+          title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+          acceptance_criteria TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'done', 'cancelled')),
+          estimated_tokens INTEGER NOT NULL DEFAULT 0, owner_session_id TEXT, lock_expires_at TEXT,
+          complexity_hint TEXT NOT NULL DEFAULT 'normal' CHECK (complexity_hint IN ('normal', 'high')),
+          cancellation_reason TEXT, priority INTEGER NOT NULL DEFAULT 0, task_number INTEGER,
+          completion_summary TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE task_files (
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE, file_path TEXT NOT NULL
+        );
+        CREATE TABLE task_dependencies (
+          task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          depends_on_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          PRIMARY KEY (task_id, depends_on_task_id)
+        );
+        CREATE TABLE handoff_notes (
+          id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          session_id TEXT NOT NULL, decisions TEXT NOT NULL DEFAULT '', remaining_work TEXT NOT NULL DEFAULT '',
+          discoveries TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+        );
+        INSERT INTO projects (id, name, root_path, code_prefix, created_at)
+          VALUES ('p1', 'Demo', '/tmp/demo', 'DEM', 'then');
+        INSERT INTO releases (id, project_id, version, sequence, created_at)
+          VALUES ('r1', 'p1', '0.6.0', 10, 'then');
+        INSERT INTO tasks (id, project_id, release_id, title, status, priority, task_number, created_at, updated_at)
+          VALUES ('t1', 'p1', 'r1', 'Shipped task', 'done', 7, 1, 'then', 'then');
+        INSERT INTO task_files (task_id, file_path) VALUES ('t1', 'src/a.ts');
+      `);
+      const before = {
+        project: seed.prepare(`SELECT * FROM projects WHERE id = 'p1'`).get(),
+        release: seed.prepare(`SELECT * FROM releases WHERE id = 'r1'`).get(),
+        task: seed.prepare(`SELECT * FROM tasks WHERE id = 't1'`).get(),
+        files: seed.prepare(`SELECT * FROM task_files`).all(),
+      };
+      seed.close();
+
+      const { openDatabase } = await import("../src/db/connection.js");
+      let db: import("better-sqlite3").Database | undefined;
+      expect(() => {
+        db = openDatabase(dbPath);
+      }).not.toThrow();
+
+      expect(tableColumns(db!, "release_plans")).toContain("approval_note");
+      expect(tableColumns(db!, "release_plan_items")).toContain("step");
+      expect(db!.prepare(`SELECT COUNT(*) AS cnt FROM release_plans`).get()).toEqual({ cnt: 0 });
+
+      // Not "looks similar" - every column of every seeded row, unchanged.
+      // The release link is the one most at risk: a rebuild with foreign_keys
+      // left on would have quietly SET NULL it (see widenReleaseStatusCheck).
+      expect(db!.prepare(`SELECT * FROM projects WHERE id = 'p1'`).get()).toEqual(before.project);
+      expect(db!.prepare(`SELECT * FROM releases WHERE id = 'r1'`).get()).toEqual(before.release);
+      expect(db!.prepare(`SELECT * FROM tasks WHERE id = 't1'`).get()).toEqual(before.task);
+      expect(db!.prepare(`SELECT * FROM task_files`).all()).toEqual(before.files);
+      db!.close();
+
+      // Second open: the tables are already there, a plan written through the
+      // first open survives, and nothing is recreated under it.
+      const again = openDatabase(dbPath);
+      expect(() =>
+        again.exec(
+          `INSERT INTO release_plans (id, release_id, created_at, updated_at) VALUES ('pl1', 'r1', 'now', 'now')`,
+        ),
+      ).not.toThrow();
+      again.close();
+      const third = openDatabase(dbPath);
+      expect(third.prepare(`SELECT id, status FROM release_plans`).all()).toEqual([
+        { id: "pl1", status: "draft" },
+      ]);
+      expect(third.prepare(`SELECT * FROM tasks WHERE id = 't1'`).get()).toEqual(before.task);
+      third.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

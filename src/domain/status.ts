@@ -1,11 +1,26 @@
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireEpic, listEpics, type Epic } from "./epics.js";
 import { listHandoffNotes, type HandoffNote } from "./handoffNotes.js";
+import {
+  getPlan,
+  listPendingPlans,
+  type PendingPlan,
+  type PlanDrift,
+  type PlanItem,
+  type PlanStatus,
+} from "./plans.js";
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, requireRelease, type Release } from "./releases.js";
+import { displayStatus, hasUnmetDependencies, type DisplayStatus } from "./taskStatus.js";
 import { listTaskFilePaths, requireTask, type Task, withCode, taskCode} from "./tasks.js";
 
-export type DisplayStatus = "pending" | "in_progress" | "blocked" | "done" | "cancelled";
+// Re-exported, not redefined: `DisplayStatus` moved to the taskStatus.ts leaf
+// (see its header for the cycle that put it there), but it is still the type of
+// TaskSummary.status and of listTasks' filter, both exported from here - a
+// consumer of those should not have to learn a second module to name it. Only
+// the type: the three functions have exactly one home, so that a call site
+// never has two paths to the same query.
+export type { DisplayStatus };
 
 export interface TaskSummary {
   id: string;
@@ -29,12 +44,49 @@ export interface ProjectStatus {
   percent: number;
 }
 
+/**
+ * The plan situation of the batch a release-scoped get_next_task was pointed
+ * at. `PlanStatus`'s own two values are the *stored* ones; the two added here
+ * are computed at read time, exactly as plans.ts explains for drift - `none`
+ * because a batch with no plan row is an ordinary answer rather than a failure,
+ * and `drifted` because it is a property of how an approved plan compares to
+ * the batch right now.
+ *
+ * Reported *beside* `reason`, not folded into it, deliberately. `reason` has
+ * always meant "why there is no task", and case 4 of this feature can hand a
+ * task out and still need to say the batch has no plan - one field cannot carry
+ * both facts without changing the meaning every existing caller relies on.
+ */
+export type ReportedPlanStatus = PlanStatus | "drifted" | "none";
+
 type NextTaskOutcome =
   | { task: TaskDetail }
   | { task: null; reason: "all_done" }
-  | { task: null; reason: "all_blocked"; blocked_on: string[] };
+  | { task: null; reason: "all_blocked"; blocked_on: string[] }
+  /**
+   * A batch was named, but its plan is a draft or has drifted, so there is no
+   * approved order to work it in. `drift` names the disagreeing tasks whenever
+   * there is one, because the only useful response to this refusal is fixing
+   * the plan - by uuid, matching plans.ts's convention for these two lists.
+   */
+  | { task: null; reason: "plan_not_approved"; drift?: PlanDrift };
 
-export type GetNextTaskResult = NextTaskOutcome & { doc_drift: boolean };
+export type GetNextTaskResult = NextTaskOutcome & {
+  doc_drift: boolean;
+  /**
+   * Unscoped calls only, and absent (not `[]`) when there is nothing to report,
+   * following this project's "absent is not zero" habit - which is also what
+   * keeps the answer byte-identical for every project that has no plans.
+   * See plans.ts's `listPendingPlans` for why an unscoped call reports these
+   * rather than refusing.
+   */
+  plan_pending?: PendingPlan[];
+  /**
+   * Release-scoped calls only. Absent on an unscoped one, where there is no
+   * single batch whose plan the answer could be describing.
+   */
+  plan_status?: ReportedPlanStatus;
+};
 
 export interface TaskDetail extends Task {
   /** How a person refers to this task: `TTM-63`. See tasks.ts's `withCodes`. */
@@ -72,48 +124,6 @@ function withLease(nowIso: string): string {
   return new Date(Date.parse(nowIso) + LOCK_LEASE_MS).toISOString();
 }
 
-/**
- * `status = blocked` is never stored (see schema) - it's computed here from unmet
- * dependencies at query time, so it can't drift out of sync with the graph.
- */
-export function hasUnmetDependencies(db: DatabaseInstance, taskId: string): boolean {
-  const row = db
-    .prepare(
-      `SELECT COUNT(*) AS cnt
-       FROM task_dependencies td
-       JOIN tasks t ON t.id = td.depends_on_task_id
-       WHERE td.task_id = ? AND t.status NOT IN ('done', 'cancelled')`,
-    )
-    .get(taskId) as { cnt: number };
-  return row.cnt > 0;
-}
-
-/**
- * Dependents of `taskId` that just became unblocked because it's no longer
- * pending work - shared by completeTask and cancelTask (lifecycle.ts), since
- * resolving a task (whether by finishing it or abandoning it) unblocks its
- * dependents the same way.
- */
-export function findUnblockedDependents(db: DatabaseInstance, taskId: string): string[] {
-  const dependents = db
-    .prepare(`SELECT DISTINCT task_id FROM task_dependencies WHERE depends_on_task_id = ?`)
-    .all(taskId) as Array<{ task_id: string }>;
-
-  return dependents
-    .filter((dep) => {
-      const dependentTask = db
-        .prepare(`SELECT status FROM tasks WHERE id = ?`)
-        .get(dep.task_id) as { status: string } | undefined;
-      return dependentTask?.status === "pending" && !hasUnmetDependencies(db, dep.task_id);
-    })
-    .map((dep) => dep.task_id);
-}
-
-export function displayStatus(db: DatabaseInstance, task: Pick<Task, "id" | "status">): DisplayStatus {
-  if (task.status !== "pending") return task.status;
-  return hasUnmetDependencies(db, task.id) ? "blocked" : "pending";
-}
-
 function handOut(
   db: DatabaseInstance,
   candidate: Task,
@@ -127,55 +137,224 @@ function handOut(
   return { task: getTaskDetail(db, candidate.id) };
 }
 
-export function getNextTask(db: DatabaseInstance, projectRef: string): GetNextTaskResult {
-  const project = requireProject(db, projectRef);
+/**
+ * Which pool a hand-out draws from: the whole project (an unscoped call - what
+ * every session has always got) or the one release batch it was pointed at.
+ *
+ * `column` is interpolated into the SQL below rather than bound, which is safe
+ * *because* it is a union of two literals written here - no caller-supplied
+ * string ever reaches it. Binding is impossible for a column name anyway, and
+ * the alternative (two near-identical copies of every statement) is exactly the
+ * duplication that lets the scoped path drift away from the unscoped one.
+ */
+interface HandOutScope {
+  column: "project_id" | "release_id";
+  id: string;
+}
 
-  const select = db.transaction((): NextTaskOutcome => {
-    const projectId = project.id;
-    const nowIso = new Date().toISOString();
+/**
+ * The answer when nothing could be handed out: all_done only when the pool
+ * holds no unfinished work at all, otherwise all_blocked naming the pending
+ * tasks that were passed over. Shared by both selection strategies so the two
+ * cannot disagree about what an exhausted pool is called.
+ */
+function exhausted(db: DatabaseInstance, scope: HandOutScope, skipped: Task[]): NextTaskOutcome {
+  const remaining = db
+    .prepare(
+      `SELECT COUNT(*) AS cnt FROM tasks WHERE ${scope.column} = ? AND status NOT IN ('done', 'cancelled')`,
+    )
+    .get(scope.id) as { cnt: number };
 
-    const pendingTasks = db
-      .prepare(
-        `SELECT * FROM tasks WHERE project_id = ? AND status = 'pending' ORDER BY priority DESC, created_at ASC`,
-      )
-      .all(projectId) as Task[];
+  if (remaining.cnt === 0) {
+    return { task: null, reason: "all_done" };
+  }
 
-    for (const candidate of pendingTasks) {
-      if (!hasUnmetDependencies(db, candidate.id)) {
-        return handOut(db, candidate, nowIso, candidate.owner_session_id);
+  return { task: null, reason: "all_blocked", blocked_on: skipped.map((t) => t.id) };
+}
+
+/**
+ * Priority order: highest priority first, oldest first among equals, then the
+ * stale-lock reclaim pass.
+ *
+ * Parameterised by scope rather than copied, so the release-scoped fallback for
+ * a batch with no plan (case 4) runs the *same* algorithm as the unscoped call
+ * instead of a lookalike that can drift away from it. The unscoped call passes
+ * project_id and gets behaviour identical to what it always had - the contract
+ * every session in this project depends on.
+ */
+function pickByPriority(db: DatabaseInstance, scope: HandOutScope, nowIso: string): NextTaskOutcome {
+  const pendingTasks = db
+    .prepare(
+      `SELECT * FROM tasks WHERE ${scope.column} = ? AND status = 'pending' ORDER BY priority DESC, created_at ASC`,
+    )
+    .all(scope.id) as Task[];
+
+  for (const candidate of pendingTasks) {
+    if (!hasUnmetDependencies(db, candidate.id)) {
+      return handOut(db, candidate, nowIso, candidate.owner_session_id);
+    }
+  }
+
+  // No fresh pending work - see if an in_progress task's lock has expired
+  // (its session died or never completed) and can be automatically reclaimed.
+  const reclaimable = db
+    .prepare(
+      `SELECT * FROM tasks
+       WHERE ${scope.column} = ? AND status = 'in_progress'
+         AND lock_expires_at IS NOT NULL AND lock_expires_at < ?
+       ORDER BY lock_expires_at ASC
+       LIMIT 1`,
+    )
+    .get(scope.id, nowIso) as Task | undefined;
+
+  if (reclaimable) {
+    return handOut(db, reclaimable, nowIso, null);
+  }
+
+  return exhausted(db, scope, pendingTasks);
+}
+
+/**
+ * The approved plan's own order - step then position, exactly as `getPlan`
+ * returns it - instead of priority. Priority is a standing guess about what
+ * matters most; an approved plan is a decision a person made about this batch,
+ * and the point of pointing get_next_task at a batch is that the decision wins.
+ *
+ * The two candidate shapes mirror `pickByPriority`'s two branches one for one -
+ * a pending task, or an in_progress one whose lease has lapsed and is therefore
+ * reclaimable - so following a plan changes *which* task is handed out and
+ * never the ownership semantics of handing it out. It does reorder the two
+ * branches against each other: a reclaimable step-1 task now beats a fresh
+ * pending step-2 one, where the unscoped path drains all pending work before
+ * reclaiming anything. That is the plan being followed, not an oversight - the
+ * plan says step 1 comes first, and a dead session's abandoned task is still
+ * step 1's work.
+ *
+ * A task in the batch but absent from the plan is not a candidate and is not
+ * looked for here: that set being non-empty *is* drift, so the caller has
+ * already refused before reaching this function.
+ */
+function pickByPlan(
+  db: DatabaseInstance,
+  scope: HandOutScope,
+  items: PlanItem[],
+  nowIso: string,
+): NextTaskOutcome {
+  // Only the ones actually passed over as blocked, so an exhausted plan reports
+  // the same blocked_on a priority-ordered pass would have: every task it saw
+  // still pending and still waiting on something.
+  const blocked: Task[] = [];
+
+  for (const item of items) {
+    // getPlan JOINs items to tasks, and the item row cascades on task delete,
+    // so this row always exists; the guard narrows the type rather than
+    // handling a case that can occur.
+    const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(item.task_id) as Task | undefined;
+    if (!task) continue;
+
+    if (task.status === "done" || task.status === "cancelled") continue;
+
+    if (task.status === "pending") {
+      if (hasUnmetDependencies(db, task.id)) {
+        blocked.push(task);
+        continue;
       }
+      return handOut(db, task, nowIso, task.owner_session_id);
     }
 
-    // No fresh pending work - see if an in_progress task's lock has expired
-    // (its session died or never completed) and can be automatically reclaimed.
-    const reclaimable = db
-      .prepare(
-        `SELECT * FROM tasks
-         WHERE project_id = ? AND status = 'in_progress'
-           AND lock_expires_at IS NOT NULL AND lock_expires_at < ?
-         ORDER BY lock_expires_at ASC
-         LIMIT 1`,
-      )
-      .get(projectId, nowIso) as Task | undefined;
-
-    if (reclaimable) {
-      return handOut(db, reclaimable, nowIso, null);
+    // in_progress: someone holds it. Reclaimable only once the lease it was
+    // handed out under has lapsed - the same predicate as pickByPriority's
+    // reclaim branch, `IS NOT NULL` included, because an in_progress task with
+    // no lease was never handed out by this path and is not this path's to take
+    // back. String comparison, not Date parsing: these are all
+    // `toISOString()` output, fixed-width UTC, so lexicographic order is
+    // chronological order - the same assumption the SQL above already makes.
+    if (task.lock_expires_at !== null && task.lock_expires_at < nowIso) {
+      return handOut(db, task, nowIso, null);
     }
+  }
 
-    const remaining = db
-      .prepare(
-        `SELECT COUNT(*) AS cnt FROM tasks WHERE project_id = ? AND status NOT IN ('done', 'cancelled')`,
-      )
-      .get(projectId) as { cnt: number };
+  return exhausted(db, scope, blocked);
+}
 
-    if (remaining.cnt === 0) {
-      return { task: null, reason: "all_done" };
-    }
+/**
+ * Hands out the next task to work, marking it in_progress under a fresh lease.
+ *
+ * Unscoped (no `releaseRef`) it behaves as it always has: project-wide,
+ * priority order, the stale-lock reclaim, all_done/all_blocked. It gains one
+ * reported field, `plan_pending`, so that handing out a task from a batch whose
+ * plan nobody approved is visible in the answer rather than silent.
+ *
+ * Given a `releaseRef` it works one batch, and the batch's plan decides how:
+ * an approved plan is followed in its own order; a draft or drifted plan
+ * refuses outright, which is the whole point of a plan being approved at all;
+ * and a batch with no plan falls back to priority order within the batch. That
+ * last case is deliberately not treated as an implicit plan - a batch nobody
+ * has ordered yet still has to be workable, or writing the plan would be
+ * impossible without first refusing all work on the tasks it orders.
+ */
+export function getNextTask(
+  db: DatabaseInstance,
+  projectRef: string,
+  releaseRef?: string,
+): GetNextTaskResult {
+  const project = requireProject(db, projectRef);
+  // `requireRelease`, not `requireAssignableRelease`: an unknown batch is the
+  // caller's mistake and should throw the same "Unknown release" every other
+  // tool throws, whereas whether a shipped or cancelled batch may still hand
+  // work out is a separate question this change deliberately leaves alone -
+  // release_id here scopes the same hand-out, it does not add a new gate.
+  const release = releaseRef === undefined ? null : requireRelease(db, project.id, releaseRef);
+  const doc_drift = isDocDrifted(project);
+  const nowIso = new Date().toISOString();
 
-    return { task: null, reason: "all_blocked", blocked_on: pendingTasks.map((t) => t.id) };
-  });
+  if (release === null) {
+    const outcome = db.transaction(() =>
+      pickByPriority(db, { column: "project_id", id: project.id }, nowIso),
+    )();
+    const planPending = listPendingPlans(db, project.id);
+    return {
+      ...outcome,
+      doc_drift,
+      ...(planPending.length > 0 ? { plan_pending: planPending } : {}),
+    };
+  }
 
-  return { ...select(), doc_drift: isDocDrifted(project) };
+  const scope: HandOutScope = { column: "release_id", id: release.id };
+  const plan = getPlan(db, project.id, release.id);
+
+  if (!plan) {
+    return { ...db.transaction(() => pickByPriority(db, scope, nowIso))(), doc_drift, plan_status: "none" };
+  }
+
+  const drift: PlanDrift = {
+    unplanned_task_ids: plan.unplanned_task_ids,
+    orphaned_task_ids: plan.orphaned_task_ids,
+  };
+  const drifted = drift.unplanned_task_ids.length > 0 || drift.orphaned_task_ids.length > 0;
+
+  if (plan.status !== "approved" || drifted) {
+    // The enforced half. A draft plan was never signed off; an approved one
+    // that has drifted was signed off on a batch that has since changed. Either
+    // way, handing work out would be handing out work whose order nobody
+    // agreed - so nothing is handed out, and no transaction is needed because
+    // nothing is written. `plan_status` reports the plan's *own* state, which
+    // is why a drifted draft still reads `draft`: the approval is the first
+    // thing missing, and drift is reported alongside it either way.
+    return {
+      task: null,
+      reason: "plan_not_approved",
+      doc_drift,
+      plan_status: plan.status === "approved" ? "drifted" : "draft",
+      ...(drifted ? { drift } : {}),
+    };
+  }
+
+  return {
+    ...db.transaction(() => pickByPlan(db, scope, plan.items, nowIso))(),
+    doc_drift,
+    plan_status: "approved",
+  };
 }
 
 export function listTasks(
