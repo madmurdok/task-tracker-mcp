@@ -122,14 +122,27 @@ export function requireRelease(db: DatabaseInstance, projectId: string, ref: str
  * it's a terminal record of work that was abandoned, so adding fresh work to
  * it would say something untrue about that work. Note the asymmetry this
  * creates against setTaskRelease's outbound check, explained there.
+ *
+ * `action` names what the caller was trying to do, because this guard is no
+ * longer only about task assignment: writing and approving a release plan
+ * (plans.ts) go through it for the same "a finished batch is a frozen record"
+ * reason. Defaulted rather than required so the task-assignment callers read
+ * as they always did, and worth passing because "cannot assign new tasks to
+ * it" is actively misleading in answer to an approve_plan call - it sends
+ * someone looking for a task they never touched.
  */
-export function requireAssignableRelease(db: DatabaseInstance, projectId: string, ref: string): Release {
+export function requireAssignableRelease(
+  db: DatabaseInstance,
+  projectId: string,
+  ref: string,
+  action = "assign new tasks to it",
+): Release {
   const release = requireRelease(db, projectId, ref);
   if (release.status === "released") {
-    throw new Error(`Release ${ref} is already released; cannot assign new tasks to it`);
+    throw new Error(`Release ${ref} is already released; cannot ${action}`);
   }
   if (release.status === "cancelled") {
-    throw new Error(`Release ${ref} is cancelled; cannot assign new tasks to it`);
+    throw new Error(`Release ${ref} is cancelled; cannot ${action}`);
   }
   return release;
 }

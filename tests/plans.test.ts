@@ -187,7 +187,7 @@ describe("upsertPlan", () => {
     markReleased(db, release.id);
 
     expect(() => upsertPlan(db, project.id, release.version, { steps: [task.id] })).toThrow(
-      /already released/,
+      /already released; cannot write a plan for it/,
     );
   });
 
@@ -197,7 +197,7 @@ describe("upsertPlan", () => {
     markCancelled(db, release.id);
 
     expect(() => upsertPlan(db, project.id, release.version, { steps: [task.id] })).toThrow(
-      /is cancelled/,
+      /is cancelled; cannot write a plan for it/,
     );
   });
 
@@ -515,9 +515,9 @@ describe("approvePlan", () => {
 
     expect(() =>
       approvePlan(db, project.id, release.version, { approved_by: "valentin" }),
-    ).toThrow(/already released/);
+    ).toThrow(/already released; cannot approve its plan/);
     expect(() => approvePlan(db, project.id, other.version, { approved_by: "valentin" })).toThrow(
-      /is cancelled/,
+      /is cancelled; cannot approve its plan/,
     );
   });
 

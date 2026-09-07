@@ -344,7 +344,7 @@ export function upsertPlan(
   input: UpsertPlanInput,
 ): ReleasePlan {
   const project = requireProject(db, projectRef);
-  const release = requireAssignableRelease(db, project.id, releaseRef);
+  const release = requireAssignableRelease(db, project.id, releaseRef, "write a plan for it");
 
   const run = db.transaction((): ReleasePlan => {
     const items = resolveSteps(db, release.id, releaseRef, input.steps);
@@ -463,7 +463,7 @@ export function approvePlan(
   input: ApprovePlanInput,
 ): ReleasePlan {
   const project = requireProject(db, projectRef);
-  const release = requireAssignableRelease(db, project.id, releaseRef);
+  const release = requireAssignableRelease(db, project.id, releaseRef, "approve its plan");
 
   if (input.approved_by.trim() === "") {
     throw new Error("approve_plan requires approved_by: an approval with no approver records nothing");
