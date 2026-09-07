@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { openDatabase } from "../src/db/connection.js";
+import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import { createProject } from "../src/domain/projects.js";
 import { createTask } from "../src/domain/tasks.js";
 import { addDependency } from "../src/domain/dependencies.js";
+import { approvePlan, upsertPlan } from "../src/domain/plans.js";
+import { createRelease } from "../src/domain/releases.js";
 import { getNextTask, getProjectStatus, getTaskDetail, listTasks } from "../src/domain/status.js";
 import { addHandoffNote } from "../src/domain/handoffNotes.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
@@ -15,6 +17,82 @@ function setup() {
   const makeTask = (title: string) =>
     createTask(db, noopEstimator, { project_id: project.id, title, complexity_hint: "normal" }).task;
   return { db, project, makeTask };
+}
+
+/** A project with one release batch, and a task-maker that files tasks into it. */
+function setupBatch() {
+  const db = openDatabase(":memory:");
+  const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+  const release = createRelease(db, { project_id: project.id, version: "0.1" });
+  const makeTask = (title: string, priority?: number) =>
+    createTask(db, noopEstimator, {
+      project_id: project.id,
+      release_id: release.id,
+      title,
+      complexity_hint: "normal",
+      priority,
+    }).task;
+  // Backlog task: in the project, outside the batch. Present so a scoped pick
+  // can be shown to ignore work it should not see.
+  const makeBacklogTask = (title: string, priority?: number) =>
+    createTask(db, noopEstimator, { project_id: project.id, title, complexity_hint: "normal", priority })
+      .task;
+  return { db, project, release, makeTask, makeBacklogTask };
+}
+
+/**
+ * The *stored* status, so a test can show a task was left alone rather than
+ * trusting that the call which refused to hand it out also refrained from
+ * writing to it.
+ */
+function storedTask(db: DatabaseInstance, taskId: string): { status: string; owner_session_id: string | null } {
+  return db.prepare(`SELECT status, owner_session_id FROM tasks WHERE id = ?`).get(taskId) as {
+    status: string;
+    owner_session_id: string | null;
+  };
+}
+
+/**
+ * Task state written directly, matching plans.test.ts's markReleased helper and
+ * for the same reason: these put a task into a given state so the *pick* rules
+ * can be tested, and shouldn't also depend on completeTask's verifier or on
+ * which writes do or do not revert a plan's approval.
+ */
+function markStatus(db: DatabaseInstance, taskId: string, status: string): void {
+  db.prepare(`UPDATE tasks SET status = ? WHERE id = ?`).run(status, taskId);
+}
+
+function moveToRelease(db: DatabaseInstance, taskId: string, releaseId: string | null): void {
+  db.prepare(`UPDATE tasks SET release_id = ? WHERE id = ?`).run(releaseId, taskId);
+}
+
+function expireLease(db: DatabaseInstance, taskId: string): void {
+  db.prepare(`UPDATE tasks SET lock_expires_at = ? WHERE id = ?`).run(
+    new Date(Date.now() - 1000).toISOString(),
+    taskId,
+  );
+}
+
+/**
+ * A batch whose plan order and priority order disagree *by construction*: the
+ * plan's first step holds the lowest-priority task in the batch and its last
+ * step holds the highest. Without that, a plan-ordered pick and a
+ * priority-ordered pick would return the same task and a passing test would
+ * prove nothing about which order was followed.
+ *
+ * A function rather than shared state because each arm of that comparison hands
+ * a task out, which writes to the database.
+ */
+function planContradictingPriority() {
+  const { db, project, release, makeTask } = setupBatch();
+  const low = makeTask("first in the plan, lowest priority", 1);
+  const high = makeTask("last in the plan, highest priority", 99);
+  upsertPlan(db, project.id, release.version, {
+    steps: [low.id, high.id],
+    rationale: "the low-priority task unblocks the high-priority one",
+  });
+  approvePlan(db, project.id, release.version, { approved_by: "owner" });
+  return { db, project, release, low, high };
 }
 
 describe("getNextTask", () => {
@@ -131,6 +209,301 @@ describe("getNextTask", () => {
       .prepare(`SELECT lock_expires_at FROM tasks WHERE id = ?`)
       .get(a.id) as { lock_expires_at: string };
     expect(new Date(row.lock_expires_at).getTime()).toBeGreaterThan(Date.now());
+  });
+});
+
+describe("getNextTask scoped to a release batch with an approved plan", () => {
+  it("follows the plan's order even where priority disagrees, which an unscoped call does not", () => {
+    const planned = planContradictingPriority();
+
+    const scoped = getNextTask(planned.db, planned.project.id, planned.release.version);
+
+    expect(scoped.task?.id).toBe(planned.low.id);
+    expect(scoped.plan_status).toBe("approved");
+
+    // The control arm, on an identical fixture: unscoped, the same two tasks
+    // come out in the *other* order. Without this the assertion above could
+    // pass on a build that ignores plans entirely.
+    const control = planContradictingPriority();
+    const unscoped = getNextTask(control.db, control.project.id);
+
+    expect(unscoped.task?.id).toBe(control.high.id);
+    // An unscoped answer describes no single batch, so it reports no plan state.
+    expect("plan_status" in unscoped).toBe(false);
+  });
+
+  it("walks the plan step by step across consecutive calls", () => {
+    const { db, project, release, low, high } = planContradictingPriority();
+
+    expect(getNextTask(db, project.id, release.version).task?.id).toBe(low.id);
+    expect(getNextTask(db, project.id, release.version).task?.id).toBe(high.id);
+  });
+
+  it("accepts the batch by version or by id", () => {
+    const byVersion = planContradictingPriority();
+    expect(getNextTask(byVersion.db, byVersion.project.id, byVersion.release.version).task?.id).toBe(
+      byVersion.low.id,
+    );
+
+    const byId = planContradictingPriority();
+    expect(getNextTask(byId.db, byId.project.id, byId.release.id).task?.id).toBe(byId.low.id);
+  });
+
+  it("rejects an unknown release ref", () => {
+    const { db, project } = setupBatch();
+    expect(() => getNextTask(db, project.id, "9.9")).toThrow(/Unknown release: 9\.9/);
+  });
+
+  it("skips a done and a cancelled plan item and hands out the next one", () => {
+    const { db, project, release, makeTask } = setupBatch();
+    const first = makeTask("first");
+    const second = makeTask("second");
+    const third = makeTask("third");
+    upsertPlan(db, project.id, release.version, { steps: [first.id, second.id, third.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+
+    // The two rows are built to the exact shape each lifecycle path leaves
+    // behind, because that is what makes this test able to fail at all.
+    // complete_task's UPDATE (lifecycle.ts) names neither owner_session_id nor
+    // lock_expires_at, so a finished task still carries the lease it was handed
+    // out under - and once that lease lapses, the done/cancelled skip is the
+    // only thing between the plan and handing a completed task straight back
+    // out. cancel_task does clear the lease, so that arm is the NULL-lease
+    // shape; between them the two cover both.
+    expect(getNextTask(db, project.id, release.version).task?.id).toBe(first.id);
+    markStatus(db, first.id, "done");
+    expireLease(db, first.id);
+    markStatus(db, second.id, "cancelled");
+
+    const result = getNextTask(db, project.id, release.version);
+
+    expect(result.task?.id).toBe(third.id);
+    // Neither of the two was touched on the way past.
+    expect(storedTask(db, first.id).status).toBe("done");
+    expect(storedTask(db, second.id).status).toBe("cancelled");
+  });
+
+  it("skips a plan item with an unmet dependency rather than handing it out", () => {
+    const { db, project, release, makeTask } = setupBatch();
+    const blocked = makeTask("needs the other one first");
+    const prerequisite = makeTask("the prerequisite");
+    addDependency(db, blocked.id, prerequisite.id);
+    // The plan puts the blocked task first on purpose: the dependency gate has
+    // to override the plan's own order, not just priority's.
+    upsertPlan(db, project.id, release.version, { steps: [blocked.id, prerequisite.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+
+    const result = getNextTask(db, project.id, release.version);
+
+    expect(result.task?.id).toBe(prerequisite.id);
+    expect(storedTask(db, blocked.id).status).toBe("pending");
+  });
+
+  it("skips a plan item held under a live lease and reclaims one whose lease has lapsed", () => {
+    const { db, project, release, makeTask } = setupBatch();
+    const first = makeTask("first");
+    const second = makeTask("second");
+    upsertPlan(db, project.id, release.version, { steps: [first.id, second.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+
+    expect(getNextTask(db, project.id, release.version).task?.id).toBe(first.id);
+    // first is in_progress under a live lease, so the plan moves past it.
+    expect(getNextTask(db, project.id, release.version).task?.id).toBe(second.id);
+
+    db.prepare(`UPDATE tasks SET owner_session_id = ? WHERE id = ?`).run("dead-session", first.id);
+    expireLease(db, first.id);
+
+    // Back to step 1: a dead session's abandoned task is still step 1's work,
+    // and reclaiming clears the owner exactly as the unscoped reclaim does.
+    const reclaimed = getNextTask(db, project.id, release.version);
+    expect(reclaimed.task?.id).toBe(first.id);
+    expect(reclaimed.task?.owner_session_id).toBeNull();
+  });
+
+  it("reports all_blocked over the batch alone, ignoring unblocked work outside it", () => {
+    const { db, project, release, makeTask, makeBacklogTask } = setupBatch();
+    const prerequisite = makeBacklogTask("prerequisite, outside the batch");
+    const blocked = makeTask("the batch's only task");
+    addDependency(db, blocked.id, prerequisite.id);
+    upsertPlan(db, project.id, release.version, { steps: [blocked.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+
+    const result = getNextTask(db, project.id, release.version);
+
+    expect(result.task).toBeNull();
+    if (result.task === null) {
+      expect(result.reason).toBe("all_blocked");
+      if (result.reason === "all_blocked") {
+        expect(result.blocked_on).toEqual([blocked.id]);
+      }
+    }
+    // The prerequisite is pending and unblocked, and an unscoped call would
+    // have handed it out - being outside the batch is the only reason it wasn't.
+    expect(storedTask(db, prerequisite.id).status).toBe("pending");
+  });
+
+  it("reports all_done once the batch is finished, whatever is left elsewhere", () => {
+    const { db, project, release, makeTask, makeBacklogTask } = setupBatch();
+    makeBacklogTask("still pending, outside the batch");
+    const only = makeTask("the batch's only task");
+    upsertPlan(db, project.id, release.version, { steps: [only.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+    markStatus(db, only.id, "done");
+
+    const result = getNextTask(db, project.id, release.version);
+
+    expect(result.task).toBeNull();
+    if (result.task === null) {
+      expect(result.reason).toBe("all_done");
+    }
+  });
+});
+
+describe("getNextTask refusing a batch whose plan is not approved", () => {
+  it("refuses a draft plan without touching the tasks it orders", () => {
+    const { db, project, release, makeTask } = setupBatch();
+    const first = makeTask("first");
+    upsertPlan(db, project.id, release.version, { steps: [first.id] });
+
+    const result = getNextTask(db, project.id, release.version);
+
+    expect(result.task).toBeNull();
+    if (result.task === null) {
+      expect(result.reason).toBe("plan_not_approved");
+    }
+    expect(result.plan_status).toBe("draft");
+    expect(storedTask(db, first.id)).toEqual({ status: "pending", owner_session_id: null });
+  });
+
+  it("refuses an approved plan that no longer covers the batch, naming the drift", () => {
+    const { db, project, release, makeTask, makeBacklogTask } = setupBatch();
+    const planned = makeTask("in the plan");
+    upsertPlan(db, project.id, release.version, { steps: [planned.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+
+    // Moved in with a direct write, not setTaskRelease: what this test needs is
+    // the state "approved plan, batch has since grown", stated outright rather
+    // than produced as a side effect of whichever writes revert an approval.
+    const latecomer = makeBacklogTask("added to the batch after approval");
+    moveToRelease(db, latecomer.id, release.id);
+
+    const result = getNextTask(db, project.id, release.version);
+
+    expect(result.task).toBeNull();
+    if (result.task === null) {
+      expect(result.reason).toBe("plan_not_approved");
+      if (result.reason === "plan_not_approved") {
+        expect(result.drift?.unplanned_task_ids).toEqual([latecomer.id]);
+        expect(result.drift?.orphaned_task_ids).toEqual([]);
+      }
+    }
+    expect(result.plan_status).toBe("drifted");
+    expect(storedTask(db, planned.id).status).toBe("pending");
+  });
+
+  it("refuses an approved plan holding an item that left the batch", () => {
+    const { db, project, release, makeTask } = setupBatch();
+    const staying = makeTask("staying");
+    const leaving = makeTask("leaving");
+    upsertPlan(db, project.id, release.version, { steps: [staying.id, leaving.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+
+    moveToRelease(db, leaving.id, null);
+
+    const result = getNextTask(db, project.id, release.version);
+
+    expect(result.task).toBeNull();
+    if (result.task === null) {
+      expect(result.reason).toBe("plan_not_approved");
+      if (result.reason === "plan_not_approved") {
+        expect(result.drift?.orphaned_task_ids).toEqual([leaving.id]);
+      }
+    }
+    expect(result.plan_status).toBe("drifted");
+  });
+});
+
+describe("getNextTask scoped to a batch with no plan", () => {
+  it("falls back to priority order within the batch and says no plan exists", () => {
+    const { db, project, release, makeTask, makeBacklogTask } = setupBatch();
+    makeBacklogTask("highest priority of all, but outside the batch", 999);
+    makeTask("low priority, in the batch", 1);
+    const high = makeTask("high priority, in the batch", 99);
+
+    const result = getNextTask(db, project.id, release.version);
+
+    expect(result.task?.id).toBe(high.id);
+    expect(result.plan_status).toBe("none");
+  });
+
+  it("reclaims a stale lock within the batch, as the unscoped path does", () => {
+    const { db, project, release, makeTask } = setupBatch();
+    const only = makeTask("the batch's only task");
+
+    getNextTask(db, project.id, release.version);
+    db.prepare(`UPDATE tasks SET owner_session_id = ? WHERE id = ?`).run("stale-session", only.id);
+    expireLease(db, only.id);
+
+    const reclaimed = getNextTask(db, project.id, release.version);
+
+    expect(reclaimed.task?.id).toBe(only.id);
+    expect(reclaimed.task?.owner_session_id).toBeNull();
+    expect(reclaimed.plan_status).toBe("none");
+  });
+});
+
+describe("getNextTask's plan_pending on an unscoped call", () => {
+  it("names a batch whose plan is still a draft, while still handing work out", () => {
+    const { db, project, release, makeTask } = setupBatch();
+    const first = makeTask("first");
+    upsertPlan(db, project.id, release.version, { steps: [first.id] });
+
+    const result = getNextTask(db, project.id);
+
+    // Still handed out: an unscoped call is allowed to bypass a plan, it just
+    // may not do so silently.
+    expect(result.task?.id).toBe(first.id);
+    expect(result.plan_pending).toEqual([
+      { release_id: release.id, version: "0.1", plan_status: "draft" },
+    ]);
+  });
+
+  it("names a batch whose approved plan has drifted", () => {
+    const { db, project, release, makeTask, makeBacklogTask } = setupBatch();
+    const planned = makeTask("in the plan");
+    upsertPlan(db, project.id, release.version, { steps: [planned.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+    const latecomer = makeBacklogTask("added after approval");
+    moveToRelease(db, latecomer.id, release.id);
+
+    const result = getNextTask(db, project.id);
+
+    expect(result.plan_pending).toEqual([
+      { release_id: release.id, version: "0.1", plan_status: "drifted" },
+    ]);
+  });
+
+  it("is absent, not empty, when there is nothing to report", () => {
+    // No plan anywhere: the answer must be exactly what it always was.
+    const plain = setup();
+    plain.makeTask("A");
+    expect("plan_pending" in getNextTask(plain.db, plain.project.id)).toBe(false);
+
+    // An approved, undrifted plan is not pending - there is no bypass to warn
+    // about, so the key stays absent rather than arriving as [].
+    const approved = planContradictingPriority();
+    expect("plan_pending" in getNextTask(approved.db, approved.project.id)).toBe(false);
+  });
+
+  it("stays quiet about a batch there is no longer any work to bypass", () => {
+    const { db, project, release, makeTask } = setupBatch();
+    const only = makeTask("the batch's only task");
+    upsertPlan(db, project.id, release.version, { steps: [only.id] });
+    markStatus(db, only.id, "done");
+
+    // A draft plan over a finished batch is a warning nobody can act on, and it
+    // would otherwise be repeated on every get_next_task call for ever.
+    expect("plan_pending" in getNextTask(db, project.id)).toBe(false);
   });
 });
 

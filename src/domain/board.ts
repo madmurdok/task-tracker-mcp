@@ -3,7 +3,7 @@ import { listEpics } from "./epics.js";
 import { getPlan, type PlanStatus } from "./plans.js";
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, type ReleaseStatus } from "./releases.js";
-import { displayStatus, type DisplayStatus } from "./status.js";
+import { displayStatus, type DisplayStatus } from "./taskStatus.js";
 import type { Task } from "./tasks.js";
 
 export interface BoardTask {

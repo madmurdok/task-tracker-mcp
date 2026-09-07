@@ -3,7 +3,7 @@ import type { DatabaseInstance } from "../db/connection.js";
 import { withdrawPlanApproval } from "./planWrites.js";
 import { requireProject } from "./projects.js";
 import { requireAssignableRelease, requireRelease } from "./releases.js";
-import { displayStatus, type DisplayStatus } from "./status.js";
+import { displayStatus, type DisplayStatus } from "./taskStatus.js";
 import { requireTask, runOne, taskCode, type TaskStatus } from "./tasks.js";
 
 /**
@@ -12,13 +12,17 @@ import { requireTask, runOne, taskCode, type TaskStatus } from "./tasks.js";
  * stopping every two or three tasks to re-earn approval.
  *
  * IMPORT DIRECTION - read before adding an import *to* this module.
- * plans.ts depends on projects.ts, releases.ts, status.ts and tasks.ts; none of
- * them depends on plans.ts, which is what keeps the graph acyclic. The two
- * follow-up tasks both want to call into here from a module this one already
- * imports (the createTask/setTaskRelease revert hooks, and get_next_task's
- * plan-order scoping), so both would close a cycle. releases.ts already faced
- * exactly this and hand-rolled `requireTaskProjectAndRelease` rather than
- * import `requireTask` back from tasks.ts; the same escape applies here -
+ * plans.ts depends on projects.ts, releases.ts, taskStatus.ts and tasks.ts;
+ * none of them depends on plans.ts, which is what keeps the graph acyclic.
+ * status.ts now does depend on plans.ts, and only in that direction:
+ * get_next_task has to follow an approved plan, and the only thing this module
+ * ever wanted from status.ts was `displayStatus`, so that primitive (with
+ * `hasUnmetDependencies` and `findUnblockedDependents`, which are the same
+ * dependency-graph derivation) moved down into the taskStatus.ts leaf that both
+ * modules now import. That resolved the cycle by extracting the shared layer
+ * rather than by duplicating a query - see taskStatus.ts's own header.
+ * The revert hooks (createTask/setTaskRelease) have no such route, since they
+ * live in modules this one imports and need no shared primitive: for them
  * `revertPlanToDraft` is deliberately a single self-contained UPDATE with no
  * cross-module calls, so a hook can inline it if importing turns out to be
  * more trouble than it's worth.
@@ -249,6 +253,75 @@ export function isPlanDrifted(
 ): boolean {
   const drift = planDrift(db, plan);
   return drift.unplanned_task_ids.length > 0 || drift.orphaned_task_ids.length > 0;
+}
+
+/**
+ * One batch whose plan is not currently a licence to work, and why.
+ */
+export interface PendingPlan {
+  release_id: string;
+  /** The batch as a person names it (`0.7.0`), beside the uuid a tool needs. */
+  version: string;
+  /**
+   * `draft` - never approved. `drifted` - approved, but the batch has changed
+   * under the approval since. Not `PlanStatus`: drift is computed at read time
+   * and deliberately has no stored status (see ReleasePlanRecord.status).
+   */
+  plan_status: "draft" | "drifted";
+}
+
+/**
+ * Every batch in a project whose plan is still a draft, or is approved but no
+ * longer matches the batch.
+ *
+ * Exists for get_next_task's `plan_pending`: an unscoped call hands out work
+ * project-wide, so it *can* hand out a task belonging to a batch whose order
+ * nobody approved. It is allowed to - refusing would make a project unworkable
+ * the moment one unapproved plan exists anywhere in it - but it has to say so
+ * in its own answer, so the bypass is visible to whoever reads it instead of
+ * silent.
+ *
+ * Restricted to batches where there is still something to bypass. A released or
+ * cancelled release takes no new work at all (see requireAssignableRelease),
+ * and a batch whose every task is already done or cancelled has no work left to
+ * hand out; reporting either would be a warning nobody can act on, repeated on
+ * every single get_next_task call for the rest of the project's life.
+ */
+export function listPendingPlans(db: DatabaseInstance, projectId: string): PendingPlan[] {
+  const rows = db
+    .prepare(
+      // `r.status = 'planned'` rather than `NOT IN ('released', 'cancelled')`:
+      // planned is the only state in which a batch is still being worked, and
+      // spelling it positively means a later ReleaseStatus doesn't silently
+      // join the reported set.
+      `SELECT p.id, p.release_id, p.status, r.version
+       FROM release_plans p
+       JOIN releases r ON r.id = p.release_id
+       WHERE r.project_id = ?
+         AND r.status = 'planned'
+         AND EXISTS (
+           SELECT 1 FROM tasks t
+           WHERE t.release_id = r.id AND t.status NOT IN ('done', 'cancelled')
+         )
+       ORDER BY r.sequence ASC, r.created_at ASC`,
+    )
+    .all(projectId) as Array<{ id: string; release_id: string; status: PlanStatus; version: string }>;
+
+  const pending: PendingPlan[] = [];
+  for (const row of rows) {
+    if (row.status === "draft") {
+      pending.push({ release_id: row.release_id, version: row.version, plan_status: "draft" });
+      continue;
+    }
+    // Approved, so pending only if the batch moved under the approval. Through
+    // `isPlanDrifted`, so this can never disagree with the drift `getPlan`
+    // reports for the same release - one definition, as planDrift's header says.
+    if (isPlanDrifted(db, row)) {
+      pending.push({ release_id: row.release_id, version: row.version, plan_status: "drifted" });
+    }
+  }
+
+  return pending;
 }
 
 interface ItemRow {
