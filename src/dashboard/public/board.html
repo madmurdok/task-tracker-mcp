@@ -24,6 +24,19 @@
     <pre id="release-notes-body"></pre>
     <button type="button" id="release-notes-close">Close</button>
   </dialog>
+  <!-- A separate dialog from release-notes: that one is a <pre> of plain
+       text, but a plan has structure - steps, a per-item strikethrough, an
+       approval header, and a drift warning - none of which a <pre> can
+       render. Read-only, same as the rest of the dashboard (REQUIREMENTS.md
+       Item 8): there is no Approve button here, only what is already true in
+       the database. Approval happens in chat, via approve_plan. -->
+  <dialog id="plan-dialog">
+    <h2 id="plan-title"></h2>
+    <p id="plan-approval" class="plan-approval"></p>
+    <p id="plan-drift-warning" class="plan-drift-warning" hidden></p>
+    <ol id="plan-steps" class="plan-steps"></ol>
+    <button type="button" id="plan-close">Close</button>
+  </dialog>
   <script src="board.js"></script>
 </body>
 </html>

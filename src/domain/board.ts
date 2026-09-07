@@ -1,5 +1,6 @@
 import type { DatabaseInstance } from "../db/connection.js";
 import { listEpics } from "./epics.js";
+import { getPlan, type PlanStatus } from "./plans.js";
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, type ReleaseStatus } from "./releases.js";
 import { displayStatus, type DisplayStatus } from "./status.js";
@@ -18,6 +19,46 @@ export interface BoardTask {
   task_number: number;
 }
 
+/**
+ * One item's place in the lane's plan - the ordering only. No title, code or
+ * status: `lane.tasks` already carries all three (see BoardTask), keyed by
+ * this same `task_id`, so the popup joins against it instead of the payload
+ * carrying a second copy of two fields that change under the plan's feet
+ * between one 1.5s poll and the next.
+ */
+export interface BoardPlanItem {
+  task_id: string;
+  step: number;
+  note: string;
+  /**
+   * added_at > approved_at, computed here rather than read off PlanItem
+   * (which doesn't carry it either) - see schema.ts's release_plan_items
+   * comment for why this is never stored. false whenever the plan isn't
+   * currently approved (approved_at null): "new since approval" presumes an
+   * approval to be new *since*.
+   */
+  new_since_approval: boolean;
+}
+
+/**
+ * The lane's execution plan (TTM-66/67), shaped for the popup rather than
+ * re-exporting plans.ts's ReleasePlan verbatim: `orphaned_task_ids` is left
+ * off on purpose - an orphaned item's task already left this lane's `tasks`,
+ * so the popup would have nothing to join it against, unlike
+ * `unplanned_task_ids` (still in the batch, just missing from the plan),
+ * which lane.tasks can render as "not yet in the plan".
+ */
+export interface BoardPlan {
+  status: PlanStatus;
+  rationale: string;
+  approved_by: string | null;
+  approval_note: string | null;
+  approved_at: string | null;
+  drifted: boolean;
+  unplanned_task_ids: string[];
+  items: BoardPlanItem[];
+}
+
 export interface BoardLane {
   release_id: string | null;
   release_version: string | null;
@@ -29,6 +70,10 @@ export interface BoardLane {
   release_notes: string | null;
   release_cancellation_reason: string | null;
   tasks: BoardTask[];
+  // null for the Backlog lane (no release, so nothing to plan) and for a
+  // release nobody has written a plan for yet - "no plan" is an ordinary
+  // answer here too, matching getPlan's own return type.
+  plan: BoardPlan | null;
 }
 
 export interface BoardData {
@@ -48,6 +93,33 @@ export interface BoardData {
  */
 function isStale(task: Task, nowIso: string): boolean {
   return task.status === "in_progress" && task.lock_expires_at !== null && task.lock_expires_at < nowIso;
+}
+
+/**
+ * Shapes a release's plan (if it has one) for the board - see BoardPlan for
+ * what is deliberately left out. `drifted` is folded from the same two lists
+ * getPlan already computed (planDrift, in plans.ts) rather than a second call
+ * to isPlanDrifted, which would just re-run that query.
+ */
+function toBoardPlan(db: DatabaseInstance, projectId: string, releaseId: string): BoardPlan | null {
+  const plan = getPlan(db, projectId, releaseId);
+  if (!plan) return null;
+
+  return {
+    status: plan.status,
+    rationale: plan.rationale,
+    approved_by: plan.approved_by,
+    approval_note: plan.approval_note,
+    approved_at: plan.approved_at,
+    drifted: plan.unplanned_task_ids.length > 0 || plan.orphaned_task_ids.length > 0,
+    unplanned_task_ids: plan.unplanned_task_ids,
+    items: plan.items.map((item) => ({
+      task_id: item.task_id,
+      step: item.step,
+      note: item.note,
+      new_since_approval: plan.approved_at !== null && item.added_at > plan.approved_at,
+    })),
+  };
 }
 
 /**
@@ -96,6 +168,7 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
     release_notes: null,
     release_cancellation_reason: null,
     tasks: unreleasedTasks,
+    plan: null,
   });
 
   // listReleases orders oldest/lowest-sequence first (needed as-is for
@@ -115,6 +188,7 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
       // dashboard can label it as what it is.
       release_cancellation_reason: release.cancellation_reason,
       tasks: tasks.filter((task) => task.release_id === release.id).map(toBoardTask),
+      plan: toBoardPlan(db, project.id, release.id),
     });
   }
 
