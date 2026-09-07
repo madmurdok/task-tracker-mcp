@@ -5,6 +5,7 @@ import { GitDiffCompletionVerifier } from "../domain/verification.js";
 import { registerDependencyTools } from "./tools/dependencies.js";
 import { registerEpicTools } from "./tools/epics.js";
 import { registerLifecycleTools } from "./tools/lifecycle.js";
+import { registerPlanTools } from "./tools/plans.js";
 import { registerProjectTools } from "./tools/projects.js";
 import { registerReleaseTools } from "./tools/releases.js";
 import { registerStatusTools } from "./tools/status.js";
@@ -27,6 +28,7 @@ export function createServer(db: DatabaseInstance): McpServer {
   registerDependencyTools(server, db);
   registerStatusTools(server, db);
   registerLifecycleTools(server, db, verifier);
+  registerPlanTools(server, db);
 
   return server;
 }

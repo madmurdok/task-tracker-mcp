@@ -47,7 +47,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 28 registered tools over the same transport", async () => {
+  it("exercises all 31 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -87,6 +87,9 @@ describe("MCP server smoke test", () => {
         "set_release_sequence",
         "create_tasks",
         "delete_task",
+        "create_plan",
+        "get_plan",
+        "approve_plan",
       ].sort(),
     );
 
@@ -185,6 +188,70 @@ describe("MCP server smoke test", () => {
     expect(cancelled.ok).toBe(true);
     const afterCancel = await call("list_tasks", { project_id, status: "cancelled" });
     expect(afterCancel.tasks).toEqual([expect.objectContaining({ id: new_task_ids[0] })]);
+
+    // create_plan -> get_plan -> approve_plan, over a release and task
+    // created here so the plan's own drift check has an easy-to-reason-about
+    // batch, isolated from the epic/task graph exercised above.
+    const { release_id: planReleaseId } = await call("create_release", {
+      project_id,
+      version: "1.0",
+    });
+    const { task_id: planTaskId } = await call("create_task", {
+      project_id,
+      release_id: planReleaseId,
+      title: "Ship it",
+      complexity_hint: "normal",
+    });
+
+    const plan = await call("create_plan", {
+      project_id,
+      release_id: planReleaseId,
+      steps: [planTaskId],
+      rationale: "only one task in this batch, so one step",
+    });
+    expect(plan.status).toBe("draft");
+    expect(plan.items).toEqual([
+      expect.objectContaining({ task_id: planTaskId, step: 1, position: 1, status: "pending" }),
+    ]);
+
+    // Read the database directly, not just the response - `steps` is a nested
+    // shape that could be silently dropped the way `summary` once was for
+    // complete_task (see CLAUDE.md). Confirm the row landed, not just an "ok".
+    const planRow = db
+      .prepare("SELECT * FROM release_plans WHERE release_id = ?")
+      .get(planReleaseId) as { id: string; status: string; rationale: string };
+    expect(planRow).toMatchObject({ status: "draft", rationale: "only one task in this batch, so one step" });
+    const planItemRows = db
+      .prepare("SELECT task_id, step, position FROM release_plan_items WHERE plan_id = ?")
+      .all(planRow.id);
+    expect(planItemRows).toEqual([{ task_id: planTaskId, step: 1, position: 1 }]);
+
+    const fetchedPlan = await call("get_plan", { project_id, release_id: planReleaseId });
+    expect(fetchedPlan.status).toBe("draft");
+    expect(fetchedPlan.unplanned_task_ids).toEqual([]);
+    expect(fetchedPlan.orphaned_task_ids).toEqual([]);
+    expect(fetchedPlan.items).toEqual([
+      expect.objectContaining({ task_id: planTaskId, code: expect.stringContaining("-") }),
+    ]);
+
+    const approved = await call("approve_plan", {
+      project_id,
+      release_id: planReleaseId,
+      approved_by: "valentin",
+      note: "looks right, ship it",
+    });
+    expect(approved.status).toBe("approved");
+    expect(approved.approved_by).toBe("valentin");
+    expect(approved.approval_note).toBe("looks right, ship it");
+
+    const approvedRow = db
+      .prepare("SELECT status, approved_by, approval_note FROM release_plans WHERE id = ?")
+      .get(planRow.id);
+    expect(approvedRow).toEqual({
+      status: "approved",
+      approved_by: "valentin",
+      approval_note: "looks right, ship it",
+    });
   });
 
   it("list_projects returns an empty array when nothing is registered yet", async () => {
