@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
+import { withdrawPlanApproval } from "./planWrites.js";
 import { requireProject } from "./projects.js";
 import { requireAssignableRelease, requireRelease } from "./releases.js";
 import { displayStatus, type DisplayStatus } from "./status.js";
@@ -544,12 +545,9 @@ export function approvePlan(
  * honest rather than just "a row with this release_id exists".
  */
 export function revertPlanToDraft(db: DatabaseInstance, releaseId: string): boolean {
-  const { changes } = db
-    .prepare(
-      `UPDATE release_plans
-       SET status = 'draft', approved_by = NULL, approval_note = NULL, approved_at = NULL, updated_at = ?
-       WHERE release_id = ? AND status = 'approved'`,
-    )
-    .run(new Date().toISOString(), releaseId);
-  return changes > 0;
+  // The statement itself lives in planWrites.ts, which imports nothing from
+  // the domain layer - that is what lets tasks.ts and releases.ts call it
+  // without importing this module and closing a cycle. Kept exported here
+  // too, because this is where a reader looks for it.
+  return withdrawPlanApproval(db, releaseId);
 }

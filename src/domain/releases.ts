@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
+import { appendTaskToPlan, removeTaskFromPlan } from "./planWrites.js";
 import { requireProject } from "./projects.js";
 import { resolveTaskId, runOne } from "./tasks.js";
 
@@ -169,63 +170,7 @@ function requireTaskProjectAndRelease(
   return { projectId: row.project_id, releaseId: row.release_id };
 }
 
-/**
- * TTM-68, the inbound half - a task moved into a release is membership drift
- * for that release's plan, if it has one. Same shape as tasks.ts's
- * `appendToPlanAndRevert` (see its comment for why this is duplicated here
- * rather than imported from either plans.ts or tasks.ts): append the task as
- * a new final step, then send an approved plan back to draft.
- */
-function appendToPlanAndRevert(db: DatabaseInstance, releaseId: string, taskId: string): void {
-  const plan = db.prepare(`SELECT id FROM release_plans WHERE release_id = ?`).get(releaseId) as
-    | { id: string }
-    | undefined;
-  if (!plan) return;
 
-  const { maxStep } = db
-    .prepare(`SELECT COALESCE(MAX(step), 0) AS maxStep FROM release_plan_items WHERE plan_id = ?`)
-    .get(plan.id) as { maxStep: number };
-
-  const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO release_plan_items (plan_id, task_id, step, position, note, added_at)
-     VALUES (?, ?, ?, 0, '', ?)`,
-  ).run(plan.id, taskId, maxStep + 1, now);
-
-  db.prepare(
-    `UPDATE release_plans
-     SET status = 'draft', approved_by = NULL, approval_note = NULL, approved_at = NULL, updated_at = ?
-     WHERE id = ? AND status = 'approved'`,
-  ).run(now, plan.id);
-}
-
-/**
- * TTM-68, the outbound half - a task moved out of a release (or cleared to
- * null) is membership drift for the release it left, if that release has a
- * plan: the order it was given no longer applies to it. Drops its item
- * outright rather than leaving it to be reported as orphaned - the item is
- * for a task that is, as of this same write, simply not in the batch
- * anymore - and sends an approved plan back to draft.
- *
- * Inlined for the same reason as `appendToPlanAndRevert` above: no import
- * from plans.ts, to keep clear of the cycle described in its IMPORT
- * DIRECTION comment.
- */
-function revertPlanOnRemoval(db: DatabaseInstance, releaseId: string, taskId: string): void {
-  const plan = db.prepare(`SELECT id FROM release_plans WHERE release_id = ?`).get(releaseId) as
-    | { id: string }
-    | undefined;
-  if (!plan) return;
-
-  db.prepare(`DELETE FROM release_plan_items WHERE plan_id = ? AND task_id = ?`).run(plan.id, taskId);
-
-  const now = new Date().toISOString();
-  db.prepare(
-    `UPDATE release_plans
-     SET status = 'draft', approved_by = NULL, approval_note = NULL, approved_at = NULL, updated_at = ?
-     WHERE id = ? AND status = 'approved'`,
-  ).run(now, plan.id);
-}
 
 /**
  * Escape valve for a task that turns out not to belong in a release (or
@@ -277,10 +222,10 @@ export function setTaskRelease(db: DatabaseInstance, taskRef: string, releaseRef
     );
 
     if (currentReleaseId && currentReleaseId !== newReleaseId) {
-      revertPlanOnRemoval(db, currentReleaseId, taskId);
+      removeTaskFromPlan(db, currentReleaseId, taskId);
     }
     if (newReleaseId && newReleaseId !== currentReleaseId) {
-      appendToPlanAndRevert(db, newReleaseId, taskId);
+      appendTaskToPlan(db, newReleaseId, taskId);
     }
   });
 

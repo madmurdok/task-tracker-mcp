@@ -4,6 +4,7 @@ import { isOverBudget, type BudgetEstimator } from "./budget.js";
 import { addDependency } from "./dependencies.js";
 import { requireEpic } from "./epics.js";
 import { requireProject } from "./projects.js";
+import { appendTaskToPlan } from "./planWrites.js";
 import { requireAssignableRelease } from "./releases.js";
 
 export type TaskStatus = "pending" | "in_progress" | "done" | "cancelled";
@@ -160,56 +161,6 @@ export function requireTask(db: DatabaseInstance, taskId: string): Task {
   return task;
 }
 
-/**
- * TTM-68, the inbound half: a task created straight into a release is
- * membership drift for that release's plan, if it has one - the plan's order
- * no longer covers the whole batch. Appends the task as a new final step
- * (not merged into the last one - the plan reasoned about the tasks it
- * already had, not this one) and returns the plan to draft so nothing is
- * handed out from it until a human re-approves. Appending, not any other
- * position, is what makes re-approval cheap: the common case is "it goes
- * last", which then costs the owner one word, and any other order is still
- * available by re-sending the plan with upsert_plan.
- *
- * Inlined rather than imported from plans.ts's `revertPlanToDraft` - plans.ts
- * imports this module (see its IMPORT DIRECTION comment), so importing back
- * would close a cycle that, per that comment, resolves to `undefined` at call
- * time in this project's ESM setup rather than failing at load - a much
- * worse failure to chase down than a few duplicated lines. The same
- * self-contained shape is duplicated in releases.ts for `setTaskRelease`,
- * rather than shared through the tasks.ts/releases.ts edge that already
- * exists between them, so this hook stays as disposable/inspectable as
- * `revertPlanToDraft` itself.
- *
- * A plain UPDATE ... WHERE status = 'approved', not an unconditional one: the
- * overwhelmingly common case is a release with no plan, or a plan already in
- * draft (e.g. every task after the first in a createTasks batch), and
- * neither needs a write. Never touches tasks.status/owner_session_id/
- * lock_expires_at - a revert gates handing out *new* work, not a task a
- * session already holds.
- */
-function appendToPlanAndRevert(db: DatabaseInstance, releaseId: string, taskId: string): void {
-  const plan = db.prepare(`SELECT id FROM release_plans WHERE release_id = ?`).get(releaseId) as
-    | { id: string }
-    | undefined;
-  if (!plan) return;
-
-  const { maxStep } = db
-    .prepare(`SELECT COALESCE(MAX(step), 0) AS maxStep FROM release_plan_items WHERE plan_id = ?`)
-    .get(plan.id) as { maxStep: number };
-
-  const now = new Date().toISOString();
-  db.prepare(
-    `INSERT INTO release_plan_items (plan_id, task_id, step, position, note, added_at)
-     VALUES (?, ?, ?, 0, '', ?)`,
-  ).run(plan.id, taskId, maxStep + 1, now);
-
-  db.prepare(
-    `UPDATE release_plans
-     SET status = 'draft', approved_by = NULL, approval_note = NULL, approved_at = NULL, updated_at = ?
-     WHERE id = ? AND status = 'approved'`,
-  ).run(now, plan.id);
-}
 
 /**
  * Attaches each task's code to rows on their way out of this layer.
@@ -325,7 +276,7 @@ export function createTask(
     // TTM-68: created straight into a planned batch, so its plan (if any)
     // needs this task appended and, if approved, sent back to draft.
     if (releaseId) {
-      appendToPlanAndRevert(db, releaseId, task.id);
+      appendTaskToPlan(db, releaseId, task.id);
     }
     return task;
   });
