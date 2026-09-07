@@ -96,12 +96,14 @@ graph TD
   threshold (e.g. 15k tokens) as "should split" in tool responses. Isolated behind
   an interface so the heuristic can be swapped later without touching callers.
 - **Completion Verifier** — pluggable check (`GitDiffCompletionVerifier`) that
-  `complete_task` runs before accepting a Claude-declared completion: confirms each
-  declared file actually changed, and, if a `test_command` was given, that it exits
-  zero. `force: true` skips it. A file counts as changed if it's dirty in the
+  `complete_task` runs before accepting a Claude-declared completion: confirms the
+  task's declared files changed, and, if a `test_command` was given, that it exits
+  zero. `force: true` skips it. The bar is **any**, not each - both git calls are
+  made once over the whole declared list, so a task declaring three files passes
+  once one of them is touched. It passes if any declared file is dirty in the
   working tree/index (`git status --porcelain`) **or** the newest HEAD-reachable
-  commit touching it was committed at or after the task's `created_at` (`git log
-  --format=%cI`, committer date). The commit half exists because the working-tree
+  commit touching any of them was committed at or after the task's `created_at`
+  (`git log -1 --format=%cI`, committer date). The commit half exists because the working-tree
   half alone fires backwards on a project whose branch workflow requires
   committing: it passes on work-in-progress and fails on finished work, so every
   real completion had to be forced. It accepts a known false positive in
@@ -309,7 +311,7 @@ discoverable.
   dependency gate `get_next_task` applies) instead of silently sitting `pending`
   with an owner attached and no status change; an already `done`/`cancelled` task
   rejects with a `not_claimable` error.
-- **A `complete_task` call's declared files were neither dirty nor touched by a
+- **None of a `complete_task` call's declared files were dirty, nor touched by a
   commit since the task was created.** `complete_task` rejects with
   `verification_failed` (reason included) unless `force: true` is passed — see
   Completion Verifier in Components. A task created *after* its work was already
