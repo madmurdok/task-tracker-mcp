@@ -96,11 +96,21 @@ graph TD
   threshold (e.g. 15k tokens) as "should split" in tool responses. Isolated behind
   an interface so the heuristic can be swapped later without touching callers.
 - **Completion Verifier** — pluggable check (`GitDiffCompletionVerifier`) that
-  `complete_task` runs before accepting a Claude-declared completion: confirms the
-  task's declared files actually changed (`git status --porcelain`) and, if a
-  `test_command` was given, that it exits zero. `force: true` skips it. Isolated
-  behind a `CompletionVerifier` interface the same way the Budget Estimator isolates
-  its heuristic.
+  `complete_task` runs before accepting a Claude-declared completion: confirms each
+  declared file actually changed, and, if a `test_command` was given, that it exits
+  zero. `force: true` skips it. A file counts as changed if it's dirty in the
+  working tree/index (`git status --porcelain`) **or** the newest HEAD-reachable
+  commit touching it was committed at or after the task's `created_at` (`git log
+  --format=%cI`, committer date). The commit half exists because the working-tree
+  half alone fires backwards on a project whose branch workflow requires
+  committing: it passes on work-in-progress and fails on finished work, so every
+  real completion had to be forced. It accepts a known false positive in
+  exchange — commits aren't attributed to tasks, so *any* commit after the task's
+  creation that touches a declared file counts, whoever made it — and bounds on
+  `created_at` rather than the claim timestamp, since `claim_task` renews the
+  lease on every re-claim/hand-off and a claim-time bound could land after the
+  very commits it's meant to find. Isolated behind a `CompletionVerifier`
+  interface the same way the Budget Estimator isolates its heuristic.
 - **Status CLI** (`src/cli/status.ts`) — a standalone script that opens the SQLite
   file directly and calls the same domain functions (`getProjectStatus`,
   `listTasks`) the MCP tools use, so a human can eyeball progress without going
@@ -299,9 +309,11 @@ discoverable.
   dependency gate `get_next_task` applies) instead of silently sitting `pending`
   with an owner attached and no status change; an already `done`/`cancelled` task
   rejects with a `not_claimable` error.
-- **A `complete_task` call's declared files were never actually touched.**
-  `complete_task` rejects with `verification_failed` (reason included) unless
-  `force: true` is passed — see Completion Verifier in Components.
+- **A `complete_task` call's declared files were neither dirty nor touched by a
+  commit since the task was created.** `complete_task` rejects with
+  `verification_failed` (reason included) unless `force: true` is passed — see
+  Completion Verifier in Components. A task created *after* its work was already
+  committed still fails this check, correctly: `created_at` postdates the commit.
 - **Design doc changes after the graph exists.** `check_doc_sync` detects the drift
   (doc hash no longer matches); `get_next_task`/`get_project_status` also report
   `doc_drift: true` on every call from then on, so it can't be silently missed on
