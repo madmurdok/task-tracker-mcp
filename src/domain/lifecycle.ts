@@ -2,7 +2,8 @@ import type { DatabaseInstance } from "../db/connection.js";
 import { requireProject } from "./projects.js";
 import { resolveTaskId } from "./tasks.js";
 import { requireRelease } from "./releases.js";
-import { findUnblockedDependents, hasUnmetDependencies, LOCK_LEASE_MS } from "./status.js";
+import { LOCK_LEASE_MS } from "./status.js";
+import { findUnblockedDependents, hasUnmetDependencies } from "./taskStatus.js";
 import type { CompletionVerifier } from "./verification.js";
 
 /**
@@ -429,7 +430,7 @@ export interface CancelTaskResult {
  * releaseTask does (a cancelled task isn't being worked by anyone), and
  * unblocks dependents the same way completeTask does - a cancelled
  * prerequisite is resolved, not stuck, from a dependent's point of view (see
- * hasUnmetDependencies in status.ts). There's no session_id parameter here
+ * hasUnmetDependencies in taskStatus.ts). There's no session_id parameter here
  * (unlike claim/release), so the conflict check is owner-agnostic: any active
  * lock blocks a plain cancel_task call, `force` overrides it regardless of
  * who holds it.
