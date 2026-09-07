@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 import { addDependency } from "../src/domain/dependencies.js";
-import { cancelTask, completeTask } from "../src/domain/lifecycle.js";
+import { cancelTask, claimTask, completeTask } from "../src/domain/lifecycle.js";
 import {
   approvePlan,
   getPlan,
@@ -12,7 +12,7 @@ import {
 } from "../src/domain/plans.js";
 import { createProject } from "../src/domain/projects.js";
 import { createRelease, setTaskRelease } from "../src/domain/releases.js";
-import { createTask, type Task } from "../src/domain/tasks.js";
+import { createTask, createTasks, type Task } from "../src/domain/tasks.js";
 import type { CompletionVerifier } from "../src/domain/verification.js";
 
 const noopEstimator: BudgetEstimator = { estimateTokens: () => 0 };
@@ -51,6 +51,18 @@ function markCancelled(db: DatabaseInstance, releaseId: string): void {
   db.prepare(`UPDATE releases SET status = 'cancelled', cancellation_reason = 'gate said no' WHERE id = ?`).run(
     releaseId,
   );
+}
+
+// Moves a task's release_id straight in the table, bypassing setTaskRelease -
+// which, as of TTM-68, drops the task's plan item and reverts the plan itself
+// the moment membership changes, so it can no longer be used to *create* an
+// orphaned-item state to test planDrift's own detection of one. This helper
+// is what's left to reach that state: the data drifted out from under a plan
+// by some means other than setTaskRelease/createTask (e.g. hand-written SQL,
+// or a plan item surviving from before this hook existed) - exactly the case
+// planDrift's orphaned-item computation exists to still catch.
+function moveTaskReleaseDirectly(db: DatabaseInstance, taskId: string, releaseId: string | null): void {
+  db.prepare(`UPDATE tasks SET release_id = ? WHERE id = ?`).run(releaseId, taskId);
 }
 
 describe("upsertPlan", () => {
@@ -326,9 +338,12 @@ describe("plan drift", () => {
   it("reports a batch task missing from the plan as unplanned", () => {
     const { db, project, release } = setup();
     const planned = addTask(db, project.id, "planned", release.id);
-    upsertPlan(db, project.id, release.version, { steps: [planned.id] });
-
+    // Both created before the plan exists - TTM-68's inbound hook only fires
+    // when a release already has a plan, so creating `late` here (rather
+    // than after upsertPlan) leaves it genuinely unplanned instead of
+    // auto-appended, which is the scenario this test is about.
     const late = addTask(db, project.id, "late", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [planned.id] });
 
     const plan = getPlan(db, project.id, release.version)!;
     expect(plan.unplanned_task_ids).toEqual([late.id]);
@@ -343,7 +358,11 @@ describe("plan drift", () => {
     const leaves = addTask(db, project.id, "leaves", release.id);
     upsertPlan(db, project.id, release.version, { steps: [stays.id, leaves.id] });
 
-    setTaskRelease(db, leaves.id, other.version);
+    // Not setTaskRelease - as of TTM-68 that call drops the item itself and
+    // reverts the plan (see the "plan revert hooks" describe block below);
+    // this test is about planDrift's own detection of an item whose task
+    // left the batch by some other means, so the move is made directly.
+    moveTaskReleaseDirectly(db, leaves.id, other.id);
 
     const plan = getPlan(db, project.id, release.version)!;
     expect(plan.orphaned_task_ids).toEqual([leaves.id]);
@@ -359,7 +378,9 @@ describe("plan drift", () => {
     const leaves = addTask(db, project.id, "leaves", release.id);
     upsertPlan(db, project.id, release.version, { steps: [stays.id, leaves.id] });
 
-    setTaskRelease(db, leaves.id, null);
+    // See the note in the previous test - setTaskRelease itself now cleans
+    // this state up (TTM-68), so it's created directly here instead.
+    moveTaskReleaseDirectly(db, leaves.id, null);
 
     expect(getPlan(db, project.id, release.version)!.orphaned_task_ids).toEqual([leaves.id]);
   });
@@ -438,8 +459,11 @@ describe("approvePlan", () => {
   it("refuses a plan that leaves a batch task unplanned, naming it by code", () => {
     const { db, project, release } = setup();
     const planned = addTask(db, project.id, "planned", release.id);
-    upsertPlan(db, project.id, release.version, { steps: [planned.id] });
+    // Created before the plan exists - see the same note in the "plan drift"
+    // describe block; TTM-68's inbound hook would otherwise auto-append this
+    // task the moment it's created into an already-planned release.
     addTask(db, project.id, "late", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [planned.id] });
 
     expect(() =>
       approvePlan(db, project.id, release.version, { approved_by: "valentin" }),
@@ -456,7 +480,9 @@ describe("approvePlan", () => {
     const stays = addTask(db, project.id, "stays", release.id);
     const leaves = addTask(db, project.id, "leaves", release.id);
     upsertPlan(db, project.id, release.version, { steps: [stays.id, leaves.id] });
-    setTaskRelease(db, leaves.id, null);
+    // See the note above `moveTaskReleaseDirectly`'s other uses - setTaskRelease
+    // would itself clean up the orphaned item this test needs to still exist.
+    moveTaskReleaseDirectly(db, leaves.id, null);
 
     expect(() =>
       approvePlan(db, project.id, release.version, { approved_by: "valentin" }),
@@ -585,5 +611,190 @@ describe("revertPlanToDraft", () => {
     });
     expect(reapproved.status).toBe("approved");
     expect(reapproved.approval_note).toBe("still fine");
+  });
+});
+
+describe("plan revert hooks (TTM-68)", () => {
+  it("createTask into a release with an approved plan appends it as a final step and reverts to draft", () => {
+    const { db, project, release } = setup();
+    const first = addTask(db, project.id, "first", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [first.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
+
+    const late = addTask(db, project.id, "late", release.id);
+
+    const plan = getPlan(db, project.id, release.version)!;
+    expect(plan.status).toBe("draft");
+    expect(plan.approved_by).toBeNull();
+    expect(plan.approval_note).toBeNull();
+    expect(plan.approved_at).toBeNull();
+    expect(plan.items.map((item) => [item.task_id, item.step, item.position])).toEqual([
+      [first.id, 1, 1],
+      [late.id, 2, 0],
+    ]);
+    expect(plan.unplanned_task_ids).toEqual([]);
+  });
+
+  it("setTaskRelease moving a task into a release with an approved plan appends it and reverts to draft", () => {
+    const { db, project, release } = setup();
+    const first = addTask(db, project.id, "first", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [first.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
+
+    const backlog = addTask(db, project.id, "backlog");
+    setTaskRelease(db, backlog.id, release.version);
+
+    const plan = getPlan(db, project.id, release.version)!;
+    expect(plan.status).toBe("draft");
+    expect(plan.items.map((item) => [item.task_id, item.step, item.position])).toEqual([
+      [first.id, 1, 1],
+      [backlog.id, 2, 0],
+    ]);
+  });
+
+  it("setTaskRelease moving a task out of a release with an approved plan drops its item and reverts to draft", () => {
+    const { db, project, release } = setup();
+    const stays = addTask(db, project.id, "stays", release.id);
+    const leaves = addTask(db, project.id, "leaves", release.id);
+    const other = createRelease(db, { project_id: project.id, version: "0.2" });
+    upsertPlan(db, project.id, release.version, { steps: [stays.id, leaves.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
+
+    setTaskRelease(db, leaves.id, other.version);
+
+    const plan = getPlan(db, project.id, release.version)!;
+    expect(plan.status).toBe("draft");
+    expect(plan.items.map((item) => item.task_id)).toEqual([stays.id]);
+    // Dropped outright, not left behind to be reported as orphaned - it left
+    // the batch by the one call that's supposed to keep the plan honest.
+    expect(plan.orphaned_task_ids).toEqual([]);
+  });
+
+  it("setTaskRelease clearing a task's release to null drops its item and reverts the source plan", () => {
+    const { db, project, release } = setup();
+    const stays = addTask(db, project.id, "stays", release.id);
+    const leaves = addTask(db, project.id, "leaves", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [stays.id, leaves.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
+
+    setTaskRelease(db, leaves.id, null);
+
+    const plan = getPlan(db, project.id, release.version)!;
+    expect(plan.status).toBe("draft");
+    expect(plan.items.map((item) => item.task_id)).toEqual([stays.id]);
+  });
+
+  it("createTasks lands a whole batch into a planned release and reverts the plan once", () => {
+    const { db, project, release } = setup();
+    const first = addTask(db, project.id, "first", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [first.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
+
+    const result = createTasks(db, noopEstimator, project.id, [
+      { title: "second", release_id: release.id, complexity_hint: "normal" },
+      { title: "third", release_id: release.id, complexity_hint: "normal" },
+      { title: "fourth", release_id: release.id, complexity_hint: "normal" },
+    ]);
+
+    const plan = getPlan(db, project.id, release.version)!;
+    expect(plan.status).toBe("draft");
+    expect(plan.approved_by).toBeNull();
+    expect(plan.items.map((item) => item.task_id)).toEqual([
+      first.id,
+      ...result.tasks.map((t) => t.task_id),
+    ]);
+    // Each of the three lands its own step, in creation order - not all
+    // fighting over the same "next" step number.
+    expect(plan.items.map((item) => item.step)).toEqual([1, 2, 3, 4]);
+  });
+
+  it("createTasks rolls back every appended plan item along with the batch when one spec fails", () => {
+    const { db, project, release } = setup();
+    const first = addTask(db, project.id, "first", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [first.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
+
+    expect(() =>
+      createTasks(db, noopEstimator, project.id, [
+        { title: "second", release_id: release.id, complexity_hint: "normal" },
+        { title: "bad", release_id: "nonexistent-release", complexity_hint: "normal" },
+      ]),
+    ).toThrow(/Unknown release/);
+
+    const plan = getPlan(db, project.id, release.version)!;
+    // Rolled back entirely, including the plan-append that "second" would
+    // otherwise have made - not just the tasks table.
+    expect(plan.status).toBe("approved");
+    expect(plan.items.map((item) => item.task_id)).toEqual([first.id]);
+    const taskCount = db
+      .prepare(`SELECT COUNT(*) AS cnt FROM tasks WHERE project_id = ?`)
+      .get(project.id) as { cnt: number };
+    expect(taskCount.cnt).toBe(1);
+  });
+
+  it("does not revert the plan when a planned task is completed", () => {
+    const { db, project, release } = setup();
+    const first = addTask(db, project.id, "first", release.id);
+    const second = addTask(db, project.id, "second", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [first.id, second.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
+
+    completeTask(db, noopVerifier, { task_id: first.id, summary: "done" });
+
+    const plan = getPlan(db, project.id, release.version)!;
+    expect(plan.status).toBe("approved");
+    expect(plan.approved_by).toBe("valentin");
+  });
+
+  it("does not revert the plan when a planned task is cancelled", () => {
+    const { db, project, release } = setup();
+    const first = addTask(db, project.id, "first", release.id);
+    const second = addTask(db, project.id, "second", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [first.id, second.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
+
+    cancelTask(db, { task_id: second.id, reason: "not needed" });
+
+    const plan = getPlan(db, project.id, release.version)!;
+    expect(plan.status).toBe("approved");
+    expect(plan.approved_by).toBe("valentin");
+  });
+
+  it("does not touch an in-flight task's status, owner or lock when a revert fires", () => {
+    const { db, project, release } = setup();
+    const first = addTask(db, project.id, "first", release.id);
+    const second = addTask(db, project.id, "second", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [first.id, second.id] });
+    approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
+
+    claimTask(db, first.id, "session-abc");
+    const before = db
+      .prepare(`SELECT status, owner_session_id, lock_expires_at FROM tasks WHERE id = ?`)
+      .get(first.id);
+
+    // Triggers a revert on the same release's plan without touching `first`.
+    addTask(db, project.id, "late", release.id);
+
+    const plan = getPlan(db, project.id, release.version)!;
+    expect(plan.status).toBe("draft");
+    const after = db
+      .prepare(`SELECT status, owner_session_id, lock_expires_at FROM tasks WHERE id = ?`)
+      .get(first.id);
+    expect(after).toEqual(before);
+    expect(after).toMatchObject({ status: "in_progress", owner_session_id: "session-abc" });
+  });
+
+  it("does nothing to a release with no plan at all", () => {
+    const { db, project, release } = setup();
+    const first = addTask(db, project.id, "first", release.id);
+
+    expect(getPlan(db, project.id, release.version)).toBeUndefined();
+
+    setTaskRelease(db, first.id, null);
+    expect(getPlan(db, project.id, release.version)).toBeUndefined();
+
+    const backlog = addTask(db, project.id, "backlog");
+    setTaskRelease(db, backlog.id, release.version);
+    expect(getPlan(db, project.id, release.version)).toBeUndefined();
   });
 });
