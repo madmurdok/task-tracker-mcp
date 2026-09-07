@@ -260,6 +260,21 @@ function createLane(lane, codePrefix) {
     headerRow.appendChild(badge);
   }
 
+  // Rendered exactly when there's something to show: a release only gets a
+  // plan once someone writes one (upsert_plan), and the Backlog lane never
+  // has a release to plan at all. Placed before Release notes, per the
+  // owner's own phrasing of where the button belongs, and - like that button
+  // and Cancellation reason - a separate click target from the heading so
+  // opening it doesn't also toggle the lane's collapse state.
+  if (lane.plan) {
+    const planButton = document.createElement("button");
+    planButton.type = "button";
+    planButton.className = "lane-notes-button";
+    planButton.textContent = "Plan";
+    planButton.addEventListener("click", () => showPlanDialog(lane, codePrefix));
+    headerRow.appendChild(planButton);
+  }
+
   if (lane.release_notes) {
     const notesButton = document.createElement("button");
     notesButton.type = "button";
@@ -425,6 +440,94 @@ function wireReleaseNotesDialog() {
   document.getElementById("release-notes-close").addEventListener("click", () => dialog.close());
 }
 
+// task_id/step/note/new_since_approval only (see board.ts's BoardPlanItem) -
+// title, code and live status come from joining against lane.tasks here,
+// the one place that join needs to happen, rather than the payload carrying
+// a second copy of either.
+function showPlanDialog(lane, codePrefix) {
+  const plan = lane.plan;
+  const tasksById = new Map(lane.tasks.map((task) => [task.id, task]));
+
+  document.getElementById("plan-title").textContent = `${laneTitle(lane)} - plan`;
+
+  const approval = document.getElementById("plan-approval");
+  approval.textContent =
+    plan.status === "approved"
+      ? `Approved by ${plan.approved_by}${plan.approval_note ? ` - "${plan.approval_note}"` : ""}`
+      : "Draft - not yet approved";
+
+  // The owner's cue to re-approve: named tasks the plan doesn't cover, not
+  // just a bare "drifted" flag - codesFor's human-facing rendering (see
+  // plans.ts's approvePlan refusal message) is what this mirrors, joined
+  // against lane.tasks here instead of carrying task_number a second time.
+  const driftWarning = document.getElementById("plan-drift-warning");
+  if (plan.drifted) {
+    const names = plan.unplanned_task_ids
+      .map((id) => tasksById.get(id))
+      .filter((task) => task !== undefined)
+      .map((task) => `${codePrefix}-${task.task_number}`);
+    driftWarning.textContent =
+      names.length > 0
+        ? `This plan is out of date: ${names.join(", ")} ${names.length === 1 ? "is" : "are"} not in it. Re-approve in chat once the order covers them.`
+        : "This plan is out of date - the batch has changed since it was written. Re-approve in chat.";
+    driftWarning.hidden = false;
+  } else {
+    driftWarning.hidden = true;
+  }
+
+  const stepsList = document.getElementById("plan-steps");
+  while (stepsList.firstChild) stepsList.removeChild(stepsList.firstChild);
+
+  // Items already arrive step ASC, position ASC (see plans.ts's
+  // listPlanItems) - group consecutive same-step items into one <li> rather
+  // than re-sorting, since they can run in parallel.
+  let currentGroup = null;
+  for (const item of plan.items) {
+    if (!currentGroup || currentGroup.step !== item.step) {
+      currentGroup = { step: item.step, items: [] };
+      const stepEl = document.createElement("li");
+      stepEl.className = "plan-step";
+      const stepLabel = document.createElement("span");
+      stepLabel.className = "plan-step-label";
+      stepLabel.textContent = `Step ${item.step}`;
+      stepEl.appendChild(stepLabel);
+      currentGroup.el = stepEl;
+      stepsList.appendChild(stepEl);
+    }
+
+    const task = tasksById.get(item.task_id);
+    const row = document.createElement("div");
+    row.className = "plan-item";
+    // Struck through for done/cancelled, the same statuses a card itself
+    // fades and strikes (see .card[data-status="cancelled"] in style.css) -
+    // "already-finished parts of the plan" is exactly what the owner asked
+    // for. A task the plan still names but that left the release (orphaned -
+    // see BoardPlan's comment on why board.ts doesn't surface that set) has
+    // no entry in tasksById; render its bare id rather than dropping the row
+    // silently, since the plan did still order it.
+    row.dataset.status = task ? task.status : "unknown";
+    const label = task ? `${codePrefix}-${task.task_number} - ${task.title}` : item.task_id;
+    row.textContent = item.note ? `${label} (${item.note})` : label;
+
+    if (item.new_since_approval) {
+      const badge = document.createElement("span");
+      badge.className = "plan-item-new";
+      badge.textContent = "new";
+      row.appendChild(badge);
+    }
+
+    currentGroup.el.appendChild(row);
+  }
+
+  document.getElementById("plan-dialog").showModal();
+}
+
+function wirePlanDialog() {
+  const dialog = document.getElementById("plan-dialog");
+  document.getElementById("plan-close").addEventListener("click", () => dialog.close());
+}
+
 loadBoard();
 wireShutdownButton();
 wireReleaseNotesDialog();
+wirePlanDialog();

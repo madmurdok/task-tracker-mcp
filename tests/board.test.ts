@@ -9,6 +9,7 @@ import { addDependency } from "../src/domain/dependencies.js";
 import { createEpic } from "../src/domain/epics.js";
 import { createProject } from "../src/domain/projects.js";
 import { cancelRelease } from "../src/domain/lifecycle.js";
+import { approvePlan, upsertPlan } from "../src/domain/plans.js";
 import { createRelease } from "../src/domain/releases.js";
 import { createTask } from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
@@ -42,12 +43,25 @@ function domElementStub(): any {
     get firstChild() {
       return el.children[0] ?? null;
     },
-    addEventListener() {},
+    // Stored (not a no-op) so tests can simulate a click via fireClick below
+    // - needed to assert "clicking Plan opens the dialog without toggling
+    // collapse", which is a behavior, not just a markup shape.
+    _listeners: {} as Record<string, Array<() => void>>,
+    addEventListener(type: string, handler: () => void) {
+      (el._listeners[type] ??= []).push(handler);
+    },
     setAttribute() {},
-    showModal() {},
+    showModal() {
+      el.showModalCalls = (el.showModalCalls ?? 0) + 1;
+    },
     close() {},
   };
   return el;
+}
+
+// Invokes every "click" listener registered on a stub via addEventListener.
+function fireClick(el: any): void {
+  for (const handler of el._listeners?.click ?? []) handler();
 }
 
 // Resolved relative to this test file (not process.cwd()) so it always reads
@@ -57,11 +71,21 @@ const BOARD_JS_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), ".
 
 function loadBoardScript(): any {
   const src = readFileSync(BOARD_JS_PATH, "utf8");
+  // Same id must return the same stub across calls (unlike createElement,
+  // which always returns a fresh node) - showPlanDialog looks a dialog up by
+  // id in one call and a test needs that exact object back afterward to
+  // check showModalCalls, the same way a real `document.getElementById`
+  // would return the same element every time.
+  const elementsById = new Map<string, any>();
+  const getElementById = (id: string) => {
+    if (!elementsById.has(id)) elementsById.set(id, domElementStub());
+    return elementsById.get(id);
+  };
   const sandbox: any = {
     document: {
       title: "",
       createElement: () => domElementStub(),
-      getElementById: () => domElementStub(),
+      getElementById,
     },
     window: { location: { search: "" } },
     localStorage: {
@@ -197,6 +221,7 @@ describe("getBoardData", () => {
         release_notes: null,
         release_cancellation_reason: null,
         tasks: [],
+        plan: null,
       },
     ]);
   });
@@ -285,6 +310,135 @@ describe("getBoardData", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("leaves lane.plan null for a release nobody has written a plan for, and for the Backlog lane", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "0.4" });
+    createTask(db, noopEstimator, { project_id: project.id, title: "Backlog item", complexity_hint: "normal" });
+
+    const board = getBoardData(db, project.id);
+
+    expect(board.lanes.find((l) => l.release_id === null)?.plan).toBeNull();
+    expect(board.lanes.find((l) => l.release_id === release.id)?.plan).toBeNull();
+  });
+
+  it("carries a plan's approval header and items' ordering only - no title, status or code duplicated onto an item", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "0.5" });
+    const a = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "A",
+      complexity_hint: "normal",
+      release_id: release.id,
+    }).task;
+    const b = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "B",
+      complexity_hint: "normal",
+      release_id: release.id,
+    }).task;
+
+    upsertPlan(db, project.id, release.id, {
+      steps: [{ task: a.id, note: "do first" }, b.id],
+      rationale: "A unblocks B",
+    });
+
+    const board = getBoardData(db, project.id);
+    const plan = board.lanes.find((l) => l.release_id === release.id)?.plan;
+
+    expect(plan).toMatchObject({
+      status: "draft",
+      rationale: "A unblocks B",
+      approved_by: null,
+      approval_note: null,
+      approved_at: null,
+      drifted: false,
+      unplanned_task_ids: [],
+    });
+    expect(plan?.items).toEqual([
+      { task_id: a.id, step: 1, note: "do first", new_since_approval: false },
+      { task_id: b.id, step: 2, note: "", new_since_approval: false },
+    ]);
+    // toEqual above already pins the exact key set, but spelled out here too
+    // since it's the one thing this task's acceptance criteria calls out by
+    // name: no title/status/code key sneaks onto an item.
+    for (const item of plan?.items ?? []) {
+      expect(Object.keys(item).sort()).toEqual(["new_since_approval", "note", "step", "task_id"]);
+    }
+
+    approvePlan(db, project.id, release.id, { approved_by: "valentin", note: "looks right" });
+    const approvedPlan = getBoardData(db, project.id).lanes.find((l) => l.release_id === release.id)?.plan;
+    expect(approvedPlan).toMatchObject({
+      status: "approved",
+      approved_by: "valentin",
+      approval_note: "looks right",
+      drifted: false,
+    });
+    expect(approvedPlan?.approved_at).not.toBeNull();
+  });
+
+  it("populates unplanned_task_ids and drifted when the batch has a task the plan doesn't cover", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "0.6" });
+    const planned = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Planned",
+      complexity_hint: "normal",
+      release_id: release.id,
+    }).task;
+    const unplanned = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Unplanned",
+      complexity_hint: "normal",
+      release_id: release.id,
+    }).task;
+
+    upsertPlan(db, project.id, release.id, { steps: [planned.id] });
+
+    const plan = getBoardData(db, project.id).lanes.find((l) => l.release_id === release.id)?.plan;
+
+    expect(plan?.drifted).toBe(true);
+    expect(plan?.unplanned_task_ids).toEqual([unplanned.id]);
+  });
+
+  it("flags a plan item new_since_approval when it entered the plan after the current approval, false for items that predate it", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "0.7" });
+    const a = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "A",
+      complexity_hint: "normal",
+      release_id: release.id,
+    }).task;
+    // Left unassigned to any release for now - if it belonged to this release
+    // already, upsertPlan's own drift check would refuse to approve (task c
+    // not in the plan). It only needs to actually be in the release at
+    // getBoardData time, which the raw UPDATE below arranges for.
+    const c = createTask(db, noopEstimator, { project_id: project.id, title: "C", complexity_hint: "normal" }).task;
+
+    upsertPlan(db, project.id, release.id, { steps: [a.id] });
+    const approved = approvePlan(db, project.id, release.id, { approved_by: "valentin" });
+
+    // upsertPlan always demotes an approved plan back to draft the moment it
+    // touches items (see plans.ts's comment on why), and setTaskRelease's
+    // hook demotes it too the moment a task joins the release it covers - so
+    // there is no domain call that leaves a plan *approved* with a freshly
+    // -added item. The only way to observe the read-time rule in isolation
+    // (added_at > approved_at, schema.ts's rationale for not storing it) is
+    // to place the rows directly, the same way this file already reaches
+    // past the domain layer to set up a stale lock or a release's notes.
+    db.prepare(`UPDATE tasks SET release_id = ? WHERE id = ?`).run(release.id, c.id);
+    const laterThanApproval = new Date(new Date(approved.approved_at!).getTime() + 1000).toISOString();
+    db.prepare(
+      `INSERT INTO release_plan_items (plan_id, task_id, step, position, note, added_at) VALUES (?, ?, ?, ?, '', ?)`,
+    ).run(approved.id, c.id, 2, 1, laterThanApproval);
+
+    const plan = getBoardData(db, project.id).lanes.find((l) => l.release_id === release.id)?.plan;
+    const byTask = new Map(plan?.items.map((item) => [item.task_id, item]));
+
+    expect(byTask.get(a.id)?.new_since_approval).toBe(false);
+    expect(byTask.get(c.id)?.new_since_approval).toBe(true);
   });
 });
 
@@ -397,5 +551,118 @@ describe("board.js createLane for a cancelled release (client-side, via DOM shim
     );
 
     expect(section.dataset.releaseStatus).toBeUndefined();
+  });
+});
+
+describe("board.js createLane Plan button and dialog (client-side, via DOM shim)", () => {
+  function laneWithPlanStub(): any {
+    return {
+      release_id: "r1",
+      release_version: "1.0",
+      release_name: "Name",
+      release_status: "planned",
+      release_notes: null,
+      release_cancellation_reason: null,
+      tasks: [
+        { id: "a", task_number: 1, title: "First", status: "done" },
+        { id: "b", task_number: 2, title: "Second", status: "pending" },
+      ],
+      plan: {
+        status: "draft",
+        rationale: "",
+        approved_by: null,
+        approval_note: null,
+        approved_at: null,
+        drifted: false,
+        unplanned_task_ids: [],
+        items: [
+          { task_id: "a", step: 1, note: "", new_since_approval: false },
+          { task_id: "b", step: 2, note: "", new_since_approval: false },
+        ],
+      },
+    };
+  }
+
+  function partsOf(section: any) {
+    const [headerRow, columns] = section.children;
+    return { headerRow, columns };
+  }
+
+  it("renders a Plan button only when the lane has a plan", () => {
+    const { createLane } = loadBoardScript();
+    const withPlan = partsOf(createLane(laneWithPlanStub(), "DEM"));
+    const withoutPlan = partsOf(createLane({ ...laneWithPlanStub(), plan: null }, "DEM"));
+
+    expect(withPlan.headerRow.children.some((c: any) => c.textContent === "Plan")).toBe(true);
+    expect(withoutPlan.headerRow.children.some((c: any) => c.textContent === "Plan")).toBe(false);
+  });
+
+  it("clicking Plan opens the plan dialog without toggling the lane's collapse state", () => {
+    const sandbox = loadBoardScript();
+    const section = sandbox.createLane(laneWithPlanStub(), "DEM");
+    const { headerRow, columns } = partsOf(section);
+    const planButton = headerRow.children.find((c: any) => c.textContent === "Plan");
+
+    expect(columns.hidden).toBe(false);
+    fireClick(planButton);
+
+    // Collapse toggling lives on the heading's own click listener, a
+    // separate element from this button - same guarantee the Release notes
+    // button already relies on - so firing the button's listener must leave
+    // it untouched.
+    expect(columns.hidden).toBe(false);
+    expect(sandbox.document.getElementById("plan-dialog").showModalCalls).toBe(1);
+  });
+
+  it("lists plan items grouped by step, in order, struck through (by data-status) when the task is done or cancelled", () => {
+    const sandbox = loadBoardScript();
+    const lane = laneWithPlanStub();
+    lane.tasks = [
+      { id: "a", task_number: 1, title: "First", status: "done" },
+      { id: "b", task_number: 2, title: "Second", status: "pending" },
+      { id: "c", task_number: 3, title: "Third", status: "cancelled" },
+    ];
+    lane.plan.items = [
+      { task_id: "a", step: 1, note: "", new_since_approval: false },
+      { task_id: "b", step: 2, note: "", new_since_approval: false },
+      { task_id: "c", step: 3, note: "", new_since_approval: false },
+    ];
+    const section = sandbox.createLane(lane, "DEM");
+    fireClick(partsOf(section).headerRow.children.find((c: any) => c.textContent === "Plan"));
+
+    const stepsList = sandbox.document.getElementById("plan-steps");
+    expect(stepsList.children).toHaveLength(3);
+    // Each step's <li> is [stepLabel, ...one .plan-item per row] - one row
+    // here since each of these three items sits alone in its own step.
+    const rows = stepsList.children.map((stepEl: any) => stepEl.children[1]);
+    expect(rows.map((row: any) => row.dataset.status)).toEqual(["done", "pending", "cancelled"]);
+    expect(rows.map((row: any) => row.textContent)).toEqual(["DEM-1 - First", "DEM-2 - Second", "DEM-3 - Third"]);
+  });
+
+  it("shows the drift warning naming the unplanned tasks when the plan has drifted, and hides it when it hasn't", () => {
+    const sandbox = loadBoardScript();
+    const lane = laneWithPlanStub();
+    lane.tasks.push({ id: "c", task_number: 3, title: "Unplanned", status: "pending" });
+    lane.plan.drifted = true;
+    lane.plan.unplanned_task_ids = ["c"];
+    const section = sandbox.createLane(lane, "DEM");
+    fireClick(partsOf(section).headerRow.children.find((c: any) => c.textContent === "Plan"));
+
+    const warning = sandbox.document.getElementById("plan-drift-warning");
+    expect(warning.hidden).toBe(false);
+    expect(warning.textContent).toContain("DEM-3");
+  });
+
+  it("hides the drift warning and shows the approver for an approved, non-drifted plan", () => {
+    const sandbox = loadBoardScript();
+    const lane = laneWithPlanStub();
+    lane.plan.status = "approved";
+    lane.plan.approved_by = "valentin";
+    lane.plan.approval_note = "looks right";
+    const section = sandbox.createLane(lane, "DEM");
+    fireClick(partsOf(section).headerRow.children.find((c: any) => c.textContent === "Plan"));
+
+    expect(sandbox.document.getElementById("plan-drift-warning").hidden).toBe(true);
+    expect(sandbox.document.getElementById("plan-approval").textContent).toContain("valentin");
   });
 });
