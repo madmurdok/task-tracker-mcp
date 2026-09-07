@@ -43,11 +43,14 @@ and hand off work across sessions.
   epics don't enter the dependency graph, can't depend on each other, and
   `get_next_task` is not epic-aware; they exist so related tasks can be organized
   and reported on together, not to change how work is scheduled.
-- Releases participating in scheduling — v4 added releases (`create_release`,
-  `list_releases`, `get_release_status`, `release_it`, `release_id` on tasks), the
-  same non-goal as epics above: a release is a reporting/shipping gate (grouped
-  *by version*, orthogonal to epics grouping *by feature*), not a scheduling unit.
-  `get_next_task` is not release-aware either.
+- ~~Releases participating in scheduling~~ — **reversed in v10 (release plans).** v4 added releases
+  as a reporting/shipping gate only (grouped *by version*, orthogonal to epics
+  grouping *by feature*), explicitly not a scheduling unit. Release *plans*
+  changed that: `get_next_task(project_id, release_id)` now hands out in an
+  approved plan's order and refuses while that plan is unapproved. What is still
+  true is the epic half above — epics remain purely organizational, and the
+  unscoped `get_next_task(project_id)` is unchanged, so a release only
+  participates in scheduling when a caller asks it to.
 
 ## Constraints
 
@@ -161,6 +164,9 @@ erDiagram
     TASKS ||--o{ TASK_FILES : references
     TASKS ||--o{ TASK_DEPENDENCIES : "depends on"
     TASKS ||--o{ HANDOFF_NOTES : accumulates
+    RELEASES ||--o| RELEASE_PLANS : "is ordered by"
+    RELEASE_PLANS ||--o{ RELEASE_PLAN_ITEMS : sequences
+    TASKS ||--o{ RELEASE_PLAN_ITEMS : "placed by"
 
     PROJECTS {
         text id PK
@@ -230,6 +236,24 @@ erDiagram
     }
 ```
 
+A release may have one **plan**: the execution order for its batch, plus the
+record that a human approved it. The order itself was always expressible
+(`tasks.priority` and `task_dependencies`); what a plan adds is an *approval*,
+which an integer cannot carry — approved once, a batch can be worked end to end
+instead of stopping every few tasks to re-earn permission. `release_plans` holds
+`status` (`draft`/`approved`), `rationale`, and `approved_by`/`approval_note`/
+`approved_at`; `release_plan_items` places each task at a `step` (items sharing
+one may run in parallel) and a `position` within it.
+
+Two things are deliberately *not* stored there. **Drift** — a batch task missing
+from the plan, or a plan item whose task has left the batch — is computed at read
+time, for the same reason `blocked` is; a stored flag would disagree with the
+graph the moment either changed. And **"new since approval"** is
+`item.added_at > plan.approved_at`, so nothing has to be cleared on each
+approval. `status` has only two values because reverting an approved plan to
+`draft` *is* the supersede mechanism; adding a third would need the
+CHECK-widening table rebuild `schema.ts` already carries twice.
+
 `status = blocked` is derived, not stored authoritatively — `get_next_task` and
 `list_tasks` compute it from unmet dependencies at query time, so it can't drift out
 of sync with the graph; a `cancelled` prerequisite resolves a dependent the same way
@@ -274,7 +298,13 @@ discoverable.
 - `delete_task(task_id) -> { ok: true }` — hard-deletes a task row outright (cascading to its `task_files`, both directions of `task_dependencies`, and `handoff_notes` via `ON DELETE CASCADE`), for cleaning up a mis-created backlog task rather than leaving a permanent `cancelled` row behind. Restricted to tasks with no `release_id` — a released release's task membership is frozen (same reasoning as `set_task_release`), so a task already in one must be moved out first or cancelled instead. Deliberately no lock/ownership guard beyond that check.
 - `add_dependency(task_id, depends_on_task_id) -> { ok: true }` (rejects if it would create a cycle)
 - `split_task(task_id, subtasks: [{title, description, acceptance_criteria, file_paths, complexity_hint?, priority?}]) -> { new_task_ids[] }` — original task is replaced; its dependents and dependencies are rewired onto the subtasks, which also inherit its `epic_id`/`release_id`/`complexity_hint`/`priority` (the latter two overridable per subtask). Rejects if the original is already `done` or `cancelled` — splitting a finished/abandoned task would otherwise silently resurrect it.
-- `get_next_task(project_id) -> { task, doc_drift } | { task: null, reason: "all_done" | "all_blocked", blocked_on?: [...], doc_drift }` — atomically marks the returned task `in_progress` and gives it a 30-minute lock lease as part of the same transaction that selects it (see Failure Modes for both the no-duplicate-hand-out guarantee and stale-lock reclaim). Candidates are ordered `priority DESC, created_at ASC`. `task` is the full detail packet (see `get_task` below), not just the bare row. Not epic- or release-aware — picks from the whole project's graph regardless of either (see Non-goals). `doc_drift: true` means the tracked design doc changed since its hash was last captured — see `check_doc_sync`.
+- `get_next_task(project_id, release_id?) -> { task, doc_drift, ... } | { task: null, reason: "all_done" | "all_blocked" | "plan_not_approved", blocked_on?: [...], doc_drift }` — atomically marks the returned task `in_progress` and gives it a 30-minute lock lease as part of the same transaction that selects it (see Failure Modes for both the no-duplicate-hand-out guarantee and stale-lock reclaim). `task` is the full detail packet (see `get_task` below), not just the bare row. `doc_drift: true` means the tracked design doc changed since its hash was last captured — see `check_doc_sync`.
+  - **Without `release_id`** — unchanged: project-wide, `priority DESC, created_at ASC`, not epic-aware. It gains one reported field, `plan_pending`, naming any batch whose plan is `draft` or drifted, so an unscoped call cannot quietly bypass a plan without saying so in its own answer.
+  - **With `release_id`** (an id or a version) — scoped to that batch, and `plan_status` says which of four situations applies. An `approved`, undrifted plan is walked `step ASC, position ASC`, skipping done/cancelled and live leases and still gated by unmet dependencies. A `draft` or drifted plan returns `plan_not_approved` and hands out nothing — the enforcement that makes a plan followed rather than merely displayed. A batch with no plan falls back to priority order within that batch.
+  - Plan order is a **single pass**, so a reclaimable step-1 task beats a fresh pending step-2 one — where the unscoped path drains all pending work before reclaiming anything. The plan says step 1 first.
+- `create_plan(project_id, release_id, steps, rationale?) -> ReleasePlan` — writes or replaces a batch's execution order. `steps` is a flat list of task refs (each becoming a step of one, the common case) or a list of groups whose members may run in parallel; a ref is a uuid or a code (`TTM-63`). Upsert rather than separate insert/move/remove tools, because a membership change already sends the plan back to `draft`, which makes re-sending the whole plan the normal path. Replacing an approved plan resets it to `draft` and clears the approval and rationale — nobody signed off on the new order. Rejects a released or cancelled release, a task not in this batch, a task listed twice, and an empty list.
+- `get_plan(project_id, release_id) -> ReleasePlan | null` — items in execution order each with its *live* status, the approval record, and both directions of drift. `null` rather than an error when no plan exists, matching `get_task`/`get_release`.
+- `approve_plan(project_id, release_id, approved_by, note?) -> ReleasePlan` — `draft -> approved`. `note` is stored exactly as given: the approving human's verbatim words, not a summary, because the party an approval authorises is the party calling the tool and a quote is the only part of that record which is checkable afterwards. Refuses a drifted plan (the error names the offending tasks by code — it is the reader's cue to re-approve) and an already-approved one (no re-stamping over the first approver).
 - `get_task(task_id) -> { id, title, description, acceptance_criteria, status, estimated_tokens, priority, complexity_hint, file_paths, handoff_notes, ... }` — the same detail packet `get_next_task` returns, fetchable anytime with no claim/lock side effect; use this (not `get_next_task`) to just re-inspect a task.
 - `claim_task(task_id, session_id) -> { ok: true } | conflict error | blocked error | not_claimable error` — takes a specific task into work directly: moves a `pending` task straight to `in_progress` (the direct-pick counterpart to `get_next_task`'s queue-pull, for a human/orchestrator assigning a specific task to a specific parallel worker), or attaches/renews ownership on a task already `in_progress` (e.g. right after `get_next_task`). Rejects with `{ error: "conflict", current_owner_session_id, lock_expires_at }` if a different session's lock is still active, `{ error: "blocked", message }` if the task is `pending` with unmet dependencies (same gate `get_next_task`'s candidate query applies), or `{ error: "not_claimable", message, status }` if it's already `done`/`cancelled`.
 - `release_task(task_id, session_id, force?) -> { ok: true } | conflict error` — gives up ownership immediately (back to `pending`) instead of waiting out the lease; `force: true` overrides another session's still-active lock.
@@ -284,7 +314,7 @@ discoverable.
 - `get_project_status(project_id) -> { total, done, in_progress, blocked, pending, cancelled, percent, doc_drift }` — `doc_drift` mirrors `get_next_task`'s (see `check_doc_sync`).
 - `list_tasks(project_id, status?, epic_id?, release_id?) -> { tasks: [{ id, title, status, estimated_tokens, task_number, epic_id, release_id }] }` — summary rows only; use `get_task` for full detail. `epic_id`/`release_id` (both optional, combinable) scope the list to one epic and/or one release.
 - **Status CLI** (outside MCP): `node dist/cli/status.js [project_id_or_name]` — no arg lists every registered project's status; with an arg, prints that project's status plus its full task list. Read-only, opens the DB directly.
-- **Dashboard** (outside MCP): `npm run dashboard` starts a read-only local web server (`src/dashboard/server.ts`, plain `node:http`, no new dependency) bound to `127.0.0.1` only (port from `TASK_TRACKER_DASHBOARD_PORT`, default `4321`) — opens the DB the same way the Status CLI does, no MCP round-trip. Serves a project picker (`/`) and a per-project board (`/board.html?project=<id>`), plus the JSON API they poll: `GET /api/projects -> { projects: [{id, name}] }` and `GET /api/projects/:id/board -> BoardData` (`getBoardData` in `src/domain/board.ts` — tasks grouped into release swimlanes, the "no release" (Backlog) lane always first even when empty, remaining lanes newest-release-first; each task shaped with title/description/status/priority/epic_name/owner_session_id/is_stale/task_number, plus a per-board `project_code_prefix`; no new schema, purely derived from existing tables). The board page polls that endpoint every 1.5s and re-renders, showing a `doc_drift` banner, a "last updated"/disconnected indicator, click-to-collapse per-release swimlanes (each lane's title annotated with its non-cancelled task count, e.g. "Backlog (5)"; a `released` or `cancelled` lane defaults to collapsed, and a cancelled one gets a red `--danger` header, a `Cancelled` badge and its reason behind the same dialog release notes use — deliberately *louder* than a cancelled task's grey/struck-through card, since a whole abandoned batch is the thing a reader most needs to notice), per-card click-to-expand descriptions (hidden by default - only status/priority/epic/owner show at a glance; both collapse states are in-memory only, not persisted), and each card's title prefixed with its `PREFIX-N` display code (`project_code_prefix` + `task_number`, e.g. "TTM-52"). `POST /api/shutdown -> { ok: true }` is the one intentional non-GET route - closes the process shortly after responding (both pages have a "Stop dashboard" button wired to it); still doesn't touch the tracker DB, it only ends the dashboard's own process. On startup, `main()` also shells out to the OS's default-URL-open command (`open`/`xdg-open`/`start` - `src/dashboard/openBrowser.ts`) to open the picker page automatically, reusing an already-open browser/tab the same way any OS URL-open does; set `TASK_TRACKER_DASHBOARD_NO_OPEN` to skip it (headless/SSH usage). A failed open (e.g. no `xdg-open`) just logs a warning - never takes the server down.
+- **Dashboard** (outside MCP): `npm run dashboard` starts a read-only local web server (`src/dashboard/server.ts`, plain `node:http`, no new dependency) bound to `127.0.0.1` only (port from `TASK_TRACKER_DASHBOARD_PORT`, default `4321`) — opens the DB the same way the Status CLI does, no MCP round-trip. Serves a project picker (`/`) and a per-project board (`/board.html?project=<id>`), plus the JSON API they poll: `GET /api/projects -> { projects: [{id, name}] }` and `GET /api/projects/:id/board -> BoardData` (`getBoardData` in `src/domain/board.ts` — tasks grouped into release swimlanes, the "no release" (Backlog) lane always first even when empty, remaining lanes newest-release-first; each task shaped with title/description/status/priority/epic_name/owner_session_id/is_stale/task_number, plus a per-board `project_code_prefix`; no new schema, purely derived from existing tables). The board page polls that endpoint every 1.5s and re-renders, showing a `doc_drift` banner, a "last updated"/disconnected indicator, click-to-collapse per-release swimlanes (each lane's title annotated with its non-cancelled task count, e.g. "Backlog (5)"; a `released` or `cancelled` lane defaults to collapsed, and a cancelled one gets a red `--danger` header, a `Cancelled` badge and its reason behind the same dialog release notes use — deliberately *louder* than a cancelled task's grey/struck-through card, since a whole abandoned batch is the thing a reader most needs to notice), per-card click-to-expand descriptions (hidden by default - only status/priority/epic/owner show at a glance; both collapse states are in-memory only, not persisted), and each card's title prefixed with its `PREFIX-N` display code (`project_code_prefix` + `task_number`, e.g. "TTM-52"). A lane whose release has a plan also gets a **Plan** button beside Release notes, opening a dialog that lists the plan's steps in order with each item's title joined from the lane's own tasks (the payload carries the *ordering* only, never a second copy of a title or status), done and cancelled items struck through, the approval header quoting the approver's own words, and a drift warning naming the tasks the plan fails to cover. It is read-only like the rest of the dashboard — deliberately **no Approve button**, since approval happens in chat through `approve_plan`; that message is therefore the whole interface for the failure, which is why its wording is pinned by a test. `POST /api/shutdown -> { ok: true }` is the one intentional non-GET route - closes the process shortly after responding (both pages have a "Stop dashboard" button wired to it); still doesn't touch the tracker DB, it only ends the dashboard's own process. On startup, `main()` also shells out to the OS's default-URL-open command (`open`/`xdg-open`/`start` - `src/dashboard/openBrowser.ts`) to open the picker page automatically, reusing an already-open browser/tab the same way any OS URL-open does; set `TASK_TRACKER_DASHBOARD_NO_OPEN` to skip it (headless/SSH usage). A failed open (e.g. no `xdg-open`) just logs a warning - never takes the server down.
 
 ## Failure Modes & Edge Cases
 
