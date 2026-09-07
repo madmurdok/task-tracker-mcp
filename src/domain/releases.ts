@@ -170,6 +170,64 @@ function requireTaskProjectAndRelease(
 }
 
 /**
+ * TTM-68, the inbound half - a task moved into a release is membership drift
+ * for that release's plan, if it has one. Same shape as tasks.ts's
+ * `appendToPlanAndRevert` (see its comment for why this is duplicated here
+ * rather than imported from either plans.ts or tasks.ts): append the task as
+ * a new final step, then send an approved plan back to draft.
+ */
+function appendToPlanAndRevert(db: DatabaseInstance, releaseId: string, taskId: string): void {
+  const plan = db.prepare(`SELECT id FROM release_plans WHERE release_id = ?`).get(releaseId) as
+    | { id: string }
+    | undefined;
+  if (!plan) return;
+
+  const { maxStep } = db
+    .prepare(`SELECT COALESCE(MAX(step), 0) AS maxStep FROM release_plan_items WHERE plan_id = ?`)
+    .get(plan.id) as { maxStep: number };
+
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO release_plan_items (plan_id, task_id, step, position, note, added_at)
+     VALUES (?, ?, ?, 0, '', ?)`,
+  ).run(plan.id, taskId, maxStep + 1, now);
+
+  db.prepare(
+    `UPDATE release_plans
+     SET status = 'draft', approved_by = NULL, approval_note = NULL, approved_at = NULL, updated_at = ?
+     WHERE id = ? AND status = 'approved'`,
+  ).run(now, plan.id);
+}
+
+/**
+ * TTM-68, the outbound half - a task moved out of a release (or cleared to
+ * null) is membership drift for the release it left, if that release has a
+ * plan: the order it was given no longer applies to it. Drops its item
+ * outright rather than leaving it to be reported as orphaned - the item is
+ * for a task that is, as of this same write, simply not in the batch
+ * anymore - and sends an approved plan back to draft.
+ *
+ * Inlined for the same reason as `appendToPlanAndRevert` above: no import
+ * from plans.ts, to keep clear of the cycle described in its IMPORT
+ * DIRECTION comment.
+ */
+function revertPlanOnRemoval(db: DatabaseInstance, releaseId: string, taskId: string): void {
+  const plan = db.prepare(`SELECT id FROM release_plans WHERE release_id = ?`).get(releaseId) as
+    | { id: string }
+    | undefined;
+  if (!plan) return;
+
+  db.prepare(`DELETE FROM release_plan_items WHERE plan_id = ? AND task_id = ?`).run(plan.id, taskId);
+
+  const now = new Date().toISOString();
+  db.prepare(
+    `UPDATE release_plans
+     SET status = 'draft', approved_by = NULL, approval_note = NULL, approved_at = NULL, updated_at = ?
+     WHERE id = ? AND status = 'approved'`,
+  ).run(now, plan.id);
+}
+
+/**
  * Escape valve for a task that turns out not to belong in a release (or
  * belongs in a different one) - move it, or clear release_id with `null`.
  * Rejects if *either* the task's current release or its target release is
@@ -184,6 +242,14 @@ function requireTaskProjectAndRelease(
  * workflow, and unlike a released release there are no generated
  * release_notes for the membership to drift away from, which is the only
  * reason the outbound direction is frozen for shipped releases at all.
+ *
+ * TTM-68: this one function carries both directions of the plan-revert rule -
+ * `currentReleaseId` is the outbound side (dropped from its old release's
+ * plan, if any), `newReleaseId` the inbound side (appended to its new
+ * release's plan, if any). Both run inside the same transaction as the
+ * `tasks` write itself, and only when the release actually changes - calling
+ * setTaskRelease with the release a task is already in is not membership
+ * drift and must not shuffle it to the end of anyone's plan.
  */
 export function setTaskRelease(db: DatabaseInstance, taskRef: string, releaseRef: string | null): void {
   // Resolved once, at the top, and used for both the lookup and the write.
@@ -201,13 +267,24 @@ export function setTaskRelease(db: DatabaseInstance, taskRef: string, releaseRef
 
   const newReleaseId = releaseRef ? requireAssignableRelease(db, projectId, releaseRef).id : null;
 
-  runOne(
-    db.prepare(`UPDATE tasks SET release_id = ?, updated_at = ? WHERE id = ?`),
-    `set_task_release ${taskRef}`,
-    newReleaseId,
-    new Date().toISOString(),
-    taskId,
-  );
+  const run = db.transaction((): void => {
+    runOne(
+      db.prepare(`UPDATE tasks SET release_id = ?, updated_at = ? WHERE id = ?`),
+      `set_task_release ${taskRef}`,
+      newReleaseId,
+      new Date().toISOString(),
+      taskId,
+    );
+
+    if (currentReleaseId && currentReleaseId !== newReleaseId) {
+      revertPlanOnRemoval(db, currentReleaseId, taskId);
+    }
+    if (newReleaseId && newReleaseId !== currentReleaseId) {
+      appendToPlanAndRevert(db, newReleaseId, taskId);
+    }
+  });
+
+  run();
 }
 
 /**
