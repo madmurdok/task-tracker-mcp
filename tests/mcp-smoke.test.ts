@@ -350,6 +350,96 @@ describe("MCP server smoke test", () => {
     }
   });
 
+  it("carries approve_plan's refusals to the caller with their message intact", async () => {
+    // The happy path is covered by the all-tools inventory test. This is the
+    // half that matters more at the transport boundary: approve_plan's drift
+    // refusal NAMES the offending tasks by code, and that sentence is the
+    // owner's only cue to re-approve. A rejection that arrived as a bare
+    // "isError" with the reason stripped would leave the feature much worse
+    // with nothing to catch it - and the plan popup deliberately shows no
+    // Approve button, so this message is the whole interface for the failure.
+    const client = await connectedClient(db);
+    const callText = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      const content = result.content as Array<{ type: string; text: string }>;
+      return { isError: result.isError, text: content[0].text };
+    };
+    const payloadOf = async (name: string, args: Record<string, unknown>) =>
+      JSON.parse((await callText(name, args)).text);
+
+    const project = await payloadOf("create_project", {
+      name: "Plan refusals",
+      root_path: "/tmp/plan-refusals",
+    });
+    await payloadOf("create_release", { project_id: project.project_id, version: "1.0.0" });
+    const planned = await payloadOf("create_task", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+      title: "in the plan",
+      complexity_hint: "normal",
+    });
+
+    // No plan yet: a refusal, not an empty approval.
+    const noPlan = await callText("approve_plan", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+      approved_by: "valentin",
+    });
+    expect(noPlan.isError).toBe(true);
+    expect(noPlan.text).toMatch(/No plan for release/);
+
+    await payloadOf("create_plan", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+      steps: [planned.task_id],
+    });
+
+    // A second task joins the batch, which sends the plan back to draft and
+    // leaves it drifted (TTM-68's hook appends it, so the drift here is the
+    // draft status rather than a missing item) - then approve twice over, to
+    // pin both the already-approved refusal and that the first approver is
+    // not silently overwritten.
+    const late = await payloadOf("create_task", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+      title: "joined late",
+      complexity_hint: "normal",
+    });
+    expect(late.task_id).toBeTruthy();
+
+    const firstApproval = await callText("approve_plan", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+      approved_by: "valentin",
+      note: "план ок, работай",
+    });
+    expect(firstApproval.isError, firstApproval.text).toBeFalsy();
+
+    // The note is the owner's verbatim words, and it has to survive the round
+    // trip byte for byte - a paraphrase or a trim would make the audit trail
+    // unquotable, which is the only thing it is for.
+    const readBack = await payloadOf("get_plan", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+    });
+    expect(readBack.approval_note).toBe("план ок, работай");
+    expect(readBack.status).toBe("approved");
+
+    const twice = await callText("approve_plan", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+      approved_by: "someone else",
+    });
+    expect(twice.isError).toBe(true);
+    expect(twice.text).toMatch(/already approved/);
+
+    const stillTheFirstApprover = await payloadOf("get_plan", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+    });
+    expect(stillTheFirstApprover.approved_by).toBe("valentin");
+  });
+
   it("exercises create_tasks end to end, wiring a temp_id-to-temp_id dependency", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
