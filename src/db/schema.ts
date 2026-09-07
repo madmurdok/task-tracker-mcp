@@ -87,6 +87,60 @@ CREATE TABLE IF NOT EXISTS handoff_notes (
 );
 
 CREATE INDEX IF NOT EXISTS idx_handoff_notes_task_id ON handoff_notes(task_id);
+
+-- The execution order for one release batch, plus the record that a human
+-- approved it. The order was already expressible (tasks.priority, plus
+-- task_dependencies); an approval was not, and that is what this table is
+-- for: approved once, a whole batch can be worked without stopping every
+-- two or three tasks to re-earn permission.
+--
+-- status is two values and that is the whole state space - sending an
+-- approved plan back to 'draft' IS the supersede mechanism, so no third
+-- value is invented. If a third one ever is needed, note that SQLite bakes
+-- a CHECK into the stored schema permanently and no ALTER widens one: it
+-- needs the rename -> recreate -> copy -> drop rebuild that
+-- widenTaskStatusCheck and widenReleaseStatusCheck below already implement
+-- twice, pragma handling and all. Copy one of those; do not rediscover it.
+--
+-- approval_note holds the approver's own words, not a paraphrase. The party
+-- an approval authorises is the same party that calls approve_plan, so this
+-- is an audit trail rather than an enforcement boundary, and a trail that
+-- quotes is checkable where one that summarises is not.
+CREATE TABLE IF NOT EXISTS release_plans (
+  id TEXT PRIMARY KEY,
+  release_id TEXT NOT NULL UNIQUE REFERENCES releases(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'approved')),
+  rationale TEXT NOT NULL DEFAULT '',
+  approved_by TEXT,
+  approval_note TEXT,
+  approved_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- One task's place in a plan. Items sharing a step may run in parallel;
+-- position only orders them inside that step, so a display stays stable.
+--
+-- Deliberately NO added_after_approval flag: "new since approval" is
+-- added_at > release_plans.approved_at, computed at read time. A stored
+-- boolean would need clearing on every approval and could drift out of
+-- sync with it - the same reason displayStatus keeps blocked computed
+-- from the dependency graph rather than storing it on the row.
+--
+-- Nothing here duplicates the task's title or status either. Both are one
+-- join away and both change under the plan's feet; a copy would be a second
+-- truth to keep.
+CREATE TABLE IF NOT EXISTS release_plan_items (
+  plan_id TEXT NOT NULL REFERENCES release_plans(id) ON DELETE CASCADE,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  step INTEGER NOT NULL,
+  position INTEGER NOT NULL,
+  note TEXT NOT NULL DEFAULT '',
+  added_at TEXT NOT NULL,
+  PRIMARY KEY (plan_id, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_release_plan_items_task_id ON release_plan_items(task_id);
 `;
 
 import type { DatabaseInstance } from "./connection.js";
@@ -460,6 +514,14 @@ function backfillTaskNumbers(db: DatabaseInstance): void {
  * it's a no-op against tables that already exist (e.g. this project's own
  * ~/.task-tracker/tracker.db). New nullable columns need an explicit
  * ALTER TABLE so existing databases pick them up too.
+ *
+ * A new *table* is the exception and needs nothing here: it doesn't exist
+ * yet in any database, so `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL creates
+ * it on old and new ones alike (openDatabase execs SCHEMA_SQL on every open,
+ * before calling this). That is why `release_plans`/`release_plan_items` are
+ * absent below and why adding an entry for them would be dead code - unlike
+ * tasks.priority or tasks.release_id, there is no ADD COLUMN to sequence and
+ * no ordering constraint against the CHECK-widening rebuilds.
  */
 export function runMigrations(db: DatabaseInstance): void {
   ensureColumn(db, "tasks", "lock_expires_at", "TEXT");
