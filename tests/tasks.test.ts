@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import { openDatabase } from "../src/db/connection.js";
 import { addDependency } from "../src/domain/dependencies.js";
 import { addHandoffNote } from "../src/domain/handoffNotes.js";
+import { claimTask, completeTask } from "../src/domain/lifecycle.js";
 import { createProject } from "../src/domain/projects.js";
 import { createRelease } from "../src/domain/releases.js";
 import {
+  amendTask,
   createTask,
   deleteTask,
   listTaskFilePaths,
@@ -16,11 +18,15 @@ import {
   withCode,
   runOne,
 } from "../src/domain/tasks.js";
+import { listTaskAmendments } from "../src/domain/taskAmendments.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
+import type { CompletionVerifier } from "../src/domain/verification.js";
 
 function stubEstimator(tokens: number): BudgetEstimator {
   return { estimateTokens: () => tokens };
 }
+
+const noopVerifier: CompletionVerifier = { verify: () => ({ passed: true, reason: "noop" }) };
 
 describe("createTask", () => {
   it("inserts a task and its file list, scoped to the project", () => {
@@ -415,5 +421,189 @@ describe("a task-mutating call given a code changes the row it names", () => {
     expect(() =>
       runOne(db.prepare(`UPDATE tasks SET priority = ? WHERE id = ?`), "probe", 1, "no-such-row"),
     ).toThrow(/matched 0 rows/);
+  });
+});
+
+describe("amendTask", () => {
+  // One task per test, put into the status the test needs to exercise -
+  // acceptance for TTM-81 asks for a case at each of pending/in_progress/done.
+  function pendingTask(db: ReturnType<typeof openDatabase>) {
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const task = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "The memory-limit suspension test is flaky on Windows",
+      description: "Windows-only, retried three times",
+      acceptance_criteria: "Passes on a Windows runner ten times in a row",
+      complexity_hint: "normal",
+    }).task;
+    return { db, project, task };
+  }
+
+  it("corrects a pending task's title, recording the previous value under the given reason", () => {
+    const { db, task } = pendingTask(openDatabase(":memory:"));
+
+    const { amendments } = amendTask(db, stubEstimator(0), task.id, {
+      title: "The memory-limit suspension test is flaky",
+      reason: "it just failed on macOS too, so the Windows-specific title is now misleading (GM-340)",
+    });
+
+    expect(requireTask(db, task.id).title).toBe("The memory-limit suspension test is flaky");
+    expect(amendments).toEqual([
+      expect.objectContaining({
+        task_id: task.id,
+        field: "title",
+        previous_value: "The memory-limit suspension test is flaky on Windows",
+        reason: "it just failed on macOS too, so the Windows-specific title is now misleading (GM-340)",
+      }),
+    ]);
+  });
+
+  it("corrects an in_progress task's description", () => {
+    const { db, task } = pendingTask(openDatabase(":memory:"));
+    claimTask(db, task.id, "session-1");
+    expect(requireTask(db, task.id).status).toBe("in_progress");
+
+    amendTask(db, stubEstimator(0), task.id, {
+      description: "Fails on macOS too - not Windows-specific after all",
+      reason: "learned mid-task that this isn't platform-specific",
+    });
+
+    const updated = requireTask(db, task.id);
+    expect(updated.status).toBe("in_progress"); // amending text doesn't touch status
+    expect(updated.description).toBe("Fails on macOS too - not Windows-specific after all");
+  });
+
+  it("corrects a done task's title", () => {
+    const { db, task } = pendingTask(openDatabase(":memory:"));
+    claimTask(db, task.id, "session-1");
+    completeTask(db, noopVerifier, { task_id: task.id, summary: "fixed" });
+    expect(requireTask(db, task.id).status).toBe("done");
+
+    amendTask(db, stubEstimator(0), task.id, {
+      title: "The memory-limit suspension test was flaky on both Windows and macOS",
+      reason: "correcting the record for whoever reads this card next",
+    });
+
+    const updated = requireTask(db, task.id);
+    expect(updated.status).toBe("done"); // still done - a correction, not a reopen
+    expect(updated.title).toBe("The memory-limit suspension test was flaky on both Windows and macOS");
+  });
+
+  it("replaces file_paths as a whole set and recomputes estimated_tokens", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const task = createTask(db, stubEstimator(500), {
+      project_id: project.id,
+      title: "GM-341",
+      file_paths: ["src/db/releases.ts", "src/tools/releases.ts"],
+      complexity_hint: "normal",
+    }).task;
+
+    const estimator: BudgetEstimator = { estimateTokens: () => 777 };
+    const { task: amended, amendments } = amendTask(db, estimator, task.id, {
+      file_paths: ["src/domain/releases.ts", "src/mcp/tools/releases.ts"],
+      reason: "neither original path exists; these are the real files (GM-341)",
+    });
+
+    expect(listTaskFilePaths(db, task.id)).toEqual(["src/domain/releases.ts", "src/mcp/tools/releases.ts"]);
+    expect(amended.estimated_tokens).toBe(777);
+    expect(amendments).toEqual([
+      expect.objectContaining({
+        field: "file_paths",
+        previous_value: JSON.stringify(["src/db/releases.ts", "src/tools/releases.ts"]),
+      }),
+    ]);
+  });
+
+  it("treats reordering the same file_paths as no change", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const task = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      title: "x",
+      file_paths: ["src/a.ts", "src/b.ts"],
+      complexity_hint: "normal",
+    }).task;
+
+    expect(() =>
+      amendTask(db, stubEstimator(0), task.id, {
+        file_paths: ["src/b.ts", "src/a.ts"],
+        reason: "shouldn't matter, it's the same set",
+      }),
+    ).toThrow(/changed nothing/);
+  });
+
+  it("rejects a call where every given field already matches its current value", () => {
+    const { db, task } = pendingTask(openDatabase(":memory:"));
+
+    expect(() =>
+      amendTask(db, stubEstimator(0), task.id, {
+        title: task.title,
+        reason: "no-op",
+      }),
+    ).toThrow(/amend_task .* changed nothing/);
+
+    // No amendment row should have been written for the rejected call.
+    expect(listTaskAmendments(db, task.id)).toEqual([]);
+  });
+
+  it("requires a non-blank reason", () => {
+    const { db, task } = pendingTask(openDatabase(":memory:"));
+
+    expect(() =>
+      amendTask(db, stubEstimator(0), task.id, { title: "New title", reason: "   " }),
+    ).toThrow(/amend_task requires a reason/);
+
+    expect(requireTask(db, task.id).title).toBe(task.title);
+  });
+
+  it("rejects an unknown task_id", () => {
+    const db = openDatabase(":memory:");
+    expect(() => amendTask(db, stubEstimator(0), "missing", { title: "x", reason: "why" })).toThrow(
+      /Unknown task_id: missing/,
+    );
+  });
+
+  it("keeps the originally agreed text recoverable after the correction", () => {
+    const { db, task } = pendingTask(openDatabase(":memory:"));
+    const originalTitle = task.title;
+
+    amendTask(db, stubEstimator(0), task.id, {
+      title: "A different title entirely",
+      reason: "first correction",
+    });
+    amendTask(db, stubEstimator(0), task.id, {
+      title: "Yet another title",
+      reason: "second correction",
+    });
+
+    const history = listTaskAmendments(db, task.id);
+    expect(history.map((a) => a.previous_value)).toEqual([originalTitle, "A different title entirely"]);
+    expect(requireTask(db, task.id).title).toBe("Yet another title");
+  });
+
+  it("changes a task's text without touching its release_id", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const release = createRelease(db, { project_id: project.id, version: "1.0.0" });
+    const task = createTask(db, stubEstimator(0), {
+      project_id: project.id,
+      release_id: release.id,
+      title: "In a release",
+      complexity_hint: "normal",
+    }).task;
+
+    amendTask(db, stubEstimator(0), task.id, { title: "Renamed", reason: "typo" });
+
+    expect(requireTask(db, task.id).release_id).toBe(release.id);
+  });
+
+  it("resolves a task by its code the same way other mutating calls do", () => {
+    const { db, project, task } = pendingTask(openDatabase(":memory:"));
+    const code = taskCode(project.code_prefix, task.task_number);
+
+    amendTask(db, stubEstimator(0), code, { title: "Renamed via code", reason: "why not" });
+
+    expect(requireTask(db, task.id).title).toBe("Renamed via code");
   });
 });
