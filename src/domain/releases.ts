@@ -240,10 +240,17 @@ export function setTaskRelease(db: DatabaseInstance, taskRef: string, releaseRef
  */
 export function setReleaseSequence(
   db: DatabaseInstance,
-  projectId: string,
+  projectRef: string,
   releaseRef: string,
   sequence: number,
 ): void {
-  const release = requireRelease(db, projectId, releaseRef);
+  // Resolve the project first, like every other project_id-taking function
+  // here does (createRelease, cancelRelease, etc.) - passing the raw ref
+  // straight into requireRelease's project-scoped lookup silently fails to
+  // match anything when it's a name rather than a uuid, and the resulting
+  // "Unknown release" error then blames the release for what was actually an
+  // unresolved project.
+  const project = requireProject(db, projectRef);
+  const release = requireRelease(db, project.id, releaseRef);
   db.prepare(`UPDATE releases SET sequence = ? WHERE id = ?`).run(sequence, release.id);
 }

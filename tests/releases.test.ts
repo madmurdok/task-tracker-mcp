@@ -584,6 +584,37 @@ describe("setReleaseSequence", () => {
 
     expect(() => setReleaseSequence(db, project.id, release.id, 5)).not.toThrow();
   });
+
+  it("resolves the release by version and the project by name, like its sibling tools (TTM-80)", () => {
+    // set_release_sequence's own description claims project_id accepts a name,
+    // same as every other project_id-taking tool - but this one resolved the
+    // release directly against the raw project_id it was given, so a name
+    // never matched and the release lookup silently failed underneath it.
+    const { db, project } = setup();
+    const first = createRelease(db, { project_id: project.id, version: "0.1" }); // sequence 10
+    const second = createRelease(db, { project_id: project.id, version: "0.2" }); // sequence 20
+
+    expect(() => setReleaseSequence(db, "Demo", "0.1", 25)).not.toThrow();
+
+    const ordered = listReleases(db, project.id);
+    expect(ordered.map((r) => r.id)).toEqual([second.id, first.id]);
+  });
+
+  it("names the project, not the release, for an unknown project - and vice versa (TTM-80)", () => {
+    // The regression this guards: an unresolved project_id made requireRelease's
+    // project-scoped lookup match nothing, so the error read "Unknown release:
+    // <ref>" even when the release existed and only the project didn't -
+    // sending the reader to check the release instead of the actual problem.
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "0.1" });
+
+    expect(() => setReleaseSequence(db, "missing-project", release.id, 5)).toThrow(
+      /Unknown project: missing-project/,
+    );
+    expect(() => setReleaseSequence(db, project.id, "missing-release", 5)).toThrow(
+      /Unknown release: missing-release/,
+    );
+  });
 });
 
 describe("set_task_release given a task code", () => {
