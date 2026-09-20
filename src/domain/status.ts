@@ -1,6 +1,7 @@
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireEpic, listEpics, type Epic } from "./epics.js";
 import { listHandoffNotes, type HandoffNote } from "./handoffNotes.js";
+import { listTaskAmendments, type TaskAmendment } from "./taskAmendments.js";
 import {
   getPlan,
   listPendingPlans,
@@ -93,13 +94,21 @@ export interface TaskDetail extends Task {
   code: string;
   file_paths: string[];
   handoff_notes: HandoffNote[];
+  /**
+   * amend_task's trail (TTM-81), oldest first - empty for a never-amended
+   * task. The row's own fields are always the *current* text; this is what
+   * makes what a plan was approved against, or what a card used to say,
+   * recoverable rather than silently overwritten.
+   */
+  amendments: TaskAmendment[];
 }
 
 /**
  * The "compact task packet" the architecture doc's data flow promises from
  * get_next_task (files, acceptance criteria, prior handoff notes) - composes
  * requireTask/listTaskFilePaths (tasks.ts) with listHandoffNotes
- * (handoffNotes.ts). Also backs the side-effect-free get_task MCP tool.
+ * (handoffNotes.ts) and listTaskAmendments (taskAmendments.ts). Also backs the
+ * side-effect-free get_task MCP tool.
  */
 export function getTaskDetail(db: DatabaseInstance, taskId: string): TaskDetail {
   const task = requireTask(db, taskId);
@@ -109,6 +118,7 @@ export function getTaskDetail(db: DatabaseInstance, taskId: string): TaskDetail 
     ...withCode(db, task),
     file_paths: listTaskFilePaths(db, task.id),
     handoff_notes: listHandoffNotes(db, task.id),
+    amendments: listTaskAmendments(db, task.id),
   };
 }
 

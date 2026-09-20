@@ -2,7 +2,14 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DatabaseInstance } from "../../db/connection.js";
 import type { BudgetEstimator } from "../../domain/budget.js";
-import { createTask, createTasks, deleteTask, setTaskPriority, splitTask } from "../../domain/tasks.js";
+import {
+  amendTask,
+  createTask,
+  createTasks,
+  deleteTask,
+  setTaskPriority,
+  splitTask,
+} from "../../domain/tasks.js";
 import { jsonResult } from "../toolResult.js";
 
 const complexityHintEnum = z.enum(["normal", "high"]);
@@ -115,6 +122,30 @@ export function registerTaskTools(
     async ({ task_id, priority }) => {
       setTaskPriority(db, task_id, priority);
       return jsonResult({ ok: true });
+    },
+  );
+
+  server.registerTool(
+    "amend_task",
+    {
+      description:
+        "Correct a task's own text after creation, under a mandatory reason - for when the card itself turns out wrong (a file_paths entry that doesn't exist, a title that stopped being true, acceptance_criteria that turned out different), not as a way to silently rewrite the deal. Amendable: title, description, acceptance_criteria, file_paths, complexity_hint - give only the ones changing. priority has its own tool (set_task_priority) and is not amendable here. Every changed field is snapshotted to task_amendments before being overwritten; get_task returns both the corrected text and the full amendment history (previous value + reason + when), so what a plan was approved against, or what a card used to say, stays recoverable rather than lost. No status gate - amends a pending, in_progress, or done task alike, since a correction is worth making at any of them and the trail is what keeps it honest instead of a quiet edit. Never touches release_id or a batch's plan: amending text is not a membership change, so it cannot drift an approved plan back to draft (use set_task_release/create_plan for changes that should). file_paths, if given, replaces the whole list (as a set - reordering the same files is not a change) and recomputes estimated_tokens the same way create_task does. Rejects a call where every given field already matches its current value - there is nothing to record. Accepts a task's uuid or its code (`TTM-63`).",
+      inputSchema: {
+        task_id: z.string().min(1),
+        title: z.string().min(1).optional(),
+        description: z.string().optional(),
+        acceptance_criteria: z.string().optional(),
+        file_paths: z.array(z.string()).optional(),
+        complexity_hint: complexityHintEnum.optional(),
+        reason: z.string().min(1),
+      },
+    },
+    async ({ task_id, reason, ...fields }) => {
+      const { task, amendments } = amendTask(db, estimator, task_id, { ...fields, reason });
+      return jsonResult({
+        task_id: task.id,
+        amended_fields: amendments.map((amendment) => amendment.field),
+      });
     },
   );
 }

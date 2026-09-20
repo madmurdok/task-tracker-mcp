@@ -88,6 +88,27 @@ CREATE TABLE IF NOT EXISTS handoff_notes (
 
 CREATE INDEX IF NOT EXISTS idx_handoff_notes_task_id ON handoff_notes(task_id);
 
+-- Append-only trail for amend_task (TTM-81): correcting a task's own text
+-- (title/description/acceptance_criteria/file_paths/complexity_hint) after
+-- creation, as distinct from rewriting the deal without a visible trace. Each
+-- row is one field's one change - previous_value is that field's value right
+-- before this amendment (file_paths stored as a JSON array string; every other
+-- field is plain text), and reason is why, required the same way
+-- cancel_release's reason is: the record's whole value is in the why. Never
+-- updated or deleted once written - the point is that the text a plan was
+-- approved against, or a card someone read before, stays recoverable even
+-- after the row it describes reads differently.
+CREATE TABLE IF NOT EXISTS task_amendments (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  field TEXT NOT NULL CHECK (field IN ('title', 'description', 'acceptance_criteria', 'file_paths', 'complexity_hint')),
+  previous_value TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  amended_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_amendments_task_id ON task_amendments(task_id);
+
 -- The execution order for one release batch, plus the record that a human
 -- approved it. The order was already expressible (tasks.priority, plus
 -- task_dependencies); an approval was not, and that is what this table is

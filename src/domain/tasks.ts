@@ -6,6 +6,7 @@ import { requireEpic } from "./epics.js";
 import { requireProject } from "./projects.js";
 import { appendTaskToPlan } from "./planWrites.js";
 import { requireAssignableRelease } from "./releases.js";
+import { recordAmendment, type AmendableField, type TaskAmendment } from "./taskAmendments.js";
 
 export type TaskStatus = "pending" | "in_progress" | "done" | "cancelled";
 export type TaskComplexityHint = "normal" | "high";
@@ -221,6 +222,147 @@ export function setTaskPriority(db: DatabaseInstance, taskRef: string, priority:
     new Date().toISOString(),
     taskId,
   );
+}
+
+export interface AmendTaskInput {
+  title?: string;
+  description?: string;
+  acceptance_criteria?: string;
+  file_paths?: string[];
+  complexity_hint?: TaskComplexityHint;
+  /** Mandatory, the same way cancel_release's is - the record's whole value is the why. */
+  reason: string;
+}
+
+export interface AmendTaskResult {
+  task: Task;
+  /** Just the rows this call wrote - the full history is on `get_task`. */
+  amendments: TaskAmendment[];
+}
+
+/** The scalar (non-file_paths) fields amend_task may correct, in read order. */
+const AMENDABLE_SCALAR_FIELDS = [
+  "title",
+  "description",
+  "acceptance_criteria",
+  "complexity_hint",
+] as const satisfies readonly AmendableField[];
+
+function sameFileSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sortedA = [...a].sort();
+  const sortedB = [...b].sort();
+  return sortedA.every((path, i) => path === sortedB[i]);
+}
+
+/**
+ * Corrects a task's own text after creation - a path that never existed, a
+ * title that stopped being true, criteria that turned out different - without
+ * silently overwriting what a plan may have been approved against. Every
+ * changed field is snapshotted to task_amendments (see taskAmendments.ts)
+ * *before* being overwritten, under the caller's mandatory `reason`; `get_task`
+ * returns both the corrected row and its full amendment history, so nothing is
+ * lost, only superseded and dated.
+ *
+ * No status gate, deliberately - unlike the field-scoped-permissions shape
+ * this was weighed against (title/file_paths/complexity_hint free, description/
+ * acceptance_criteria pending-only), which cannot express "we learned this
+ * task was bigger" once work has started, exactly when that is usually
+ * learned. A correction on a `done` task is still worth making, for whoever
+ * reads the card next; the trail this leaves is what keeps that honest
+ * instead of a silent rewrite.
+ *
+ * Deliberately does not touch release_id, and calls neither
+ * appendTaskToPlan/removeTaskFromPlan nor revertPlanToDraft - a text
+ * correction is not a batch-membership change, so it must never be treated as
+ * one (see planWrites.ts / plans.ts's planDrift, which is computed purely off
+ * release_id and plan item rows). An approved plan stays approved and
+ * undrifted across an amendment of a task it orders.
+ *
+ * `file_paths`, given, replaces the whole list (compared as a set, not an
+ * ordered list - reordering the same files is not a change) and, since that
+ * changes what a task actually touches, recomputes `estimated_tokens` the same
+ * way createTask does. `priority` has its own single-purpose tool
+ * (set_task_priority) and is not amendable here.
+ *
+ * Rejects a call that changes nothing - every given field already matching
+ * its current value - the same way runOne rejects a write that matched no
+ * rows: a caller that thinks it corrected something should not be told `ok`
+ * for a no-op, and it would otherwise be possible to fabricate an amendment
+ * row (a reason, no actual change) that misrepresents the trail it exists to
+ * keep honest.
+ */
+export function amendTask(
+  db: DatabaseInstance,
+  estimator: BudgetEstimator,
+  taskRef: string,
+  input: AmendTaskInput,
+): AmendTaskResult {
+  if (input.reason.trim() === "") {
+    throw new Error("amend_task requires a reason: an amendment with no reason records nothing");
+  }
+
+  const run = db.transaction((): AmendTaskResult => {
+    const task = requireTask(db, taskRef);
+    const now = new Date().toISOString();
+    const amendments: TaskAmendment[] = [];
+    const setClauses: string[] = [];
+    const params: Record<string, unknown> = { id: task.id };
+
+    for (const field of AMENDABLE_SCALAR_FIELDS) {
+      const newValue = input[field];
+      if (newValue === undefined) continue;
+      const previousValue = task[field];
+      if (newValue === previousValue) continue;
+
+      amendments.push(recordAmendment(db, task.id, field, String(previousValue), input.reason, now));
+      setClauses.push(`${field} = @${field}`);
+      params[field] = newValue;
+    }
+
+    let recomputedEstimatedTokens: number | undefined;
+    if (input.file_paths !== undefined) {
+      const previousFilePaths = listTaskFilePaths(db, task.id);
+      if (!sameFileSet(previousFilePaths, input.file_paths)) {
+        amendments.push(
+          recordAmendment(
+            db,
+            task.id,
+            "file_paths",
+            JSON.stringify(previousFilePaths),
+            input.reason,
+            now,
+          ),
+        );
+
+        db.prepare(`DELETE FROM task_files WHERE task_id = ?`).run(task.id);
+        const insertFile = db.prepare(`INSERT INTO task_files (task_id, file_path) VALUES (?, ?)`);
+        for (const filePath of input.file_paths) {
+          insertFile.run(task.id, filePath);
+        }
+
+        const project = requireProject(db, task.project_id);
+        recomputedEstimatedTokens = estimator.estimateTokens(project.root_path, input.file_paths);
+        setClauses.push(`estimated_tokens = @estimated_tokens`);
+        params.estimated_tokens = recomputedEstimatedTokens;
+      }
+    }
+
+    if (amendments.length === 0) {
+      throw new Error(
+        `amend_task ${taskRef} changed nothing: every given field already matches its current value`,
+      );
+    }
+
+    setClauses.push(`updated_at = @updated_at`);
+    params.updated_at = now;
+
+    runOne(db.prepare(`UPDATE tasks SET ${setClauses.join(", ")} WHERE id = @id`), `amend_task ${taskRef}`, params);
+
+    return { task: requireTask(db, task.id), amendments };
+  });
+
+  return run();
 }
 
 export function createTask(

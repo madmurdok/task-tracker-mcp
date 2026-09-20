@@ -47,7 +47,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 31 registered tools over the same transport", async () => {
+  it("exercises all 32 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -90,6 +90,7 @@ describe("MCP server smoke test", () => {
         "create_plan",
         "get_plan",
         "approve_plan",
+        "amend_task",
       ].sort(),
     );
 
@@ -252,6 +253,32 @@ describe("MCP server smoke test", () => {
       approved_by: "valentin",
       approval_note: "looks right, ship it",
     });
+
+    // amend_task (TTM-81): correcting planTaskId's title after its plan was
+    // approved must not drift that approval back to draft - editing a task's
+    // text is not a batch-membership change (see planWrites.ts). The original
+    // text stays recoverable on get_task alongside the correction.
+    const amended = await call("amend_task", {
+      task_id: planTaskId,
+      title: "Ship it for real",
+      reason: "the original title stopped matching what this task now covers",
+    });
+    expect(amended.amended_fields).toEqual(["title"]);
+
+    const amendedTask = await call("get_task", { task_id: planTaskId });
+    expect(amendedTask.title).toBe("Ship it for real");
+    expect(amendedTask.amendments).toEqual([
+      expect.objectContaining({
+        field: "title",
+        previous_value: "Ship it",
+        reason: "the original title stopped matching what this task now covers",
+      }),
+    ]);
+
+    const planAfterAmend = await call("get_plan", { project_id, release_id: planReleaseId });
+    expect(planAfterAmend.status).toBe("approved");
+    expect(planAfterAmend.unplanned_task_ids).toEqual([]);
+    expect(planAfterAmend.orphaned_task_ids).toEqual([]);
   });
 
   it("list_projects returns an empty array when nothing is registered yet", async () => {
