@@ -572,25 +572,29 @@ const expandedSliceRows = new Set();
 let openSliceTaskId = null;
 
 // Slices arrive from the board API already ordered step ASC, position ASC
-// per task (see board.ts's listSlicesForTasks) - filtering by phase keeps
-// that order, so grouping only has to notice step boundaries within each
-// phase bucket, the same consecutive-run trick showPlanDialog uses for plan
-// items sharing a step.
+// per task (see board.ts's listSlicesForTasks) - so grouping walks that
+// order directly rather than filtering by SLICE_PHASES, which would sort by
+// phase instead of by step (TTM-88). A phase group starts whenever the phase
+// differs from the previous group's phase, so a task sliced
+// measure -> implement -> measure renders as three groups, not two merged
+// under "measure" - a phase that recurs later gets its own section. Step
+// sub-grouping within a phase group keeps the same consecutive-run trick
+// showPlanDialog uses for plan items sharing a step.
 function groupSlicesByPhase(slices) {
   const phases = [];
-  for (const phase of SLICE_PHASES) {
-    const phaseSlices = slices.filter((slice) => slice.phase === phase);
-    if (phaseSlices.length === 0) continue;
-    const steps = [];
-    let current = null;
-    for (const slice of phaseSlices) {
-      if (!current || current.step !== slice.step) {
-        current = { step: slice.step, slices: [] };
-        steps.push(current);
-      }
-      current.slices.push(slice);
+  let currentPhaseGroup = null;
+  let currentStepGroup = null;
+  for (const slice of slices) {
+    if (!currentPhaseGroup || currentPhaseGroup.phase !== slice.phase) {
+      currentPhaseGroup = { phase: slice.phase, steps: [] };
+      currentStepGroup = null;
+      phases.push(currentPhaseGroup);
     }
-    phases.push({ phase, steps });
+    if (!currentStepGroup || currentStepGroup.step !== slice.step) {
+      currentStepGroup = { step: slice.step, slices: [] };
+      currentPhaseGroup.steps.push(currentStepGroup);
+    }
+    currentStepGroup.slices.push(slice);
   }
   return phases;
 }

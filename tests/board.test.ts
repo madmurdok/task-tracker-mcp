@@ -753,3 +753,60 @@ describe("board.js createLane Plan button and dialog (client-side, via DOM shim)
     expect(sandbox.document.getElementById("plan-approval").textContent).toContain("valentin");
   });
 });
+
+describe("board.js groupSlicesByPhase (client-side, via DOM shim)", () => {
+  // TTM-88: slices arrive from the board API in step/position order, which
+  // doesn't necessarily follow SLICE_PHASES' fixed
+  // design/implement/verify/measure order. Grouping must walk the given
+  // order and only start a new group when the phase actually changes,
+  // rather than bucketing by phase first (which silently re-sorts).
+  it("keeps three phases in the order they were sliced, not SLICE_PHASES order", () => {
+    const { groupSlicesByPhase } = loadBoardScript();
+    const slices = [
+      { id: "1", phase: "measure", step: 1, label: "S1" },
+      { id: "2", phase: "implement", step: 2, label: "S2" },
+      { id: "3", phase: "verify", step: 3, label: "S3" },
+    ];
+
+    const groups = groupSlicesByPhase(slices);
+
+    expect(groups.map((g: any) => g.phase)).toEqual(["measure", "implement", "verify"]);
+    expect(groups.flatMap((g: any) => g.steps.flatMap((s: any) => s.slices.map((sl: any) => sl.label)))).toEqual([
+      "S1",
+      "S2",
+      "S3",
+    ]);
+  });
+
+  it("gives a recurring phase its own second group instead of merging it with the first", () => {
+    const { groupSlicesByPhase } = loadBoardScript();
+    const slices = [
+      { id: "1", phase: "measure", step: 1, label: "S1" },
+      { id: "2", phase: "implement", step: 2, label: "S2" },
+      { id: "3", phase: "measure", step: 3, label: "S3" },
+    ];
+
+    const groups = groupSlicesByPhase(slices);
+
+    expect(groups).toHaveLength(3);
+    expect(groups.map((g: any) => g.phase)).toEqual(["measure", "implement", "measure"]);
+    expect(groups.map((g: any) => g.steps[0].slices[0].label)).toEqual(["S1", "S2", "S3"]);
+  });
+
+  it("keeps a shared-step parallel pair inside a phase as a single step group", () => {
+    const { groupSlicesByPhase } = loadBoardScript();
+    const slices = [
+      { id: "1", phase: "implement", step: 1, label: "S1" },
+      { id: "2", phase: "implement", step: 1, label: "S2" },
+      { id: "3", phase: "verify", step: 2, label: "S3" },
+    ];
+
+    const groups = groupSlicesByPhase(slices);
+
+    expect(groups).toHaveLength(2);
+    expect(groups[0].phase).toBe("implement");
+    expect(groups[0].steps).toHaveLength(1);
+    expect(groups[0].steps[0].slices.map((sl: any) => sl.label)).toEqual(["S1", "S2"]);
+    expect(groups[1].phase).toBe("verify");
+  });
+});
