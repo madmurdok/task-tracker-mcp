@@ -168,6 +168,7 @@ erDiagram
     RELEASE_PLANS ||--o{ RELEASE_PLAN_ITEMS : sequences
     TASKS ||--o{ RELEASE_PLAN_ITEMS : "placed by"
     TASKS ||--o{ TASK_SLICES : "worked as"
+    TASKS ||--o{ TASK_SLICE_REVISIONS : "re-cut by"
 
     PROJECTS {
         text id PK
@@ -253,6 +254,14 @@ erDiagram
         text completed_at "nullable"
         text created_at
         text updated_at
+        int label_number "the n in S<n>; stored, unique per task, never renumbered"
+    }
+    TASK_SLICE_REVISIONS {
+        text id PK
+        text task_id FK "ON DELETE CASCADE"
+        text reason "required"
+        text replaced_slices "JSON array of the pending slices the revision removed"
+        text revised_at
     }
 ```
 
@@ -278,14 +287,32 @@ A task's own work is recorded the same shape (TTM-83): `task_slices` places
 each slice at a `step` (parallel within one, exactly like
 `release_plan_items`) and a `position`, with a `phase`
 (`design`/`implement`/`verify`/`measure`), the `brief`/`exit_criterion` it was
-given, and the `result`/`artifacts`/`metrics` it reports back. A slice's
-readable label — `S1`, `S2`, ... in step/position order — is computed at read
-time for the identical reason a plan's drift is: `set_task_slices` only ever
-replaces a task's whole slicing, never patches one row in place, so nothing
-can renumber it out from under a stored label. Replacing carries nothing over,
-including finished slices — a re-slicing is a new decomposition, not an edit,
-and the discarded ones are named in the result so the loss is visible rather
-than silent. `artifacts` defaults to `[]` and `metrics` stays `NULL` until
+given, and the `result`/`artifacts`/`metrics` it reports back.
+`set_task_slices` writes the first slicing (replaceable wholesale only while
+every slice is still pending); `revise_task_slices` (TTM-89) re-cuts the rest
+of a task once work has run: it deletes only the pending slices, inserts the
+new ones in steps after the highest kept step, and leaves every
+`in_progress`/`done`/`failed`/`skipped` row untouched, so a finding that forced
+the re-cut survives it. Each revision appends a `task_slice_revisions` row —
+the required `reason` plus the replaced pending slices as JSON, modelled on
+`task_amendments` — which `get_task` returns as `slice_revisions`.
+
+A slice's readable label (`S<label_number>`) is **stored**, not computed. It
+used to be computed at read time from step/position order, which was safe only
+while a slicing could be replaced solely as a whole. A revision removes pending
+rows while keeping later ones, so a computed label would renumber a kept slice
+whenever a pending slice before it went — and a ref like `GM-401/S2` already
+written into a commit would silently start naming a different slice. So a
+first slicing is numbered 1..n in step/position order, a revision numbers its
+new slices after the highest label the task had before it (the replaced ones'
+included, so no label is reused for different work), and nothing ever updates
+`label_number`. The cost is gaps (`S1, S3, S4, S7`), which is the honest
+picture of a re-cut. The alternative — refusing a revision that would renumber
+a kept slice — would forbid exactly the common case (an early parallel slice
+still pending beside one that ran). `runMigrations` adds the column to older
+databases and backfills each unlabelled task with the numbers the read-time
+scheme showed, so existing refs keep resolving; `idx_task_slices_label`
+enforces uniqueness per task. `artifacts` defaults to `[]` and `metrics` stays `NULL` until
 `complete_slice` records some, so "never measured" stays distinguishable from
 "measured, nothing to report".
 
@@ -341,9 +368,10 @@ discoverable.
 - `create_plan(project_id, release_id, steps, rationale?) -> ReleasePlan` — writes or replaces a batch's execution order. `steps` is a flat list of task refs (each becoming a step of one, the common case) or a list of groups whose members may run in parallel; a ref is a uuid or a code (`TTM-63`). Upsert rather than separate insert/move/remove tools, because a membership change already sends the plan back to `draft`, which makes re-sending the whole plan the normal path. Replacing an approved plan resets it to `draft` and clears the approval and rationale — nobody signed off on the new order. Rejects a released or cancelled release, a task not in this batch, a task listed twice, and an empty list.
 - `get_plan(project_id, release_id) -> ReleasePlan | null` — items in execution order each with its *live* status, the approval record, and both directions of drift. `null` rather than an error when no plan exists, matching `get_task`/`get_release`.
 - `approve_plan(project_id, release_id, approved_by, note?) -> ReleasePlan` — `draft -> approved`. `note` is stored exactly as given: the approving human's verbatim words, not a summary, because the party an approval authorises is the party calling the tool and a quote is the only part of that record which is checkable afterwards. Refuses a drifted plan (the error names the offending tasks by code — it is the reader's cue to re-approve), then — TTM-87 — refuses while any open batch task (status not `done`/`cancelled`) has zero slices, naming them by code and pointing at `set_task_slices` (see Failure Modes), and an already-approved plan (no re-stamping over the first approver).
-- `get_task(task_id) -> { id, title, description, acceptance_criteria, status, estimated_tokens, priority, complexity_hint, file_paths, handoff_notes, amendments, slices, ... }` — the same detail packet `get_next_task` returns, fetchable anytime with no claim/lock side effect; use this (not `get_next_task`) to just re-inspect a task. `amendments` (see `amend_task`) is that task's full correction history, oldest first, empty when it was never amended. `slices` (see `set_task_slices`) is how the task is worked, in step/position order, empty for a task nobody has sliced yet.
-- `set_task_slices(task_id, slices: Array<Slice | Slice[]>) -> { task_id, code, slices, discarded }` — writes (or replaces) a task's whole slicing: how it's worked, as an ordered sequence of steps, each a slice or an array of slices sharing a step that may run in parallel (the task-level analogue of `create_plan`'s steps, deliberately the same shape). A slice is `{phase: design|implement|verify|measure, title, brief?, exit_criterion?, model?}`. Slices are labelled `S1`, `S2`, ... in step/position order and returned with a `ref` (e.g. `TTM-83/S2`) that `start_slice`/`complete_slice` accept in place of a uuid. Replacing is wholesale and carries nothing over — done/failed/skipped slices are dropped too, named in `discarded` so a re-slicing's loss is visible rather than silent. Refuses while any slice is `in_progress` (finish, fail or skip it first) and on a `done`/`cancelled` task, whose slicing is a finished record (see Failure Modes). `task_id` accepts a uuid or a code (`TTM-63`).
-- `start_slice(slice_id) -> TaskSlice` — `pending -> in_progress`, stamping `started_at`. Refuses any slice that isn't `pending`. `slice_id` accepts a slice's own uuid or `<task>/S<n>` (e.g. `TTM-83/S2`, or `<task uuid>/S2`) — the `ref` every slice carries.
+- `get_task(task_id) -> { id, title, description, acceptance_criteria, status, estimated_tokens, priority, complexity_hint, file_paths, handoff_notes, amendments, slices, ... }` — the same detail packet `get_next_task` returns, fetchable anytime with no claim/lock side effect; use this (not `get_next_task`) to just re-inspect a task. `amendments` (see `amend_task`) is that task's full correction history, oldest first, empty when it was never amended. `slices` (see `set_task_slices`) is how the task is worked, in step/position order, empty for a task nobody has sliced yet. `slice_revisions` (see `revise_task_slices`) is its re-slicing history, oldest first, empty when it was never revised.
+- `set_task_slices(task_id, slices: Array<Slice | Slice[]>) -> { task_id, code, slices }` — writes a task's first slicing: how it's worked, as an ordered sequence of steps, each a slice or an array of slices sharing a step that may run in parallel (the task-level analogue of `create_plan`'s steps, deliberately the same shape). A slice is `{phase: design|implement|verify|measure, title, brief?, exit_criterion?, model?}`. Slices are labelled `S1`, `S2`, ... in step/position order and returned with a `ref` (e.g. `TTM-83/S2`) that `start_slice`/`complete_slice` accept in place of a uuid. While every slice is still `pending` it may be called again, replacing the slicing wholesale and renumbering from `S1`. Refuses once any slice is `in_progress`/`done`/`failed`/`skipped`, naming each and pointing at `revise_task_slices`, and on a `done`/`cancelled` task, whose slicing is a finished record (see Failure Modes). `task_id` accepts a uuid or a code (`TTM-63`).
+- `revise_task_slices(task_id, slices: Array<Slice | Slice[]>, reason) -> { task_id, code, slices, revision }` — re-cuts the rest of a task (TTM-89). Replaces only its `pending` slices with `slices` (same step shape as `set_task_slices`); every `done`/`failed`/`skipped`/`in_progress` slice is kept untouched — status, result, artifacts, metrics, timestamps, step, position and label. The new slices go in steps after the highest kept step and are labelled after the highest label the task already had, so no existing label changes or is reused (labels may have gaps). `reason` is required; `revision` is `{id, task_id, reason, replaced_slices, revised_at}`, where `replaced_slices` holds each replaced pending slice's `id`, `label`, `phase`, `step`, `position`, `title`, `brief`, `exit_criterion` and `model`, and every revision is returned by `get_task` as `slice_revisions`. Refuses on a `done`/`cancelled` task. `task_id` accepts a uuid or a code.
+- `start_slice(slice_id) -> TaskSlice` — `pending -> in_progress`, stamping `started_at`. Refuses any slice that isn't `pending`. `slice_id` accepts a slice's own uuid or `<task>/S<n>` (e.g. `TTM-83/S2`, or `<task uuid>/S2`) — the `ref` every slice carries, fixed for the slice's life.
 - `complete_slice(slice_id, status: done|failed|skipped, result, artifacts?, metrics?) -> TaskSlice` — records a slice's outcome and report, stamping `completed_at`. `done`/`failed` require the slice to be `in_progress` (they report on work that ran, and `started_at` is half its duration); `skipped` is also accepted straight from `pending` — the normal case for a slice that never ran. One-shot like `complete_task`: an already finished slice is refused, never overwritten (see Failure Modes). `result` is the slice's report; `artifacts` (optional) the repo paths of its durable outputs; `metrics` (optional) a free-form object (e.g. `reread_tokens`, `max_context`, `tool_uses`, `duration_ms`).
 - `claim_task(task_id, session_id) -> { ok: true } | conflict error | blocked error | not_claimable error` — takes a specific task into work directly: moves a `pending` task straight to `in_progress` (the direct-pick counterpart to `get_next_task`'s queue-pull, for a human/orchestrator assigning a specific task to a specific parallel worker), or attaches/renews ownership on a task already `in_progress` (e.g. right after `get_next_task`). Rejects with `{ error: "conflict", current_owner_session_id, lock_expires_at }` if a different session's lock is still active, `{ error: "blocked", message }` if the task is `pending` with unmet dependencies (same gate `get_next_task`'s candidate query applies), or `{ error: "not_claimable", message, status }` if it's already `done`/`cancelled`.
 - `release_task(task_id, session_id, force?) -> { ok: true } | conflict error` — gives up ownership immediately (back to `pending`) instead of waiting out the lease; `force: true` overrides another session's still-active lock.
@@ -430,15 +458,24 @@ discoverable.
   with unfinished work silently implied done — a task is worked as its slices,
   so "done" while some of them never ran is a claim the record would
   contradict. `force` skips this the same way it skips verification.
-- **`set_task_slices` is called on a task with a slice `in_progress`, or on
-  one that's `done`/`cancelled`.** Both refuse rather than silently discarding
-  live work or rewriting a finished record: a slice `in_progress` means some
-  agent is working it right now, and deleting the row under it would make its
-  `complete_slice` fail and lose the report; a `done`/`cancelled` task's
-  slicing is the record of how it was worked, and rewriting it afterwards
-  would erase that. Neither is bypassable by `force` — `set_task_slices` takes
-  no such parameter — so the caller finishes, fails or skips the slice first,
-  or reopens the task.
+- **`set_task_slices` is called on a task with a slice that has started or
+  finished, or on one that's `done`/`cancelled`.** Both refuse rather than
+  silently discarding live work or rewriting a finished record: a slice
+  `in_progress` means some agent is working it right now, and deleting the row
+  under it would make its `complete_slice` fail and lose the report; a
+  `done`/`failed`/`skipped` slice holds a report and metrics — often the very
+  finding that made a re-slice necessary — and wholesale replacement would
+  delete them (before TTM-89 it did, listing them only in a `discarded` field).
+  The refusal names each such slice and points at `revise_task_slices`, which
+  re-cuts only the pending rest. A `done`/`cancelled` task's slicing is the
+  record of how it was worked, and rewriting it afterwards would erase that.
+  None of this is bypassable by `force` — `set_task_slices` takes no such
+  parameter.
+- **`revise_task_slices` is called on a `done`/`cancelled` task, or with an
+  empty `reason`.** Refused, changing nothing: the finished task's slicing is
+  its record, and a revision without a reason records nothing worth having.
+  An `in_progress` slice is *not* a refusal here — it is kept, and its agent's
+  `complete_slice` still finds its row under the same label.
 - **`start_slice`/`complete_slice` are called on a slice already in the
   target state, or in the wrong one.** Both are one-shot state transitions,
   not idempotent upserts: `start_slice` refuses any non-`pending` slice, and

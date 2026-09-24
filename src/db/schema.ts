@@ -169,10 +169,18 @@ CREATE INDEX IF NOT EXISTS idx_release_plan_items_task_id ON release_plan_items(
 -- release_plan_items: slices sharing a step may run in parallel, position only
 -- orders them inside that step.
 --
--- Written wholesale by set_task_slices and never reordered in place, which is
--- what lets a slice's readable label (S1, S2, ... in step/position order) be
--- computed at read time rather than stored: nothing can renumber a slicing
--- except replacing it, and replacing it discards every old slice anyway.
+-- label_number is the n in a slice's readable label S<n> (TTM-89). It is
+-- stored, not computed from step/position order at read time: since
+-- revise_task_slices deletes pending slices while keeping finished and
+-- in_progress ones, a computed label would renumber a kept slice whenever a
+-- pending one before it goes - and GM-401/S2 in a commit would silently start
+-- pointing at another slice. set_task_slices numbers a first slicing 1..n in
+-- step/position order; revise_task_slices numbers its new slices after the
+-- highest label the task had before the revision, so a label is never reused
+-- for a different slice once anything has run. Nullable only because
+-- runMigrations adds it with ALTER TABLE to pre-TTM-89 tables and backfills it
+-- there (backfillSliceLabels); every write sets it. Unique per task via
+-- idx_task_slices_label, created in runMigrations after that backfill.
 --
 -- artifacts is a JSON array of repo paths, metrics a free-form JSON object
 -- (reread_tokens, max_context, tool_uses, duration_ms, ...) - NULL until
@@ -199,8 +207,26 @@ CREATE TABLE IF NOT EXISTS task_slices (
   completed_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  label_number INTEGER,
   UNIQUE (task_id, step, position)
 );
+
+-- revise_task_slices's trail (TTM-89), modelled on task_amendments: one row
+-- per revision, never updated or deleted. replaced_slices is a JSON array of
+-- the pending slices the revision removed, as they read just before it
+-- (label, phase, step, position, title, brief, exit_criterion, model), and
+-- reason is why - required, because the finding that forced the re-cut is
+-- the record's whole value. Finished and in_progress slices are never
+-- replaced, so they need no copy here: their own rows stay untouched.
+CREATE TABLE IF NOT EXISTS task_slice_revisions (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  reason TEXT NOT NULL,
+  replaced_slices TEXT NOT NULL,
+  revised_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_slice_revisions_task_id ON task_slice_revisions(task_id);
 `;
 
 import type { DatabaseInstance } from "./connection.js";
@@ -570,6 +596,29 @@ function backfillTaskNumbers(db: DatabaseInstance): void {
 }
 
 /**
+ * Gives pre-TTM-89 slices their stored label_number: exactly the label the old
+ * read-time numbering showed (1-based, step/position order per task), so every
+ * `TTM-83/S2` already written into a commit or summary keeps resolving to the
+ * slice it named. Only tasks with no labelled row at all are numbered - a
+ * pre-TTM-89 task is always all-NULL, and renumbering a task that already has
+ * labels is exactly what the stored column exists to prevent. No-ops once
+ * every task has labels.
+ */
+function backfillSliceLabels(db: DatabaseInstance): void {
+  db.exec(`
+    UPDATE task_slices
+    SET label_number = (
+      SELECT COUNT(*) FROM task_slices AS earlier
+      WHERE earlier.task_id = task_slices.task_id
+        AND (earlier.step < task_slices.step
+             OR (earlier.step = task_slices.step AND earlier.position <= task_slices.position))
+    )
+    WHERE label_number IS NULL
+      AND task_id NOT IN (SELECT task_id FROM task_slices WHERE label_number IS NOT NULL)
+  `);
+}
+
+/**
  * `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL only shapes brand-new databases -
  * it's a no-op against tables that already exist (e.g. this project's own
  * ~/.task-tracker/tracker.db). New nullable columns need an explicit
@@ -579,9 +628,10 @@ function backfillTaskNumbers(db: DatabaseInstance): void {
  * yet in any database, so `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL creates
  * it on old and new ones alike (openDatabase execs SCHEMA_SQL on every open,
  * before calling this). That is why `release_plans`/`release_plan_items` and
- * `task_slices` are absent below and why adding an entry for them would be dead code - unlike
+ * `task_slice_revisions` are absent below and why adding an entry for them would be dead code - unlike
  * tasks.priority or tasks.release_id, there is no ADD COLUMN to sequence and
- * no ordering constraint against the CHECK-widening rebuilds.
+ * no ordering constraint against the CHECK-widening rebuilds. `task_slices` is
+ * the same, except for the label_number column TTM-89 added to it later.
  */
 export function runMigrations(db: DatabaseInstance): void {
   ensureColumn(db, "tasks", "lock_expires_at", "TEXT");
@@ -643,4 +693,14 @@ export function runMigrations(db: DatabaseInstance): void {
   // repairs damage from *previous* runs of it (see repairDanglingTasksOldReferences),
   // it doesn't interact with a fresh run happening in this same call.
   repairDanglingTasksOldReferences(db);
+  // task_slices itself is created by SCHEMA_SQL; only its TTM-89 column needs
+  // an ALTER on older databases. The unique index is created after the
+  // backfill so it is built over numbered rows, not a column of NULLs. Guarded
+  // on the table existing only for callers that run runMigrations against a
+  // hand-built schema without it (openDatabase always execs SCHEMA_SQL first).
+  if (db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_slices'`).get()) {
+    ensureColumn(db, "task_slices", "label_number", "INTEGER");
+    backfillSliceLabels(db);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_task_slices_label ON task_slices(task_id, label_number)`);
+  }
 }
