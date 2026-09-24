@@ -213,6 +213,7 @@ describe("MCP server smoke test", () => {
       release_id: planReleaseId,
       steps: [planTaskId],
       rationale: "only one task in this batch, so one step",
+      verbose: true,
     });
     expect(plan.status).toBe("draft");
     expect(plan.items).toEqual([
@@ -298,6 +299,7 @@ describe("MCP server smoke test", () => {
     const sliced = await call("set_task_slices", {
       task_id: planTaskId,
       slices: [{ phase: "design", title: "Decide" }, [{ phase: "implement", title: "Build", model: "opus" }]],
+      verbose: true,
     });
     expect(sliced.slices.map((sl: { label: string }) => sl.label)).toEqual(["S1", "S2"]);
     const startedSlice = await call("start_slice", { slice_id: sliced.slices[0].ref });
@@ -307,6 +309,7 @@ describe("MCP server smoke test", () => {
       status: "done",
       result: "decided",
       metrics: { tool_uses: 3 },
+      verbose: true,
     });
     expect(doneSlice).toMatchObject({ status: "done", result: "decided", metrics: { tool_uses: 3 } });
     const slicedTask = await call("get_task", { task_id: planTaskId });
@@ -322,12 +325,19 @@ describe("MCP server smoke test", () => {
       slices: [[{ phase: "implement", title: "Build smaller" }, { phase: "verify", title: "Check" }]],
       reason: "S1 decided the build splits in two",
     });
-    expect(revised.slices.map((sl: { label: string; status: string; result: string | null }) => [sl.label, sl.status, sl.result])).toEqual([
+    expect(revised.slices.map((sl: { label: string; status: string }) => [sl.label, sl.status])).toEqual([
+      ["S1", "done"],
+      ["S3", "pending"],
+      ["S4", "pending"],
+    ]);
+    // Full report/result detail is not in the compact ack - read it back via
+    // get_task instead of asking revise_task_slices for verbose:true here.
+    const revisedTask = await call("get_task", { task_id: planTaskId });
+    expect(revisedTask.slices.map((sl: { label: string; status: string; result: string | null }) => [sl.label, sl.status, sl.result])).toEqual([
       ["S1", "done", "decided"],
       ["S3", "pending", null],
       ["S4", "pending", null],
     ]);
-    const revisedTask = await call("get_task", { task_id: planTaskId });
     expect(revisedTask.slice_revisions).toEqual([
       expect.objectContaining({
         reason: "S1 decided the build splits in two",
@@ -475,6 +485,7 @@ describe("MCP server smoke test", () => {
       task_id: code,
       slices: [{ phase: "implement", title: "Build once" }],
       reason: "A and B turned out to be one change",
+      verbose: true,
     });
     expect(revised.isError).toBeFalsy();
     expect(revised.payload.slices.map((sl: { ref: string }) => sl.ref)).toEqual([`${code}/S1`, `${code}/S4`]);
@@ -699,6 +710,137 @@ describe("MCP server smoke test", () => {
 
     const listed = await call("list_tasks", { project_id: project.project_id });
     expect(listed.payload.tasks).toHaveLength(2);
+  });
+
+  it("TTM-91: write tools return a compact acknowledgement by default, and verbose:true restores the full object", async () => {
+    const client = await connectedClient(db);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      expect(result.isError).toBeFalsy();
+      const content = result.content as Array<{ type: string; text: string }>;
+      return JSON.parse(content[0].text);
+    };
+
+    const { project_id } = await call("create_project", { name: "Compact", root_path: "/tmp/compact" });
+    const { release_id } = await call("create_release", { project_id, version: "1.0" });
+    const { task_id } = await call("create_task", {
+      project_id,
+      release_id,
+      title: "Ship it",
+      complexity_hint: "normal",
+    });
+
+    // Three slices, briefs ~500 chars, so a step index and a code arithmetic
+    // mistake would show up in the byte-size table too: two sequential steps
+    // (S1, S2), the third (S3) added by the revision below.
+    const sliceSpecs = [
+      { phase: "design" as const, title: "Decide", brief: "x".repeat(500), exit_criterion: "a decision" },
+      { phase: "implement" as const, title: "Build", brief: "y".repeat(500), exit_criterion: "it builds" },
+    ];
+
+    // set_task_slices: compact by default - just enough to address each slice
+    // and see its state, not the brief/exit_criterion the caller just wrote.
+    const compactSet = await call("set_task_slices", { task_id, slices: sliceSpecs });
+    expect(compactSet).toEqual({
+      task_id,
+      code: expect.any(String),
+      slices: [
+        { ref: expect.stringMatching(/\/S1$/), label: "S1", phase: "design", title: "Decide", status: "pending" },
+        { ref: expect.stringMatching(/\/S2$/), label: "S2", phase: "implement", title: "Build", status: "pending" },
+      ],
+    });
+    expect(compactSet.slices[0]).not.toHaveProperty("brief");
+    expect(compactSet.slices[0]).not.toHaveProperty("id");
+    const code = compactSet.code as string;
+
+    // Same slices again (all still pending, so set_task_slices may replace
+    // wholesale) - this time verbose:true, to see the full row it wrote.
+    const verboseSet = await call("set_task_slices", { task_id, slices: sliceSpecs, verbose: true });
+    expect(verboseSet.slices[0]).toMatchObject({ brief: "x".repeat(500), exit_criterion: "a decision" });
+    expect(verboseSet.slices[0]).toHaveProperty("id");
+    const s1Id = verboseSet.slices[0].id as string;
+
+    // start_slice / complete_slice: {ok, ref, label, status} by default.
+    const compactStart = await call("start_slice", { slice_id: s1Id });
+    expect(compactStart).toEqual({ ok: true, ref: `${code}/S1`, label: "S1", status: "in_progress" });
+
+    const verboseComplete = await call("complete_slice", {
+      slice_id: s1Id,
+      status: "done",
+      result: "z".repeat(1000),
+      verbose: true,
+    });
+    expect(verboseComplete).toMatchObject({ status: "done", result: "z".repeat(1000) });
+
+    const compactStart2 = await call("start_slice", { slice_id: `${code}/S2` });
+    expect(compactStart2).toEqual({ ok: true, ref: `${code}/S2`, label: "S2", status: "in_progress" });
+    const compactComplete = await call("complete_slice", {
+      slice_id: `${code}/S2`,
+      status: "done",
+      result: "z".repeat(1000),
+    });
+    expect(compactComplete).toEqual({ ok: true, ref: `${code}/S2`, label: "S2", status: "done" });
+    expect(compactComplete).not.toHaveProperty("result");
+
+    // revise_task_slices: compact keeps {task_id, code, slices, revision:
+    // {id, reason}} - the replaced_slices detail is left out.
+    const compactRevise = await call("revise_task_slices", {
+      task_id,
+      slices: [{ phase: "verify", title: "Check" }],
+      reason: "found more work",
+    });
+    expect(compactRevise.revision).toEqual({ id: expect.any(String), reason: "found more work" });
+    expect(compactRevise.revision).not.toHaveProperty("replaced_slices");
+    expect(compactRevise.slices.at(-1)).toEqual({
+      ref: `${compactSet.code}/S3`,
+      label: "S3",
+      phase: "verify",
+      title: "Check",
+      status: "pending",
+    });
+
+    const verboseRevise = await call("revise_task_slices", {
+      task_id,
+      slices: [{ phase: "verify", title: "Check again" }],
+      reason: "still more work",
+      verbose: true,
+    });
+    expect(verboseRevise.revision).toHaveProperty("replaced_slices");
+
+    // create_plan / approve_plan: compact groups codes by step and drops
+    // per-item task_id/title/note/added_at; unplanned/orphaned only appear
+    // when non-empty.
+    const compactPlan = await call("create_plan", {
+      project_id,
+      release_id,
+      steps: [task_id],
+    });
+    expect(compactPlan).toEqual({ status: "draft", steps: [[compactSet.code]] });
+    expect(compactPlan).not.toHaveProperty("unplanned");
+    expect(compactPlan).not.toHaveProperty("orphaned");
+
+    const verbosePlan = await call("create_plan", {
+      project_id,
+      release_id,
+      steps: [task_id],
+      verbose: true,
+    });
+    expect(verbosePlan.items).toEqual([expect.objectContaining({ task_id, step: 1, position: 1 })]);
+
+    const compactApprove = await call("approve_plan", {
+      project_id,
+      release_id,
+      approved_by: "valentin",
+      note: "ok",
+    });
+    expect(compactApprove).toEqual({
+      status: "approved",
+      approved_by: "valentin",
+      approval_note: "ok",
+      steps: [[compactSet.code]],
+    });
+    expect(compactApprove).not.toHaveProperty("unplanned");
+    expect(compactApprove).not.toHaveProperty("orphaned");
   });
 });
 
