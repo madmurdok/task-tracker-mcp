@@ -481,6 +481,47 @@ describe("getBoardData", () => {
     ]);
     expect(byId.get(sliced.id)?.slices.map((slice) => slice.status)).toEqual(["pending", "pending", "pending"]);
   });
+
+  it("numbers each task's slices from S1 and never shows another project's slices (TTM-84)", () => {
+    const { db, project } = setup();
+    const first = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "First",
+      complexity_hint: "normal",
+    }).task;
+    const second = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Second",
+      complexity_hint: "normal",
+    }).task;
+    const other = createProject(db, { name: "Other", root_path: "/tmp/other" });
+    const foreign = createTask(db, noopEstimator, {
+      project_id: other.id,
+      title: "Foreign",
+      complexity_hint: "normal",
+    }).task;
+
+    setTaskSlices(db, first.id, [
+      { phase: "implement", title: "first-1" },
+      { phase: "verify", title: "first-2" },
+    ]);
+    setTaskSlices(db, second.id, [
+      { phase: "implement", title: "second-1" },
+      { phase: "verify", title: "second-2" },
+    ]);
+    setTaskSlices(db, foreign.id, [{ phase: "implement", title: "foreign-1" }]);
+
+    const board = getBoardData(db, project.id);
+    const tasks = board.lanes.flatMap((lane) => lane.tasks);
+    const byId = new Map(tasks.map((task) => [task.id, task]));
+
+    // The label counter restarts per task: the second task's slices are S1/S2,
+    // not S3/S4 carried over from the first.
+    expect(byId.get(first.id)?.slices.map((slice) => slice.label)).toEqual(["S1", "S2"]);
+    expect(byId.get(second.id)?.slices.map((slice) => slice.label)).toEqual(["S1", "S2"]);
+    expect(byId.get(second.id)?.slices.map((slice) => slice.title)).toEqual(["second-1", "second-2"]);
+    expect(tasks.flatMap((task) => task.slices.map((slice) => slice.title))).not.toContain("foreign-1");
+  });
 });
 
 describe("board.js laneTitle (client-side, via DOM shim)", () => {
