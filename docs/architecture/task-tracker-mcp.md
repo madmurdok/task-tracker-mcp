@@ -167,6 +167,7 @@ erDiagram
     RELEASES ||--o| RELEASE_PLANS : "is ordered by"
     RELEASE_PLANS ||--o{ RELEASE_PLAN_ITEMS : sequences
     TASKS ||--o{ RELEASE_PLAN_ITEMS : "placed by"
+    TASKS ||--o{ TASK_SLICES : "worked as"
 
     PROJECTS {
         text id PK
@@ -234,6 +235,25 @@ erDiagram
         text discoveries
         text created_at
     }
+    TASK_SLICES {
+        text id PK
+        text task_id FK "ON DELETE CASCADE"
+        text phase "design|implement|verify|measure"
+        int step "parallel within one step, like release_plan_items"
+        int position
+        text title
+        text brief
+        text exit_criterion
+        text status "pending|in_progress|done|failed|skipped"
+        text model "nullable"
+        text result "nullable - the slice's report"
+        text artifacts "JSON array of repo paths, default []"
+        text metrics "JSON object, nullable until complete_slice records some"
+        text started_at "nullable"
+        text completed_at "nullable"
+        text created_at
+        text updated_at
+    }
 ```
 
 A release may have one **plan**: the execution order for its batch, plus the
@@ -253,6 +273,21 @@ graph the moment either changed. And **"new since approval"** is
 approval. `status` has only two values because reverting an approved plan to
 `draft` *is* the supersede mechanism; adding a third would need the
 CHECK-widening table rebuild `schema.ts` already carries twice.
+
+A task's own work is recorded the same shape (TTM-83): `task_slices` places
+each slice at a `step` (parallel within one, exactly like
+`release_plan_items`) and a `position`, with a `phase`
+(`design`/`implement`/`verify`/`measure`), the `brief`/`exit_criterion` it was
+given, and the `result`/`artifacts`/`metrics` it reports back. A slice's
+readable label — `S1`, `S2`, ... in step/position order — is computed at read
+time for the identical reason a plan's drift is: `set_task_slices` only ever
+replaces a task's whole slicing, never patches one row in place, so nothing
+can renumber it out from under a stored label. Replacing carries nothing over,
+including finished slices — a re-slicing is a new decomposition, not an edit,
+and the discarded ones are named in the result so the loss is visible rather
+than silent. `artifacts` defaults to `[]` and `metrics` stays `NULL` until
+`complete_slice` records some, so "never measured" stays distinguishable from
+"measured, nothing to report".
 
 `status = blocked` is derived, not stored authoritatively — `get_next_task` and
 `list_tasks` compute it from unmet dependencies at query time, so it can't drift out
@@ -306,12 +341,15 @@ discoverable.
 - `create_plan(project_id, release_id, steps, rationale?) -> ReleasePlan` — writes or replaces a batch's execution order. `steps` is a flat list of task refs (each becoming a step of one, the common case) or a list of groups whose members may run in parallel; a ref is a uuid or a code (`TTM-63`). Upsert rather than separate insert/move/remove tools, because a membership change already sends the plan back to `draft`, which makes re-sending the whole plan the normal path. Replacing an approved plan resets it to `draft` and clears the approval and rationale — nobody signed off on the new order. Rejects a released or cancelled release, a task not in this batch, a task listed twice, and an empty list.
 - `get_plan(project_id, release_id) -> ReleasePlan | null` — items in execution order each with its *live* status, the approval record, and both directions of drift. `null` rather than an error when no plan exists, matching `get_task`/`get_release`.
 - `approve_plan(project_id, release_id, approved_by, note?) -> ReleasePlan` — `draft -> approved`. `note` is stored exactly as given: the approving human's verbatim words, not a summary, because the party an approval authorises is the party calling the tool and a quote is the only part of that record which is checkable afterwards. Refuses a drifted plan (the error names the offending tasks by code — it is the reader's cue to re-approve) and an already-approved one (no re-stamping over the first approver).
-- `get_task(task_id) -> { id, title, description, acceptance_criteria, status, estimated_tokens, priority, complexity_hint, file_paths, handoff_notes, amendments, ... }` — the same detail packet `get_next_task` returns, fetchable anytime with no claim/lock side effect; use this (not `get_next_task`) to just re-inspect a task. `amendments` (see `amend_task`) is that task's full correction history, oldest first, empty when it was never amended.
+- `get_task(task_id) -> { id, title, description, acceptance_criteria, status, estimated_tokens, priority, complexity_hint, file_paths, handoff_notes, amendments, slices, ... }` — the same detail packet `get_next_task` returns, fetchable anytime with no claim/lock side effect; use this (not `get_next_task`) to just re-inspect a task. `amendments` (see `amend_task`) is that task's full correction history, oldest first, empty when it was never amended. `slices` (see `set_task_slices`) is how the task is worked, in step/position order, empty for a task nobody has sliced yet.
+- `set_task_slices(task_id, slices: Array<Slice | Slice[]>) -> { task_id, code, slices, discarded }` — writes (or replaces) a task's whole slicing: how it's worked, as an ordered sequence of steps, each a slice or an array of slices sharing a step that may run in parallel (the task-level analogue of `create_plan`'s steps, deliberately the same shape). A slice is `{phase: design|implement|verify|measure, title, brief?, exit_criterion?, model?}`. Slices are labelled `S1`, `S2`, ... in step/position order and returned with a `ref` (e.g. `TTM-83/S2`) that `start_slice`/`complete_slice` accept in place of a uuid. Replacing is wholesale and carries nothing over — done/failed/skipped slices are dropped too, named in `discarded` so a re-slicing's loss is visible rather than silent. Refuses while any slice is `in_progress` (finish, fail or skip it first) and on a `done`/`cancelled` task, whose slicing is a finished record (see Failure Modes). `task_id` accepts a uuid or a code (`TTM-63`).
+- `start_slice(slice_id) -> TaskSlice` — `pending -> in_progress`, stamping `started_at`. Refuses any slice that isn't `pending`. `slice_id` accepts a slice's own uuid or `<task>/S<n>` (e.g. `TTM-83/S2`, or `<task uuid>/S2`) — the `ref` every slice carries.
+- `complete_slice(slice_id, status: done|failed|skipped, result, artifacts?, metrics?) -> TaskSlice` — records a slice's outcome and report, stamping `completed_at`. `done`/`failed` require the slice to be `in_progress` (they report on work that ran, and `started_at` is half its duration); `skipped` is also accepted straight from `pending` — the normal case for a slice that never ran. One-shot like `complete_task`: an already finished slice is refused, never overwritten (see Failure Modes). `result` is the slice's report; `artifacts` (optional) the repo paths of its durable outputs; `metrics` (optional) a free-form object (e.g. `reread_tokens`, `max_context`, `tool_uses`, `duration_ms`).
 - `claim_task(task_id, session_id) -> { ok: true } | conflict error | blocked error | not_claimable error` — takes a specific task into work directly: moves a `pending` task straight to `in_progress` (the direct-pick counterpart to `get_next_task`'s queue-pull, for a human/orchestrator assigning a specific task to a specific parallel worker), or attaches/renews ownership on a task already `in_progress` (e.g. right after `get_next_task`). Rejects with `{ error: "conflict", current_owner_session_id, lock_expires_at }` if a different session's lock is still active, `{ error: "blocked", message }` if the task is `pending` with unmet dependencies (same gate `get_next_task`'s candidate query applies), or `{ error: "not_claimable", message, status }` if it's already `done`/`cancelled`.
 - `release_task(task_id, session_id, force?) -> { ok: true } | conflict error` — gives up ownership immediately (back to `pending`) instead of waiting out the lease; `force: true` overrides another session's still-active lock.
 - `check_doc_sync(project_id, acknowledge?) -> { tracked, in_sync, design_doc_path, stored_hash, current_hash }` — compares the tracked design doc's current hash against the one captured at `create_project` time (or the last `acknowledge`); `tracked: false` means no doc was ever registered. Pass `acknowledge: true` once the graph has been manually reconciled with the doc's new content to persist the current hash as the new baseline *in place* (no need to re-run `create_project`); a no-op if untracked or the doc can't currently be read.
 - `add_handoff_note(task_id, session_id, { decisions, remaining_work, discoveries }) -> { ok: true }`
-- `complete_task(task_id, summary?, test_command?, force?) -> { ok: true, unblocked_task_ids: [...] } | verification_failed error` — runs the Completion Verifier first (declared files changed + `test_command` exits zero, if given); `force: true` skips it. `summary`, if given, is persisted as `completion_summary` — the source text `release_it` pulls into generated release notes.
+- `complete_task(task_id, summary?, test_command?, force?) -> { ok: true, unblocked_task_ids: [...] } | open_slices error | verification_failed error` — refuses with `open_slices` while any of the task's slices (see `set_task_slices`) is still `pending`/`in_progress`, naming each one (see Failure Modes); then runs the Completion Verifier (declared files changed + `test_command` exits zero, if given). `force: true` skips both. `summary`, if given, is persisted as `completion_summary` — the source text `release_it` pulls into generated release notes.
 - `get_project_status(project_id) -> { total, done, in_progress, blocked, pending, cancelled, percent, doc_drift }` — `doc_drift` mirrors `get_next_task`'s (see `check_doc_sync`).
 - `list_tasks(project_id, status?, epic_id?, release_id?) -> { tasks: [{ id, title, status, estimated_tokens, task_number, epic_id, release_id }] }` — summary rows only; use `get_task` for full detail. `epic_id`/`release_id` (both optional, combinable) scope the list to one epic and/or one release.
 - **Status CLI** (outside MCP): `node dist/cli/status.js [project_id_or_name]` — no arg lists every registered project's status; with an arg, prints that project's status plus its full task list. Read-only, opens the DB directly.
@@ -386,6 +424,29 @@ discoverable.
   and `legacy_alter_table = ON` (so the RENAME doesn't repoint `tasks`' stored
   FK clause at `releases_old`) are load-bearing, and `tests/migration.test.ts`
   asserts the task→release links survive rather than only that the rows do.
+- **`complete_task` is called while the task still has slices pending or in
+  progress.** Rejected with `open_slices`, naming each open slice as
+  `describeSlice` formats it (`S2 "title" (pending)`), rather than accepted
+  with unfinished work silently implied done — a task is worked as its slices,
+  so "done" while some of them never ran is a claim the record would
+  contradict. `force` skips this the same way it skips verification.
+- **`set_task_slices` is called on a task with a slice `in_progress`, or on
+  one that's `done`/`cancelled`.** Both refuse rather than silently discarding
+  live work or rewriting a finished record: a slice `in_progress` means some
+  agent is working it right now, and deleting the row under it would make its
+  `complete_slice` fail and lose the report; a `done`/`cancelled` task's
+  slicing is the record of how it was worked, and rewriting it afterwards
+  would erase that. Neither is bypassable by `force` — `set_task_slices` takes
+  no such parameter — so the caller finishes, fails or skips the slice first,
+  or reopens the task.
+- **`start_slice`/`complete_slice` are called on a slice already in the
+  target state, or in the wrong one.** Both are one-shot state transitions,
+  not idempotent upserts: `start_slice` refuses any non-`pending` slice, and
+  `complete_slice` refuses a slice already `done`/`failed`/`skipped` — a
+  report cannot be silently replaced by a second call. `done`/`failed`
+  additionally require the slice to have been started (`in_progress`);
+  `skipped` is the one outcome also reachable straight from `pending`, since a
+  slice skipped without ever running is the normal case for a skip.
 
 ## Open Questions / Risks
 

@@ -35,6 +35,7 @@ npm run dashboard  # read-only live web dashboard, see below
 `create_release`, `list_releases`, `get_release_status`, `release_it`,
 `cancel_release`, `set_task_release`, `set_release_sequence`, `create_task`, `set_task_priority`,
 `amend_task`, `cancel_task`, `delete_task`, `add_dependency`, `split_task`, `get_next_task`, `get_task`,
+`set_task_slices`, `start_slice`, `complete_slice`,
 `list_tasks`, `get_project_status`, `claim_task`, `release_task`, `check_doc_sync`,
 `add_handoff_note`, `complete_task`, `create_plan`, `get_plan`, `approve_plan`.
 

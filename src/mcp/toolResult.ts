@@ -46,3 +46,13 @@ export function notClaimableResult(details: { message: string; status: string })
     isError: true,
   };
 }
+
+export function openSlicesResult(details: {
+  message: string;
+  open_slices: Array<{ id: string; ref: string; label: string; title: string; status: string }>;
+}): CallToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify({ error: "open_slices", ...details }) }],
+    isError: true,
+  };
+}
