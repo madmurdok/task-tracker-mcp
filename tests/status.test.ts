@@ -5,9 +5,11 @@ import { createTask } from "../src/domain/tasks.js";
 import { addDependency } from "../src/domain/dependencies.js";
 import { approvePlan, upsertPlan } from "../src/domain/plans.js";
 import { createRelease } from "../src/domain/releases.js";
+import { setTaskSlices } from "../src/domain/slices.js";
 import { getNextTask, getProjectStatus, getTaskDetail, listTasks } from "../src/domain/status.js";
 import { addHandoffNote } from "../src/domain/handoffNotes.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
+import type { Task } from "../src/domain/tasks.js";
 
 const noopEstimator: BudgetEstimator = { estimateTokens: () => 0 };
 
@@ -66,6 +68,17 @@ function moveToRelease(db: DatabaseInstance, taskId: string, releaseId: string |
   db.prepare(`UPDATE tasks SET release_id = ? WHERE id = ?`).run(releaseId, taskId);
 }
 
+// approvePlan (TTM-87) now refuses while any open batch task has no slices.
+// None of this file's fixtures were built with slicing in mind - they exist
+// to exercise getNextTask's own picking rules - so this gives each task the
+// smallest valid slicing purely to clear that gate, the same helper plans.test.ts
+// uses for the same reason.
+function sliceAll(db: DatabaseInstance, ...tasks: Task[]): void {
+  for (const task of tasks) {
+    setTaskSlices(db, task.id, [{ phase: "implement", title: "do it" }]);
+  }
+}
+
 function expireLease(db: DatabaseInstance, taskId: string): void {
   db.prepare(`UPDATE tasks SET lock_expires_at = ? WHERE id = ?`).run(
     new Date(Date.now() - 1000).toISOString(),
@@ -91,6 +104,7 @@ function planContradictingPriority() {
     steps: [low.id, high.id],
     rationale: "the low-priority task unblocks the high-priority one",
   });
+  sliceAll(db, low, high);
   approvePlan(db, project.id, release.version, { approved_by: "owner" });
   return { db, project, release, low, high };
 }
@@ -260,6 +274,7 @@ describe("getNextTask scoped to a release batch with an approved plan", () => {
     const second = makeTask("second");
     const third = makeTask("third");
     upsertPlan(db, project.id, release.version, { steps: [first.id, second.id, third.id] });
+    sliceAll(db, first, second, third);
     approvePlan(db, project.id, release.version, { approved_by: "owner" });
 
     // The two rows are built to the exact shape each lifecycle path leaves
@@ -291,6 +306,7 @@ describe("getNextTask scoped to a release batch with an approved plan", () => {
     // The plan puts the blocked task first on purpose: the dependency gate has
     // to override the plan's own order, not just priority's.
     upsertPlan(db, project.id, release.version, { steps: [blocked.id, prerequisite.id] });
+    sliceAll(db, blocked, prerequisite);
     approvePlan(db, project.id, release.version, { approved_by: "owner" });
 
     const result = getNextTask(db, project.id, release.version);
@@ -304,6 +320,7 @@ describe("getNextTask scoped to a release batch with an approved plan", () => {
     const first = makeTask("first");
     const second = makeTask("second");
     upsertPlan(db, project.id, release.version, { steps: [first.id, second.id] });
+    sliceAll(db, first, second);
     approvePlan(db, project.id, release.version, { approved_by: "owner" });
 
     expect(getNextTask(db, project.id, release.version).task?.id).toBe(first.id);
@@ -326,6 +343,7 @@ describe("getNextTask scoped to a release batch with an approved plan", () => {
     const blocked = makeTask("the batch's only task");
     addDependency(db, blocked.id, prerequisite.id);
     upsertPlan(db, project.id, release.version, { steps: [blocked.id] });
+    sliceAll(db, blocked);
     approvePlan(db, project.id, release.version, { approved_by: "owner" });
 
     const result = getNextTask(db, project.id, release.version);
@@ -347,6 +365,7 @@ describe("getNextTask scoped to a release batch with an approved plan", () => {
     makeBacklogTask("still pending, outside the batch");
     const only = makeTask("the batch's only task");
     upsertPlan(db, project.id, release.version, { steps: [only.id] });
+    sliceAll(db, only);
     approvePlan(db, project.id, release.version, { approved_by: "owner" });
     markStatus(db, only.id, "done");
 
@@ -379,6 +398,7 @@ describe("getNextTask refusing a batch whose plan is not approved", () => {
     const { db, project, release, makeTask, makeBacklogTask } = setupBatch();
     const planned = makeTask("in the plan");
     upsertPlan(db, project.id, release.version, { steps: [planned.id] });
+    sliceAll(db, planned);
     approvePlan(db, project.id, release.version, { approved_by: "owner" });
 
     // Moved in with a direct write, not setTaskRelease: what this test needs is
@@ -406,6 +426,7 @@ describe("getNextTask refusing a batch whose plan is not approved", () => {
     const staying = makeTask("staying");
     const leaving = makeTask("leaving");
     upsertPlan(db, project.id, release.version, { steps: [staying.id, leaving.id] });
+    sliceAll(db, staying, leaving);
     approvePlan(db, project.id, release.version, { approved_by: "owner" });
 
     moveToRelease(db, leaving.id, null);
@@ -472,6 +493,7 @@ describe("getNextTask's plan_pending on an unscoped call", () => {
     const { db, project, release, makeTask, makeBacklogTask } = setupBatch();
     const planned = makeTask("in the plan");
     upsertPlan(db, project.id, release.version, { steps: [planned.id] });
+    sliceAll(db, planned);
     approvePlan(db, project.id, release.version, { approved_by: "owner" });
     const latecomer = makeBacklogTask("added after approval");
     moveToRelease(db, latecomer.id, release.id);

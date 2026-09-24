@@ -511,6 +511,28 @@ function codesFor(db: DatabaseInstance, codePrefix: string, taskIds: string[]): 
 }
 
 /**
+ * Open batch tasks (status not `done`/`cancelled`) with zero rows in
+ * `task_slices` (TTM-87). Queried directly against the table rather than
+ * through `listTaskSlices` (slices.ts): this only needs a row count per task
+ * across the whole batch, and slices.ts's own read model does per-task work
+ * (labels, refs, JSON parsing) approvePlan has no use for. `done`/`cancelled`
+ * tasks are exempt for the same reason `planDrift` exempts them from the
+ * unplanned side - a finished or abandoned task has no work left to slice.
+ */
+function unslicedOpenTasks(db: DatabaseInstance, releaseId: string): string[] {
+  const rows = db
+    .prepare(
+      `SELECT t.id FROM tasks t
+       WHERE t.release_id = ?
+         AND t.status NOT IN ('done', 'cancelled')
+         AND NOT EXISTS (SELECT 1 FROM task_slices s WHERE s.task_id = t.id)
+       ORDER BY t.priority DESC, t.created_at ASC`,
+    )
+    .all(releaseId) as Array<{ id: string }>;
+  return rows.map((row) => row.id);
+}
+
+/**
  * Records the owner's one-time sign-off on the plan: draft -> approved,
  * stamping who approved it, their verbatim words, and when.
  *
@@ -520,6 +542,17 @@ function codesFor(db: DatabaseInstance, codePrefix: string, taskIds: string[]): 
  * one outcome this feature exists to prevent. The refusal names the tasks by
  * code, because the only useful response to it is fixing the plan.
  *
+ * Refuses, after the drift check, while any open batch task has no slices
+ * (TTM-87) - checked here rather than at upsert time, so a plan can still be
+ * written and reordered before every task is sliced, and only the sign-off
+ * itself is gated. A slice is how a task is worked (slices.ts's own header);
+ * approving a plan that includes an unsliced open task would license working
+ * it with no record of how, which drift's own rationale above already rules
+ * out for the same reason. There is no bypass: unlike `force` on
+ * completeTask's open-slices check, this fires before any work starts, so
+ * there is no "it turned out no slicing was needed" case to make room for.
+ *
+
  * Refuses an already-approved plan too, rather than re-stamping: a second
  * approval would quietly overwrite the first approver, note and timestamp, and
  * the audit trail is the whole value of the record.
@@ -571,6 +604,13 @@ export function approvePlan(
       }
       throw new Error(
         `Plan for release ${releaseRef} does not match the batch, so it cannot be approved (${parts.join("; ")}). Rewrite it with upsert_plan.`,
+      );
+    }
+
+    const unsliced = unslicedOpenTasks(db, record.release_id);
+    if (unsliced.length > 0) {
+      throw new Error(
+        `Plan for release ${releaseRef} has open tasks with no slices, so it cannot be approved (${codesFor(db, project.code_prefix, unsliced).join(", ")}). Slice them with set_task_slices.`,
       );
     }
 

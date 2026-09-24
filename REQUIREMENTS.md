@@ -744,6 +744,12 @@ is just an index.
   like `complete_task`. `complete_task` itself now refuses with `open_slices`
   while any slice is still open, naming each one, unless `force`. The board's
   read-only Slices view is planned (TTM-84), not part of this.
+  TTM-87 tied slicing back into v10's plan approval: `approve_plan` now also
+  refuses, after its drift check, while any open (not `done`/`cancelled`)
+  batch task has zero slices — naming the unsliced tasks by code and pointing
+  at `set_task_slices`, the same shape as the drift refusal. No bypass flag;
+  the check runs only at approval time, so a plan can still be written and
+  reordered before every task is sliced.
 
 ## How to use this file
 

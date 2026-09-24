@@ -12,6 +12,7 @@ import {
 } from "../src/domain/plans.js";
 import { createProject } from "../src/domain/projects.js";
 import { createRelease, setTaskRelease } from "../src/domain/releases.js";
+import { setTaskSlices } from "../src/domain/slices.js";
 import { createTask, createTasks, type Task } from "../src/domain/tasks.js";
 import type { CompletionVerifier } from "../src/domain/verification.js";
 
@@ -63,6 +64,17 @@ function markCancelled(db: DatabaseInstance, releaseId: string): void {
 // planDrift's orphaned-item computation exists to still catch.
 function moveTaskReleaseDirectly(db: DatabaseInstance, taskId: string, releaseId: string | null): void {
   db.prepare(`UPDATE tasks SET release_id = ? WHERE id = ?`).run(releaseId, taskId);
+}
+
+// approvePlan (TTM-87) refuses while any open batch task has no slices, which
+// every pre-existing "approves fine" test would otherwise trip now that
+// slicing wasn't part of its setup. This gives each of those tasks the
+// smallest valid slicing (one implement slice) so the tests keep exercising
+// what they were written to exercise rather than this new gate.
+function sliceAll(db: DatabaseInstance, ...tasks: Task[]): void {
+  for (const task of tasks) {
+    setTaskSlices(db, task.id, [{ phase: "implement", title: "do it" }]);
+  }
 }
 
 describe("upsertPlan", () => {
@@ -238,6 +250,7 @@ describe("upsertPlan", () => {
     const first = addTask(db, project.id, "first", release.id);
     const second = addTask(db, project.id, "second", release.id);
     upsertPlan(db, project.id, release.version, { steps: [first.id, second.id], rationale: "why" });
+    sliceAll(db, first, second);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
     const approved = getPlan(db, project.id, release.version)!;
@@ -421,6 +434,7 @@ describe("approvePlan", () => {
     const { db, project, release } = setup();
     const task = addTask(db, project.id, "first", release.id);
     upsertPlan(db, project.id, release.version, { steps: [task.id] });
+    sliceAll(db, task);
 
     const approved = approvePlan(db, project.id, release.version, {
       approved_by: "valentin",
@@ -446,6 +460,7 @@ describe("approvePlan", () => {
     const { db, project, release } = setup();
     const task = addTask(db, project.id, "first", release.id);
     upsertPlan(db, project.id, release.version, { steps: [task.id] });
+    sliceAll(db, task);
     const note = "  ок, но TTM-70 держим последним\n\n- и не мержим в main\n";
 
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note });
@@ -493,6 +508,7 @@ describe("approvePlan", () => {
     const { db, project, release } = setup();
     const task = addTask(db, project.id, "first", release.id);
     upsertPlan(db, project.id, release.version, { steps: [task.id] });
+    sliceAll(db, task);
     const first = approvePlan(db, project.id, release.version, {
       approved_by: "valentin",
       note: "first",
@@ -551,6 +567,7 @@ describe("approvePlan", () => {
     const { db, project, release } = setup();
     const task = addTask(db, project.id, "first", release.id);
     upsertPlan(db, project.id, release.version, { steps: [task.id] });
+    sliceAll(db, task);
 
     approvePlan(db, project.id, release.version, { approved_by: "valentin" });
 
@@ -558,6 +575,72 @@ describe("approvePlan", () => {
       .prepare(`SELECT approval_note FROM release_plans WHERE release_id = ?`)
       .get(release.id);
     expect(row).toEqual({ approval_note: null });
+  });
+});
+
+describe("approvePlan slicing gate (TTM-87)", () => {
+  it("refuses a plan with an open unsliced task, naming it by code", () => {
+    const { db, project, release } = setup();
+    const task = addTask(db, project.id, "first", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [task.id] });
+
+    expect(() =>
+      approvePlan(db, project.id, release.version, { approved_by: "valentin" }),
+    ).toThrow(/has open tasks with no slices.*DEM-1.*set_task_slices/s);
+
+    const row = db
+      .prepare(`SELECT status, approved_at FROM release_plans WHERE release_id = ?`)
+      .get(release.id);
+    expect(row).toMatchObject({ status: "draft", approved_at: null });
+  });
+
+  it("approves once the previously-unsliced task is given a slicing", () => {
+    const { db, project, release } = setup();
+    const task = addTask(db, project.id, "first", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [task.id] });
+
+    expect(() =>
+      approvePlan(db, project.id, release.version, { approved_by: "valentin" }),
+    ).toThrow(/has open tasks with no slices/);
+
+    setTaskSlices(db, task.id, [{ phase: "implement", title: "do it" }]);
+    const approved = approvePlan(db, project.id, release.version, { approved_by: "valentin" });
+
+    expect(approved.status).toBe("approved");
+  });
+
+  it("does not block on a done or cancelled batch task that has no slices", () => {
+    const { db, project, release } = setup();
+    const planned = addTask(db, project.id, "planned", release.id);
+    const finished = addTask(db, project.id, "finished", release.id);
+    const abandoned = addTask(db, project.id, "abandoned", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [planned.id, finished.id, abandoned.id] });
+    sliceAll(db, planned);
+    // `finished`/`abandoned` are left with zero slices on purpose - they are
+    // done/cancelled, so unslicedOpenTasks must exempt them the same way
+    // planDrift exempts them from the unplanned side.
+    completeTask(db, noopVerifier, { task_id: finished.id, summary: "done" });
+    cancelTask(db, { task_id: abandoned.id, reason: "not needed" });
+
+    const approved = approvePlan(db, project.id, release.version, { approved_by: "valentin" });
+
+    expect(approved.status).toBe("approved");
+  });
+
+  it("reports drift, not the unsliced refusal, when a plan is both drifted and unsliced", () => {
+    const { db, project, release } = setup();
+    const planned = addTask(db, project.id, "planned", release.id);
+    // Created before the plan exists, same as the drift describe block's own
+    // tests - see the note there on why.
+    addTask(db, project.id, "late", release.id);
+    upsertPlan(db, project.id, release.version, { steps: [planned.id] });
+    // Neither `planned` (in the plan) nor `late` (in the batch, not in the
+    // plan) has been sliced - both gates would fire if checked in isolation,
+    // but the drift refusal must still win: it comes first in approvePlan.
+
+    expect(() =>
+      approvePlan(db, project.id, release.version, { approved_by: "valentin" }),
+    ).toThrow(/does not match the batch.*not in the plan: DEM-2/s);
   });
 });
 
@@ -570,6 +653,7 @@ describe("revertPlanToDraft", () => {
       steps: [[first.id, second.id]],
       rationale: "one step, both in parallel",
     });
+    sliceAll(db, first, second);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
     expect(revertPlanToDraft(db, release.id)).toBe(true);
@@ -602,6 +686,7 @@ describe("revertPlanToDraft", () => {
     const { db, project, release } = setup();
     const task = addTask(db, project.id, "first", release.id);
     upsertPlan(db, project.id, release.version, { steps: [task.id] });
+    sliceAll(db, task);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
     revertPlanToDraft(db, release.id);
 
@@ -619,6 +704,7 @@ describe("plan revert hooks (TTM-68)", () => {
     const { db, project, release } = setup();
     const first = addTask(db, project.id, "first", release.id);
     upsertPlan(db, project.id, release.version, { steps: [first.id] });
+    sliceAll(db, first);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
     const late = addTask(db, project.id, "late", release.id);
@@ -639,6 +725,7 @@ describe("plan revert hooks (TTM-68)", () => {
     const { db, project, release } = setup();
     const first = addTask(db, project.id, "first", release.id);
     upsertPlan(db, project.id, release.version, { steps: [first.id] });
+    sliceAll(db, first);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
     const backlog = addTask(db, project.id, "backlog");
@@ -658,6 +745,7 @@ describe("plan revert hooks (TTM-68)", () => {
     const leaves = addTask(db, project.id, "leaves", release.id);
     const other = createRelease(db, { project_id: project.id, version: "0.2" });
     upsertPlan(db, project.id, release.version, { steps: [stays.id, leaves.id] });
+    sliceAll(db, stays, leaves);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
     setTaskRelease(db, leaves.id, other.version);
@@ -675,6 +763,7 @@ describe("plan revert hooks (TTM-68)", () => {
     const stays = addTask(db, project.id, "stays", release.id);
     const leaves = addTask(db, project.id, "leaves", release.id);
     upsertPlan(db, project.id, release.version, { steps: [stays.id, leaves.id] });
+    sliceAll(db, stays, leaves);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
     setTaskRelease(db, leaves.id, null);
@@ -688,6 +777,7 @@ describe("plan revert hooks (TTM-68)", () => {
     const { db, project, release } = setup();
     const first = addTask(db, project.id, "first", release.id);
     upsertPlan(db, project.id, release.version, { steps: [first.id] });
+    sliceAll(db, first);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
     const result = createTasks(db, noopEstimator, project.id, [
@@ -712,6 +802,7 @@ describe("plan revert hooks (TTM-68)", () => {
     const { db, project, release } = setup();
     const first = addTask(db, project.id, "first", release.id);
     upsertPlan(db, project.id, release.version, { steps: [first.id] });
+    sliceAll(db, first);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
     expect(() =>
@@ -737,9 +828,14 @@ describe("plan revert hooks (TTM-68)", () => {
     const first = addTask(db, project.id, "first", release.id);
     const second = addTask(db, project.id, "second", release.id);
     upsertPlan(db, project.id, release.version, { steps: [first.id, second.id] });
+    sliceAll(db, first, second);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
-    completeTask(db, noopVerifier, { task_id: first.id, summary: "done" });
+    // force: the slicing sliceAll gave `first` for the plan gate leaves it with
+    // an open (pending) slice, which completeTask would otherwise refuse over
+    // (lifecycle.ts's own, unrelated OpenSlicesError) - not what this test is
+    // about, which is purely whether completion reverts the plan.
+    completeTask(db, noopVerifier, { task_id: first.id, summary: "done", force: true });
 
     const plan = getPlan(db, project.id, release.version)!;
     expect(plan.status).toBe("approved");
@@ -751,6 +847,7 @@ describe("plan revert hooks (TTM-68)", () => {
     const first = addTask(db, project.id, "first", release.id);
     const second = addTask(db, project.id, "second", release.id);
     upsertPlan(db, project.id, release.version, { steps: [first.id, second.id] });
+    sliceAll(db, first, second);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
     cancelTask(db, { task_id: second.id, reason: "not needed" });
@@ -765,6 +862,7 @@ describe("plan revert hooks (TTM-68)", () => {
     const first = addTask(db, project.id, "first", release.id);
     const second = addTask(db, project.id, "second", release.id);
     upsertPlan(db, project.id, release.version, { steps: [first.id, second.id] });
+    sliceAll(db, first, second);
     approvePlan(db, project.id, release.version, { approved_by: "valentin", note: "go" });
 
     claimTask(db, first.id, "session-abc");

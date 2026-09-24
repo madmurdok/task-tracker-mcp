@@ -238,6 +238,15 @@ describe("MCP server smoke test", () => {
       expect.objectContaining({ task_id: planTaskId, code: expect.stringContaining("-") }),
     ]);
 
+    // TTM-87: approve_plan refuses an open batch task with no slices, so give
+    // it a minimal placeholder slicing first - the real slicing exercised
+    // below (set_task_slices) replaces this one wholesale, same as any
+    // re-slicing does.
+    await call("set_task_slices", {
+      task_id: planTaskId,
+      slices: [{ phase: "implement", title: "placeholder" }],
+    });
+
     const approved = await call("approve_plan", {
       project_id,
       release_id: planReleaseId,
@@ -521,6 +530,16 @@ describe("MCP server smoke test", () => {
     });
     expect(late.task_id).toBeTruthy();
 
+    // TTM-87: both batch tasks need a slicing before the plan can be approved.
+    await payloadOf("set_task_slices", {
+      task_id: planned.task_id,
+      slices: [{ phase: "implement", title: "do it" }],
+    });
+    await payloadOf("set_task_slices", {
+      task_id: late.task_id,
+      slices: [{ phase: "implement", title: "do it" }],
+    });
+
     const firstApproval = await callText("approve_plan", {
       project_id: project.project_id,
       release_id: "1.0.0",
@@ -552,6 +571,59 @@ describe("MCP server smoke test", () => {
       release_id: "1.0.0",
     });
     expect(stillTheFirstApprover.approved_by).toBe("valentin");
+  });
+
+  it("carries approve_plan's unsliced-task refusal (TTM-87) to the caller, naming the task by code", async () => {
+    const client = await connectedClient(db);
+    const callText = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      const content = result.content as Array<{ type: string; text: string }>;
+      return { isError: result.isError, text: content[0].text };
+    };
+    const payloadOf = async (name: string, args: Record<string, unknown>) =>
+      JSON.parse((await callText(name, args)).text);
+
+    const project = await payloadOf("create_project", {
+      name: "Unsliced refusal",
+      root_path: "/tmp/unsliced-refusal",
+    });
+    await payloadOf("create_release", { project_id: project.project_id, version: "1.0.0" });
+    const task = await payloadOf("create_task", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+      title: "not yet sliced",
+      complexity_hint: "normal",
+    });
+    await payloadOf("create_plan", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+      steps: [task.task_id],
+    });
+
+    const refused = await callText("approve_plan", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+      approved_by: "valentin",
+    });
+    expect(refused.isError).toBe(true);
+    expect(refused.text).toMatch(/has open tasks with no slices/);
+    // "Unsliced refusal" derives to prefix "UR" (one initial per word - see
+    // derivePrefix in projects.ts), so the first task in it is UR-1.
+    expect(refused.text).toMatch(/UR-1/);
+    expect(refused.text).toMatch(/set_task_slices/);
+
+    await payloadOf("set_task_slices", {
+      task_id: task.task_id,
+      slices: [{ phase: "implement", title: "do it" }],
+    });
+
+    const approved = await callText("approve_plan", {
+      project_id: project.project_id,
+      release_id: "1.0.0",
+      approved_by: "valentin",
+    });
+    expect(approved.isError, approved.text).toBeFalsy();
+    expect(JSON.parse(approved.text).status).toBe("approved");
   });
 
   it("exercises create_tasks end to end, wiring a temp_id-to-temp_id dependency", async () => {

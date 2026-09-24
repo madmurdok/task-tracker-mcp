@@ -340,7 +340,7 @@ discoverable.
   - Plan order is a **single pass**, so a reclaimable step-1 task beats a fresh pending step-2 one — where the unscoped path drains all pending work before reclaiming anything. The plan says step 1 first.
 - `create_plan(project_id, release_id, steps, rationale?) -> ReleasePlan` — writes or replaces a batch's execution order. `steps` is a flat list of task refs (each becoming a step of one, the common case) or a list of groups whose members may run in parallel; a ref is a uuid or a code (`TTM-63`). Upsert rather than separate insert/move/remove tools, because a membership change already sends the plan back to `draft`, which makes re-sending the whole plan the normal path. Replacing an approved plan resets it to `draft` and clears the approval and rationale — nobody signed off on the new order. Rejects a released or cancelled release, a task not in this batch, a task listed twice, and an empty list.
 - `get_plan(project_id, release_id) -> ReleasePlan | null` — items in execution order each with its *live* status, the approval record, and both directions of drift. `null` rather than an error when no plan exists, matching `get_task`/`get_release`.
-- `approve_plan(project_id, release_id, approved_by, note?) -> ReleasePlan` — `draft -> approved`. `note` is stored exactly as given: the approving human's verbatim words, not a summary, because the party an approval authorises is the party calling the tool and a quote is the only part of that record which is checkable afterwards. Refuses a drifted plan (the error names the offending tasks by code — it is the reader's cue to re-approve) and an already-approved one (no re-stamping over the first approver).
+- `approve_plan(project_id, release_id, approved_by, note?) -> ReleasePlan` — `draft -> approved`. `note` is stored exactly as given: the approving human's verbatim words, not a summary, because the party an approval authorises is the party calling the tool and a quote is the only part of that record which is checkable afterwards. Refuses a drifted plan (the error names the offending tasks by code — it is the reader's cue to re-approve), then — TTM-87 — refuses while any open batch task (status not `done`/`cancelled`) has zero slices, naming them by code and pointing at `set_task_slices` (see Failure Modes), and an already-approved plan (no re-stamping over the first approver).
 - `get_task(task_id) -> { id, title, description, acceptance_criteria, status, estimated_tokens, priority, complexity_hint, file_paths, handoff_notes, amendments, slices, ... }` — the same detail packet `get_next_task` returns, fetchable anytime with no claim/lock side effect; use this (not `get_next_task`) to just re-inspect a task. `amendments` (see `amend_task`) is that task's full correction history, oldest first, empty when it was never amended. `slices` (see `set_task_slices`) is how the task is worked, in step/position order, empty for a task nobody has sliced yet.
 - `set_task_slices(task_id, slices: Array<Slice | Slice[]>) -> { task_id, code, slices, discarded }` — writes (or replaces) a task's whole slicing: how it's worked, as an ordered sequence of steps, each a slice or an array of slices sharing a step that may run in parallel (the task-level analogue of `create_plan`'s steps, deliberately the same shape). A slice is `{phase: design|implement|verify|measure, title, brief?, exit_criterion?, model?}`. Slices are labelled `S1`, `S2`, ... in step/position order and returned with a `ref` (e.g. `TTM-83/S2`) that `start_slice`/`complete_slice` accept in place of a uuid. Replacing is wholesale and carries nothing over — done/failed/skipped slices are dropped too, named in `discarded` so a re-slicing's loss is visible rather than silent. Refuses while any slice is `in_progress` (finish, fail or skip it first) and on a `done`/`cancelled` task, whose slicing is a finished record (see Failure Modes). `task_id` accepts a uuid or a code (`TTM-63`).
 - `start_slice(slice_id) -> TaskSlice` — `pending -> in_progress`, stamping `started_at`. Refuses any slice that isn't `pending`. `slice_id` accepts a slice's own uuid or `<task>/S<n>` (e.g. `TTM-83/S2`, or `<task uuid>/S2`) — the `ref` every slice carries.
@@ -447,6 +447,17 @@ discoverable.
   additionally require the slice to have been started (`in_progress`);
   `skipped` is the one outcome also reachable straight from `pending`, since a
   slice skipped without ever running is the normal case for a skip.
+- **`approve_plan` is called while an open batch task has no slices
+  (TTM-87).** Checked inside the same transaction right after the drift check
+  above, and only if that one passes: refuses, naming the unsliced tasks by
+  code and pointing at `set_task_slices`, the same shape as the drift refusal
+  it follows. `done`/`cancelled` tasks are exempt, matching `planDrift`'s own
+  exemption of them from the unplanned side — nothing left to slice. No
+  `force`/bypass, and the check runs only at approval time, so a plan can
+  still be written and reordered before every task is sliced; this and
+  `complete_task`'s `open_slices` refusal above thus gate a task's slicing
+  from opposite ends of its lifecycle — before the batch is signed off, and
+  before the task is declared done.
 
 ## Open Questions / Risks
 
