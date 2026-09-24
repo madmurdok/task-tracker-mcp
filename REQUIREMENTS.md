@@ -553,6 +553,36 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
   the board. Drift and "new since approval" are computed at read time, never
   stored, for the same reason `blocked` is. Full contract in the architecture doc.
 
+### 10. Task phases and slices, so how a task is worked is itself trackable
+
+- **Status:** done (see Implemented, v11)
+- **Priority:** high
+- **Problem:** a task was one opaque span from `claim_task` to `complete_task` —
+  no record of the phases it actually went through (design, implementation,
+  verification, measurement), no place for a fresh agent's verification report
+  to live separately from the implementer's own summary, and no way to catch a
+  task marked done with part of that work never run. Working every task
+  single-agent end to end also spends context a phase-by-phase handoff would
+  not have to.
+- **Confirmed with the user:**
+  - Every task is worked as phases and slices: design -> implementation
+    slices -> verification by a fresh agent -> measurement.
+  - Results follow "option C": the slice's report goes in `result`, durable
+    artifacts are referenced by path in the project repo, and scratch output
+    is not recorded.
+  - Evidence from the GM-395 pilot: context never exceeded 338k (vs 550k
+    single-agent); the fresh-agent verification step found 3 blind tests the
+    implementer's own pass had missed.
+- **Design:** one table, `task_slices` (phase, step/position, title, brief,
+  exit_criterion, model, status, result, artifacts, metrics, timestamps), a
+  `slices.ts` domain module, and three MCP tools — `set_task_slices` (writes a
+  task's whole slicing, wholesale-replace only), `start_slice`, `complete_slice`
+  — plus `.slices` on `get_task`/`get_next_task` and a `complete_task` refusal
+  (`open_slices`) while any slice is still pending or in progress. A slice is
+  labelled `S1`, `S2`, ... in step/position order, computed at read time, and
+  addressed by its own uuid or `<task>/S<n>`. The board's read-only Slices view
+  is planned (TTM-84), not part of this. Full contract in the architecture doc.
+
 ## Implemented
 
 What's already shipped, so a new idea can be checked against it before being added
@@ -695,6 +725,25 @@ is just an index.
   beside Release notes, with finished items struck through. Reverses v4's
   "releases don't participate in scheduling" non-goal; the unscoped
   `get_next_task` is unchanged.
+
+- **v11 — task phases and slices** (`set_task_slices`, `start_slice`,
+  `complete_slice`, `.slices` on `get_task`/`get_next_task`, `task_slices`): a
+  task's own work now has a record of the phases it went through — design,
+  implementation slices, verification by a fresh agent, measurement — instead
+  of one opaque span from claim to complete. `set_task_slices` writes a task's
+  whole slicing at once: steps run in order, and a step holding an array of
+  slices means they may run in parallel (the same shorthand `create_plan`'s
+  steps use). Slices are labelled `S1`, `S2`, ... in step/position order,
+  computed at read time rather than stored, and addressed by their own uuid or
+  `<task>/S<n>` (e.g. `TTM-83/S2`). Replacing a slicing is wholesale — it
+  carries nothing over, dropping even finished slices and listing them in
+  `discarded` — and refuses while a slice is `in_progress` or the task is
+  `done`/`cancelled`. `start_slice` moves `pending -> in_progress`;
+  `complete_slice` records the outcome (`done`/`failed`/`skipped`) with
+  `result` as the slice's report and optional `artifacts`/`metrics`, one-shot
+  like `complete_task`. `complete_task` itself now refuses with `open_slices`
+  while any slice is still open, naming each one, unless `force`. The board's
+  read-only Slices view is planned (TTM-84), not part of this.
 
 ## How to use this file
 
