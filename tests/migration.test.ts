@@ -1026,6 +1026,7 @@ describe("task_slices (via SCHEMA_SQL)", () => {
           "completed_at",
           "created_at",
           "updated_at",
+          "label_number",
         ].sort(),
       );
       expect(db!.prepare(`SELECT COUNT(*) AS cnt FROM task_slices`).get()).toEqual({ cnt: 0 });
@@ -1054,6 +1055,97 @@ describe("task_slices (via SCHEMA_SQL)", () => {
         { id: "s1", status: "pending", artifacts: "[]", metrics: null },
       ]);
       expect(again.prepare(`SELECT * FROM tasks`).all()).toEqual(before.tasks);
+      again.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("task_slices.label_number (TTM-89, via runMigrations)", () => {
+  /**
+   * The seed is the current SCHEMA_SQL with task_slices cut back to its
+   * pre-TTM-89 shape (no label_number) and without task_slice_revisions - the
+   * shape a 0.10.0 tracker.db has on disk - so it cannot drift from the real
+   * previous schema the way a hand-copied fixture would.
+   */
+  async function preLabelSchema(): Promise<string> {
+    const { SCHEMA_SQL } = await import("../src/db/schema.js");
+    const cut = SCHEMA_SQL.indexOf("CREATE TABLE IF NOT EXISTS task_slice_revisions");
+    expect(cut).toBeGreaterThan(0);
+    const withoutRevisions = SCHEMA_SQL.slice(0, cut);
+    const labelColumn = "  label_number INTEGER,\n";
+    expect(withoutRevisions).toContain(labelColumn);
+    return withoutRevisions.replace(labelColumn, "");
+  }
+
+  it("labels existing slices exactly as the old read-time numbering did, and keeps them through a revision", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "ttmcp-pre-labels-"));
+    const dbPath = path.join(dir, "tracker.db");
+    try {
+      const seed = new Database(dbPath);
+      seed.exec(await preLabelSchema());
+      // Inserted out of step/position order, so a backfill that followed rowid
+      // instead of step/position would number them differently.
+      seed.exec(`
+        INSERT INTO projects (id, name, root_path, code_prefix, created_at)
+          VALUES ('p1', 'Demo', '/tmp/demo', 'DEM', 'then');
+        INSERT INTO tasks (id, project_id, title, status, task_number, created_at, updated_at)
+          VALUES ('t1', 'p1', 'Sliced', 'in_progress', 1, 'then', 'then'),
+                 ('t2', 'p1', 'Other', 'pending', 2, 'then', 'then');
+        INSERT INTO task_slices (id, task_id, phase, step, position, title, status, result, created_at, updated_at)
+          VALUES ('c', 't1', 'verify', 3, 1, 'Check', 'pending', NULL, 'then', 'then'),
+                 ('b2', 't1', 'implement', 2, 2, 'Build B', 'in_progress', NULL, 'then', 'then'),
+                 ('a', 't1', 'design', 1, 1, 'Decide', 'done', 'decided', 'then', 'then'),
+                 ('b1', 't1', 'implement', 2, 1, 'Build A', 'pending', NULL, 'then', 'then'),
+                 ('x', 't2', 'implement', 1, 1, 'Only', 'pending', NULL, 'then', 'then');
+      `);
+      const rowsBefore = seed.prepare(`SELECT * FROM task_slices ORDER BY id`).all();
+      seed.close();
+
+      const { openDatabase } = await import("../src/db/connection.js");
+      const db = openDatabase(dbPath);
+      expect(db.prepare(`SELECT id, label_number FROM task_slices ORDER BY task_id, label_number`).all()).toEqual([
+        { id: "a", label_number: 1 },
+        { id: "b1", label_number: 2 },
+        { id: "b2", label_number: 3 },
+        { id: "c", label_number: 4 },
+        { id: "x", label_number: 1 },
+      ]);
+      // Nothing but the new column changed on any existing row.
+      const rowsAfter = (db.prepare(`SELECT * FROM task_slices ORDER BY id`).all() as Array<Record<string, unknown>>).map(
+        ({ label_number: _label, ...rest }) => rest,
+      );
+      expect(rowsAfter).toEqual(rowsBefore);
+
+      const { listTaskSlices, requireSlice, reviseTaskSlices } = await import("../src/domain/slices.js");
+      expect(listTaskSlices(db, "DEM-1").map((s) => [s.ref, s.title])).toEqual([
+        ["DEM-1/S1", "Decide"],
+        ["DEM-1/S2", "Build A"],
+        ["DEM-1/S3", "Build B"],
+        ["DEM-1/S4", "Check"],
+      ]);
+
+      // A migrated task revises like a new one: S2 (pending, before kept S3)
+      // goes, S3 keeps its label, the new slice is numbered after S4.
+      reviseTaskSlices(db, "DEM-1", [{ phase: "implement", title: "Rework" }], "migrated re-cut");
+      expect(requireSlice(db, "DEM-1/S3").id).toBe("b2");
+      expect(listTaskSlices(db, "DEM-1").map((s) => s.label)).toEqual(["S1", "S3", "S5"]);
+      db.close();
+
+      // Reopen: the backfill does not touch an already-labelled task, gaps included.
+      const again = openDatabase(dbPath);
+      expect(listTaskSlices(again, "DEM-1").map((s) => [s.label, s.title])).toEqual([
+        ["S1", "Decide"],
+        ["S3", "Build B"],
+        ["S5", "Rework"],
+      ]);
+      expect(() =>
+        again.exec(
+          `INSERT INTO task_slices (id, task_id, phase, step, position, title, label_number, created_at, updated_at)
+           VALUES ('dup', 't1', 'verify', 9, 1, 'Dup', 3, 'now', 'now')`,
+        ),
+      ).toThrow(/UNIQUE constraint failed/);
       again.close();
     } finally {
       rmSync(dir, { recursive: true, force: true });

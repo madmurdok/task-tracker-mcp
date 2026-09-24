@@ -12,7 +12,7 @@ import {
 } from "./plans.js";
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, requireRelease, type Release } from "./releases.js";
-import { listTaskSlices, type TaskSlice } from "./slices.js";
+import { listSliceRevisions, listTaskSlices, type TaskSlice, type TaskSliceRevision } from "./slices.js";
 import { displayStatus, hasUnmetDependencies, type DisplayStatus } from "./taskStatus.js";
 import { listTaskFilePaths, requireTask, type Task, withCode, taskCode} from "./tasks.js";
 
@@ -107,6 +107,11 @@ export interface TaskDetail extends Task {
    * a step may run in parallel. Empty for a task nobody has sliced yet.
    */
   slices: TaskSlice[];
+  /**
+   * revise_task_slices's trail (TTM-89), oldest first - each revision's reason
+   * and the pending slices it replaced. Empty for a task never revised.
+   */
+  slice_revisions: TaskSliceRevision[];
 }
 
 /**
@@ -126,6 +131,7 @@ export function getTaskDetail(db: DatabaseInstance, taskId: string): TaskDetail 
     handoff_notes: listHandoffNotes(db, task.id),
     amendments: listTaskAmendments(db, task.id),
     slices: listTaskSlices(db, task.id),
+    slice_revisions: listSliceRevisions(db, task.id),
   };
 }
 

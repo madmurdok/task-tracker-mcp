@@ -5,8 +5,10 @@ import { cancelTask, completeTask, OpenSlicesError } from "../src/domain/lifecyc
 import { createProject } from "../src/domain/projects.js";
 import {
   completeSlice,
+  listSlicesForTasks,
   listTaskSlices,
   requireSlice,
+  reviseTaskSlices,
   setTaskSlices,
   startSlice,
 } from "../src/domain/slices.js";
@@ -38,7 +40,6 @@ describe("set_task_slices / start_slice / complete_slice", () => {
     ]);
 
     expect(written.task_id).toBe(task.id);
-    expect(written.discarded).toEqual([]);
     expect(written.slices.map((s) => [s.label, s.ref, s.phase, s.step, s.position, s.status])).toEqual([
       ["S1", `${task.code}/S1`, "design", 1, 1, "pending"],
       ["S2", `${task.code}/S2`, "implement", 2, 1, "pending"],
@@ -159,7 +160,7 @@ describe("set_task_slices / start_slice / complete_slice", () => {
 });
 
 describe("set_task_slices replace rules", () => {
-  it("refuses to replace while a slice is in_progress, naming it, and leaves the slicing untouched", () => {
+  it("refuses to replace while a slice is in_progress, naming it and revise_task_slices, and leaves the slicing untouched", () => {
     const { db, task } = setup();
     setTaskSlices(db, task.code, [
       { phase: "design", title: "Decide" },
@@ -169,35 +170,52 @@ describe("set_task_slices replace rules", () => {
     const before = listTaskSlices(db, task.code);
 
     expect(() => setTaskSlices(db, task.code, [{ phase: "implement", title: "Other" }])).toThrow(
-      /has slices in progress: S1 "Decide" \(in_progress\)/,
+      /has slices that are in progress or finished: S1 "Decide" \(in_progress\); .*use revise_task_slices/,
     );
     expect(listTaskSlices(db, task.code)).toEqual(before);
   });
 
-  it("replaces wholesale once nothing is in progress, carrying nothing over and listing the finished slices it dropped", () => {
+  // TTM-89: replacing wholesale used to delete finished slices along with
+  // their reports and metrics. Now a finished slice makes set_task_slices
+  // refuse and point at revise_task_slices, and nothing is deleted.
+  it("refuses once any slice is finished - done, failed or skipped - naming each, and deletes nothing", () => {
+    const { db, task } = setup();
+    setTaskSlices(db, task.code, [
+      { phase: "design", title: "Decide" },
+      { phase: "implement", title: "Build" },
+      { phase: "verify", title: "Check" },
+      { phase: "measure", title: "Bench" },
+    ]);
+    startSlice(db, `${task.code}/S1`);
+    completeSlice(db, `${task.code}/S1`, { status: "done", result: "decided", metrics: { tool_uses: 3 } });
+    startSlice(db, `${task.code}/S2`);
+    completeSlice(db, `${task.code}/S2`, { status: "failed", result: "hit a wall" });
+    completeSlice(db, `${task.code}/S4`, { status: "skipped", result: "no bench" });
+    const before = listTaskSlices(db, task.code);
+
+    expect(() => setTaskSlices(db, task.code, [{ phase: "implement", title: "Other" }])).toThrow(
+      /has slices that are in progress or finished: S1 "Decide" \(done\), S2 "Build" \(failed\), S4 "Bench" \(skipped\); set_task_slices only writes a first slicing - use revise_task_slices/,
+    );
+    expect(listTaskSlices(db, task.code)).toEqual(before);
+  });
+
+  it("replaces an all-pending slicing wholesale, renumbering from S1", () => {
     const { db, task } = setup();
     const first = setTaskSlices(db, task.code, [
       { phase: "design", title: "Decide" },
       { phase: "implement", title: "Build" },
       { phase: "measure", title: "Bench" },
     ]);
-    startSlice(db, `${task.code}/S1`);
-    completeSlice(db, `${task.code}/S1`, { status: "done", result: "decided" });
-    completeSlice(db, `${task.code}/S3`, { status: "skipped", result: "no bench" });
 
     const second = setTaskSlices(db, task.code, [
       { phase: "implement", title: "Build" },
       { phase: "verify", title: "Check" },
     ]);
 
-    expect(second.discarded).toEqual([
-      { label: "S1", title: "Decide", status: "done" },
-      { label: "S3", title: "Bench", status: "skipped" },
-    ]);
     // Nothing carried over: the surviving title "Build" is a new, pending row.
-    expect(second.slices.map((s) => [s.label, s.title, s.status, s.result])).toEqual([
-      ["S1", "Build", "pending", null],
-      ["S2", "Check", "pending", null],
+    expect(second.slices.map((s) => [s.label, s.title, s.status, s.step])).toEqual([
+      ["S1", "Build", "pending", 1],
+      ["S2", "Check", "pending", 2],
     ]);
     const oldIds = new Set(first.slices.map((s) => s.id));
     expect(second.slices.some((s) => oldIds.has(s.id))).toBe(false);
@@ -221,6 +239,186 @@ describe("set_task_slices replace rules", () => {
     setTaskSlices(db, task.code, [{ phase: "design", title: "x" }]);
     db.prepare(`DELETE FROM tasks WHERE id = ?`).run(task.id);
     expect(db.prepare(`SELECT COUNT(*) AS cnt FROM task_slices`).get()).toEqual({ cnt: 0 });
+  });
+});
+
+describe("revise_task_slices (TTM-89)", () => {
+  /**
+   * S1 design (step 1)        -> done, with metrics
+   * S2 implement (step 2, p1) -> pending   <- a pending slice before kept ones
+   * S3 implement (step 2, p2) -> in_progress
+   * S4 verify (step 3)        -> skipped
+   * S5 verify (step 4)        -> pending
+   * S6 measure (step 5)       -> failed
+   */
+  function slicedMidway() {
+    const ctx = setup();
+    const { db, task } = ctx;
+    setTaskSlices(db, task.code, [
+      { phase: "design", title: "Decide" },
+      [
+        { phase: "implement", title: "Build A", brief: "brief A", exit_criterion: "A builds", model: "sonnet" },
+        { phase: "implement", title: "Build B" },
+      ],
+      { phase: "verify", title: "Check" },
+      { phase: "verify", title: "Recheck", model: "opus" },
+      { phase: "measure", title: "Bench" },
+    ]);
+    startSlice(db, `${task.code}/S1`);
+    completeSlice(db, `${task.code}/S1`, {
+      status: "done",
+      result: "the store cannot hold it",
+      artifacts: ["docs/finding.md"],
+      metrics: { tool_uses: 12, duration_ms: 3400 },
+    });
+    startSlice(db, `${task.code}/S3`);
+    completeSlice(db, `${task.code}/S4`, { status: "skipped", result: "not needed" });
+    startSlice(db, `${task.code}/S6`);
+    completeSlice(db, `${task.code}/S6`, { status: "failed", result: "bench harness broken" });
+    return ctx;
+  }
+
+  const rawRow = (db: DatabaseInstance, id: string) => db.prepare(`SELECT * FROM task_slices WHERE id = ?`).get(id);
+
+  it("keeps finished and in_progress slices byte for byte and replaces only the pending ones", () => {
+    const { db, task } = slicedMidway();
+    const before = listTaskSlices(db, task.code);
+    const kept = before.filter((s) => ["S1", "S3", "S4", "S6"].includes(s.label));
+    const rawBefore = kept.map((s) => rawRow(db, s.id));
+
+    const revised = reviseTaskSlices(
+      db,
+      task.code,
+      [{ phase: "implement", title: "Rework store" }, [{ phase: "verify", title: "V1" }, { phase: "verify", title: "V2" }]],
+      "S1 found the store cannot hold it",
+    );
+
+    // Every column of every kept row, unchanged - status, result, artifacts,
+    // metrics, timestamps, step, position and label.
+    expect(kept.map((s) => rawRow(db, s.id))).toEqual(rawBefore);
+    expect(revised.slices.filter((s) => kept.some((k) => k.id === s.id))).toEqual(kept);
+    // The pending ones are gone.
+    const replacedIds = before.filter((s) => s.status === "pending").map((s) => s.id);
+    expect(replacedIds).toHaveLength(2);
+    for (const id of replacedIds) expect(rawRow(db, id)).toBeUndefined();
+    expect(revised.slices.filter((s) => s.status === "pending").map((s) => s.title)).toEqual([
+      "Rework store",
+      "V1",
+      "V2",
+    ]);
+
+    // The in_progress slice is still workable by its old ref.
+    const s3 = completeSlice(db, `${task.code}/S3`, { status: "done", result: "B built anyway" });
+    expect(s3.id).toBe(kept.find((s) => s.label === "S3")!.id);
+  });
+
+  it("places the new slices in steps after the highest kept step, labelled after the highest label", () => {
+    const { db, task } = slicedMidway();
+    const revised = reviseTaskSlices(
+      db,
+      task.code,
+      [{ phase: "implement", title: "Rework store" }, [{ phase: "verify", title: "V1" }, { phase: "verify", title: "V2" }]],
+      "re-cut",
+    );
+
+    expect(revised.slices.map((s) => [s.label, s.title, s.step, s.position, s.status])).toEqual([
+      ["S1", "Decide", 1, 1, "done"],
+      ["S3", "Build B", 2, 2, "in_progress"],
+      ["S4", "Check", 3, 1, "skipped"],
+      ["S6", "Bench", 5, 1, "failed"],
+      ["S7", "Rework store", 6, 1, "pending"],
+      ["S8", "V1", 7, 1, "pending"],
+      ["S9", "V2", 7, 2, "pending"],
+    ]);
+    expect(revised.slices.map((s) => s.ref)).toEqual(revised.slices.map((s) => `${task.code}/${s.label}`));
+  });
+
+  it("keeps every kept slice's label - including one that sat after a removed pending slice - and never reuses a label", () => {
+    const { db, task } = slicedMidway();
+    const idOf = (ref: string) => requireSlice(db, ref).id;
+    const before = { S3: idOf(`${task.code}/S3`), S4: idOf(`${task.code}/S4`), S6: idOf(`${task.code}/S6`) };
+
+    // S2 (pending) sits before S3 and S4 (kept); S5 (pending) before S6.
+    reviseTaskSlices(db, task.code, [{ phase: "implement", title: "Rework" }], "first re-cut");
+    expect(idOf(`${task.code}/S3`)).toBe(before.S3);
+    expect(idOf(`${task.code}/S4`)).toBe(before.S4);
+    expect(idOf(`${task.code}/S6`)).toBe(before.S6);
+    expect(() => requireSlice(db, `${task.code}/S2`)).toThrow(/Unknown slice/);
+    expect(() => requireSlice(db, `${task.code}/S5`)).toThrow(/Unknown slice/);
+
+    // A second revision replaces S7 (pending) and still does not reuse 7.
+    const second = reviseTaskSlices(db, task.code, [{ phase: "verify", title: "Final" }], "second re-cut");
+    expect(second.slices.map((s) => s.label)).toEqual(["S1", "S3", "S4", "S6", "S8"]);
+    expect(idOf(`${task.code}/S3`)).toBe(before.S3);
+
+    // The board's batch query reads the same labels as get_task.
+    const board = listSlicesForTasks(db, [task], task.code.split("-")[0]!).get(task.id)!;
+    expect(board.map((s) => s.label)).toEqual(["S1", "S3", "S4", "S6", "S8"]);
+  });
+
+  it("records every revision with its reason and the replaced pending slices, and get_task returns the history", () => {
+    const { db, task } = slicedMidway();
+    expect(getTaskDetail(db, task.id).slice_revisions).toEqual([]);
+
+    const first = reviseTaskSlices(db, task.code, [{ phase: "implement", title: "Rework" }], "S1 found X");
+    expect(first.revision).toMatchObject({ task_id: task.id, reason: "S1 found X" });
+    expect(first.revision.replaced_slices).toEqual([
+      expect.objectContaining({
+        label: "S2",
+        phase: "implement",
+        step: 2,
+        position: 1,
+        title: "Build A",
+        brief: "brief A",
+        exit_criterion: "A builds",
+        model: "sonnet",
+      }),
+      expect.objectContaining({ label: "S5", phase: "verify", step: 4, title: "Recheck", model: "opus" }),
+    ]);
+    const second = reviseTaskSlices(db, task.code, [{ phase: "verify", title: "Final" }], "Rework is moot");
+    expect(second.revision.replaced_slices.map((s) => [s.label, s.title])).toEqual([["S7", "Rework"]]);
+
+    expect(getTaskDetail(db, task.code).slice_revisions).toEqual([first.revision, second.revision]);
+  });
+
+  it("works on an all-pending slicing, recording what it replaced", () => {
+    const { db, task } = setup();
+    setTaskSlices(db, task.code, [{ phase: "design", title: "a" }, { phase: "implement", title: "b" }]);
+    const revised = reviseTaskSlices(db, task.code, [{ phase: "implement", title: "c" }], "rethought");
+    expect(revised.slices.map((s) => [s.label, s.title, s.step])).toEqual([["S3", "c", 1]]);
+    expect(revised.revision.replaced_slices.map((s) => s.label)).toEqual(["S1", "S2"]);
+  });
+
+  it("refuses on a done or cancelled task, and without a reason, changing nothing", () => {
+    const { db, task } = slicedMidway();
+    const before = listTaskSlices(db, task.code);
+    expect(() => reviseTaskSlices(db, task.code, [{ phase: "design", title: "x" }], "  ")).toThrow(
+      /revise_task_slices requires a reason/,
+    );
+    expect(() => reviseTaskSlices(db, task.code, [], "why")).toThrow(/revise_task_slices requires at least one step/);
+    expect(listTaskSlices(db, task.code)).toEqual(before);
+
+    completeTask(db, noopVerifier, { task_id: task.code, force: true });
+    expect(() => reviseTaskSlices(db, task.code, [{ phase: "design", title: "x" }], "why")).toThrow(
+      `Task ${task.code} is done; its slicing is a finished record and cannot be revised`,
+    );
+    expect(listTaskSlices(db, task.code)).toEqual(before);
+
+    const other = setup();
+    setTaskSlices(other.db, other.task.code, [{ phase: "design", title: "a" }]);
+    cancelTask(other.db, { task_id: other.task.id, reason: "not needed" });
+    expect(() => reviseTaskSlices(other.db, other.task.code, [{ phase: "design", title: "x" }], "why")).toThrow(
+      `Task ${other.task.code} is cancelled; its slicing is a finished record and cannot be revised`,
+    );
+    expect(db.prepare(`SELECT COUNT(*) AS cnt FROM task_slice_revisions`).get()).toEqual({ cnt: 0 });
+    expect(other.db.prepare(`SELECT COUNT(*) AS cnt FROM task_slice_revisions`).get()).toEqual({ cnt: 0 });
+  });
+
+  it("cascades: deleting the task takes its revision history", () => {
+    const { db, task } = slicedMidway();
+    reviseTaskSlices(db, task.code, [{ phase: "design", title: "x" }], "why");
+    db.prepare(`DELETE FROM tasks WHERE id = ?`).run(task.id);
+    expect(db.prepare(`SELECT COUNT(*) AS cnt FROM task_slice_revisions`).get()).toEqual({ cnt: 0 });
   });
 });
 

@@ -579,9 +579,23 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
   task's whole slicing, wholesale-replace only), `start_slice`, `complete_slice`
   — plus `.slices` on `get_task`/`get_next_task` and a `complete_task` refusal
   (`open_slices`) while any slice is still pending or in progress. A slice is
-  labelled `S1`, `S2`, ... in step/position order, computed at read time, and
+  labelled `S1`, `S2`, ... in step/position order (stored since TTM-89), and
   addressed by its own uuid or `<task>/S<n>`. The board's read-only Slices view
   is planned (TTM-84), not part of this. Full contract in the architecture doc.
+- **Re-slicing without losing findings (TTM-89):** when an early slice finds a
+  fundamental problem, the rest of the task has to be re-cut. Replacing the
+  whole slicing deleted finished slices with their reports - destroying the
+  very finding that caused the re-slice - and was refused while anything was
+  in progress. So `revise_task_slices(task_id, slices, reason)` replaces only
+  the pending slices, keeps done/failed/skipped/in_progress ones untouched,
+  puts the new ones in steps after the highest kept step, and records each
+  revision (reason + the replaced pending slices) in `task_slice_revisions`,
+  returned by `get_task` as `slice_revisions`. `set_task_slices` became
+  first-slicing only: it refuses once any slice is in progress or finished,
+  pointing at `revise_task_slices`. Labels became stored (`label_number`)
+  rather than computed, so removing a pending slice cannot renumber a kept one
+  that a commit or summary already names; existing rows were backfilled with
+  the numbers the read-time scheme showed.
 
 ## Implemented
 
@@ -726,19 +740,28 @@ is just an index.
   "releases don't participate in scheduling" non-goal; the unscoped
   `get_next_task` is unchanged.
 
-- **v11 — task phases and slices** (`set_task_slices`, `start_slice`,
+- **v11 — task phases and slices** (`set_task_slices`, `revise_task_slices`, `start_slice`,
   `complete_slice`, `.slices` on `get_task`/`get_next_task`, `task_slices`): a
   task's own work now has a record of the phases it went through — design,
   implementation slices, verification by a fresh agent, measurement — instead
   of one opaque span from claim to complete. `set_task_slices` writes a task's
   whole slicing at once: steps run in order, and a step holding an array of
   slices means they may run in parallel (the same shorthand `create_plan`'s
-  steps use). Slices are labelled `S1`, `S2`, ... in step/position order,
-  computed at read time rather than stored, and addressed by their own uuid or
-  `<task>/S<n>` (e.g. `TTM-83/S2`). Replacing a slicing is wholesale — it
-  carries nothing over, dropping even finished slices and listing them in
-  `discarded` — and refuses while a slice is `in_progress` or the task is
-  `done`/`cancelled`. `start_slice` moves `pending -> in_progress`;
+  steps use). Slices are labelled `S1`, `S2`, ... in step/position order and
+  addressed by their own uuid or `<task>/S<n>` (e.g. `TTM-83/S2`).
+  TTM-89 split writing from re-cutting. `set_task_slices` writes the first
+  slicing, and may replace it wholesale only while every slice is still
+  pending; once one is `in_progress`/`done`/`failed`/`skipped` it refuses and
+  points at `revise_task_slices(task_id, slices, reason)`, which replaces only
+  the pending slices, keeps every other slice untouched (status, result,
+  metrics, timestamps, label), places the new ones after the highest kept
+  step, and appends the revision (reason + replaced pending slices) to
+  `task_slice_revisions`, returned by `get_task` as `slice_revisions`. Labels
+  are stored (`task_slices.label_number`, backfilled for existing rows with
+  the numbers the old read-time scheme showed) and never renumbered: a
+  revision numbers its new slices after the highest label the task had, so a
+  ref like `GM-401/S2` keeps naming the same slice, and labels may have gaps.
+  Both refuse on a `done`/`cancelled` task. `start_slice` moves `pending -> in_progress`;
   `complete_slice` records the outcome (`done`/`failed`/`skipped`) with
   `result` as the slice's report and optional `artifacts`/`metrics`, one-shot
   like `complete_task`. `complete_task` itself now refuses with `open_slices`
