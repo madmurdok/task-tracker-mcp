@@ -8,6 +8,7 @@ import { registerLifecycleTools } from "./tools/lifecycle.js";
 import { registerPlanTools } from "./tools/plans.js";
 import { registerProjectTools } from "./tools/projects.js";
 import { registerReleaseTools } from "./tools/releases.js";
+import { registerSliceTools } from "./tools/slices.js";
 import { registerStatusTools } from "./tools/status.js";
 import { registerTaskTools } from "./tools/tasks.js";
 import { packageVersion } from "../version.js";
@@ -29,6 +30,7 @@ export function createServer(db: DatabaseInstance): McpServer {
   registerStatusTools(server, db);
   registerLifecycleTools(server, db, verifier);
   registerPlanTools(server, db);
+  registerSliceTools(server, db);
 
   return server;
 }

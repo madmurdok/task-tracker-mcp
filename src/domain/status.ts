@@ -12,6 +12,7 @@ import {
 } from "./plans.js";
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, requireRelease, type Release } from "./releases.js";
+import { listTaskSlices, type TaskSlice } from "./slices.js";
 import { displayStatus, hasUnmetDependencies, type DisplayStatus } from "./taskStatus.js";
 import { listTaskFilePaths, requireTask, type Task, withCode, taskCode} from "./tasks.js";
 
@@ -101,6 +102,11 @@ export interface TaskDetail extends Task {
    * recoverable rather than silently overwritten.
    */
   amendments: TaskAmendment[];
+  /**
+   * How the task is worked (TTM-83), in step/position order - slices sharing
+   * a step may run in parallel. Empty for a task nobody has sliced yet.
+   */
+  slices: TaskSlice[];
 }
 
 /**
@@ -119,6 +125,7 @@ export function getTaskDetail(db: DatabaseInstance, taskId: string): TaskDetail 
     file_paths: listTaskFilePaths(db, task.id),
     handoff_notes: listHandoffNotes(db, task.id),
     amendments: listTaskAmendments(db, task.id),
+    slices: listTaskSlices(db, task.id),
   };
 }
 

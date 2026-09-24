@@ -7,13 +7,21 @@ import {
   claimTask,
   completeTask,
   CompletionVerificationError,
+  OpenSlicesError,
   releaseTask,
   TaskBlockedError,
   TaskConflictError,
   TaskNotClaimableError,
 } from "../../domain/lifecycle.js";
 import type { CompletionVerifier } from "../../domain/verification.js";
-import { blockedResult, conflictResult, jsonResult, notClaimableResult, verificationFailedResult } from "../toolResult.js";
+import {
+  blockedResult,
+  conflictResult,
+  jsonResult,
+  notClaimableResult,
+  openSlicesResult,
+  verificationFailedResult,
+} from "../toolResult.js";
 
 export function registerLifecycleTools(
   server: McpServer,
@@ -103,7 +111,7 @@ export function registerLifecycleTools(
     "complete_task",
     {
       description:
-        "Mark a task done and report which dependent tasks are now unblocked. Verifies the task's declared files actually changed (and runs test_command, if given) before accepting the completion; pass force to skip verification. Accepts a task's uuid or its code (`TTM-63`).",
+        "Mark a task done and report which dependent tasks are now unblocked. Refuses with error:'open_slices' while any of the task's slices (see set_task_slices) is still pending or in_progress, naming each one (`S2 \"title\" (pending)`) - complete, fail or skip them first. Verifies the task's declared files actually changed (and runs test_command, if given) before accepting the completion. Pass force to skip both the open-slices guard and verification. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         summary: z.string().optional(),
@@ -116,6 +124,12 @@ export function registerLifecycleTools(
       try {
         result = completeTask(db, verifier, { task_id, summary, test_command, force });
       } catch (error) {
+        if (error instanceof OpenSlicesError) {
+          return openSlicesResult({
+            message: error.message,
+            open_slices: error.openSlices.map(({ id, ref, label, title, status }) => ({ id, ref, label, title, status })),
+          });
+        }
         if (error instanceof CompletionVerificationError) {
           return verificationFailedResult({ message: error.message, reason: error.reason });
         }

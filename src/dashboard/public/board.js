@@ -118,6 +118,21 @@ function createCard(task, statusLabel, codePrefix) {
     card.appendChild(description);
   }
 
+  // No button at all for an unsliced task (TTM-84) - same "nothing to show,
+  // nothing to click" rule the description toggle above already follows.
+  // N counts only "done": a "failed" or "skipped" slice is finished but not
+  // successfully so, and the button is meant to answer "how much of this is
+  // actually done", not "how much is no longer open".
+  if (task.slices && task.slices.length > 0) {
+    const done = task.slices.filter((slice) => slice.status === "done").length;
+    const slicesButton = document.createElement("button");
+    slicesButton.type = "button";
+    slicesButton.className = "card-slices-button";
+    slicesButton.textContent = `Slices ${done}/${task.slices.length}`;
+    slicesButton.addEventListener("click", () => showSliceDialog(task, codePrefix));
+    card.appendChild(slicesButton);
+  }
+
   return card;
 }
 
@@ -322,6 +337,12 @@ function renderBoard(board) {
   for (const lane of board.lanes) {
     container.appendChild(createLane(lane, board.project_code_prefix));
   }
+
+  // The slice dialog lives outside #board (see board.html), so tearing down
+  // and rebuilding the board above never touches it - it stays open across
+  // this poll on its own. What it does need is fresh content: re-render it
+  // in place from this same payload rather than leaving it to go stale.
+  refreshOpenSliceDialog(board);
 }
 
 function showError(message) {
@@ -527,7 +548,219 @@ function wirePlanDialog() {
   document.getElementById("plan-close").addEventListener("click", () => dialog.close());
 }
 
+// Same order as SLICE_PHASES in src/domain/slices.ts.
+const SLICE_PHASES = ["design", "implement", "verify", "measure"];
+const SLICE_PHASE_LABELS = { design: "Design", implement: "Implement", verify: "Verify", measure: "Measure" };
+const SLICE_STATUS_LABELS = {
+  pending: "Pending",
+  in_progress: "In progress",
+  done: "Done",
+  failed: "Failed",
+  skipped: "Skipped",
+};
+
+// Which slice detail rows are expanded, keyed by slice id - survives the
+// dialog's own re-renders (on poll and on reopen) the same way expandedCards
+// survives a full board re-render. Re-slicing a task (setTaskSlices) hands
+// out fresh slice ids, so a stale entry here just never matches anything
+// again - same as expandedCards for a deleted task.
+const expandedSliceRows = new Set();
+
+// The task id the slice dialog is currently showing, or null when it's
+// closed - what refreshOpenSliceDialog checks on every poll to decide
+// whether there's anything to re-render.
+let openSliceTaskId = null;
+
+// Slices arrive from the board API already ordered step ASC, position ASC
+// per task (see board.ts's listSlicesForTasks) - filtering by phase keeps
+// that order, so grouping only has to notice step boundaries within each
+// phase bucket, the same consecutive-run trick showPlanDialog uses for plan
+// items sharing a step.
+function groupSlicesByPhase(slices) {
+  const phases = [];
+  for (const phase of SLICE_PHASES) {
+    const phaseSlices = slices.filter((slice) => slice.phase === phase);
+    if (phaseSlices.length === 0) continue;
+    const steps = [];
+    let current = null;
+    for (const slice of phaseSlices) {
+      if (!current || current.step !== slice.step) {
+        current = { step: slice.step, slices: [] };
+        steps.push(current);
+      }
+      current.slices.push(slice);
+    }
+    phases.push({ phase, steps });
+  }
+  return phases;
+}
+
+function renderSliceRow(slice) {
+  const row = document.createElement("div");
+  row.className = "slice-row";
+  // Five visibly distinct statuses (TTM-84): done struck through, in_progress
+  // highlighted, pending plain, failed red, skipped muted - all via this one
+  // data attribute in style.css, the same pattern .plan-item[data-status]
+  // and .card[data-status] already use.
+  row.dataset.status = slice.status;
+
+  const summary = document.createElement("button");
+  summary.type = "button";
+  summary.className = "slice-row-summary";
+
+  const label = document.createElement("span");
+  label.className = "slice-label";
+  label.textContent = slice.label;
+  summary.appendChild(label);
+
+  const title = document.createElement("span");
+  title.className = "slice-title";
+  title.textContent = slice.title;
+  summary.appendChild(title);
+
+  if (slice.model) {
+    const model = document.createElement("span");
+    model.className = "slice-model";
+    model.textContent = slice.model;
+    summary.appendChild(model);
+  }
+
+  const status = document.createElement("span");
+  status.className = "slice-status";
+  status.textContent = SLICE_STATUS_LABELS[slice.status] ?? slice.status;
+  summary.appendChild(status);
+
+  const details = document.createElement("div");
+  details.className = "slice-details";
+
+  const applyExpanded = () => {
+    const isExpanded = expandedSliceRows.has(slice.id);
+    summary.setAttribute("aria-expanded", String(isExpanded));
+    details.hidden = !isExpanded;
+  };
+  summary.addEventListener("click", () => {
+    if (expandedSliceRows.has(slice.id)) {
+      expandedSliceRows.delete(slice.id);
+    } else {
+      expandedSliceRows.add(slice.id);
+    }
+    applyExpanded();
+  });
+  applyExpanded();
+
+  const result = document.createElement("p");
+  result.className = "slice-result";
+  result.textContent = slice.result ? slice.result : "No result recorded yet.";
+  details.appendChild(result);
+
+  if (slice.artifacts.length > 0) {
+    const artifactsLabel = document.createElement("p");
+    artifactsLabel.className = "slice-artifacts-label";
+    artifactsLabel.textContent = "Artifacts";
+    details.appendChild(artifactsLabel);
+
+    const artifactsList = document.createElement("ul");
+    artifactsList.className = "slice-artifacts";
+    for (const artifact of slice.artifacts) {
+      const item = document.createElement("li");
+      item.textContent = artifact;
+      artifactsList.appendChild(item);
+    }
+    details.appendChild(artifactsList);
+  }
+
+  if (slice.metrics) {
+    const metrics = document.createElement("pre");
+    metrics.className = "slice-metrics";
+    metrics.textContent = JSON.stringify(slice.metrics, null, 2);
+    details.appendChild(metrics);
+  }
+
+  row.appendChild(summary);
+  row.appendChild(details);
+  return row;
+}
+
+// Rebuilds the dialog's body from a task's current slices - called both when
+// it's first opened and, while it stays open, on every later poll (see
+// refreshOpenSliceDialog), so it must not depend on anything the dialog only
+// has at open time.
+function renderSliceDialogContent(task, codePrefix) {
+  document.getElementById("slice-title").textContent = `${codePrefix}-${task.task_number} - ${task.title} - slices`;
+
+  const container = document.getElementById("slice-phases");
+  while (container.firstChild) container.removeChild(container.firstChild);
+
+  for (const group of groupSlicesByPhase(task.slices)) {
+    const phaseSection = document.createElement("section");
+    phaseSection.className = "slice-phase";
+
+    const phaseHeading = document.createElement("h3");
+    phaseHeading.className = "slice-phase-title";
+    phaseHeading.textContent = SLICE_PHASE_LABELS[group.phase] ?? group.phase;
+    phaseSection.appendChild(phaseHeading);
+
+    for (const stepGroup of group.steps) {
+      // A shared step is the parallel group (TTM-84) - one row per slice
+      // inside it, same shape as showPlanDialog's per-step <li>.
+      const stepEl = document.createElement("div");
+      stepEl.className = "slice-step";
+
+      const stepLabel = document.createElement("span");
+      stepLabel.className = "slice-step-label";
+      stepLabel.textContent = `Step ${stepGroup.step}`;
+      stepEl.appendChild(stepLabel);
+
+      for (const slice of stepGroup.slices) {
+        stepEl.appendChild(renderSliceRow(slice));
+      }
+
+      phaseSection.appendChild(stepEl);
+    }
+
+    container.appendChild(phaseSection);
+  }
+}
+
+function showSliceDialog(task, codePrefix) {
+  openSliceTaskId = task.id;
+  renderSliceDialogContent(task, codePrefix);
+  document.getElementById("slice-dialog").showModal();
+}
+
+// Called on every poll (from renderBoard). The slice dialog is never torn
+// down by a poll (it lives outside #board), so "update it without closing it
+// and without collapsing expanded rows" just means: re-render its content in
+// place from the fresh payload, which leaves expandedSliceRows (outside this
+// function) and the dialog's own open/closed state both untouched.
+function refreshOpenSliceDialog(board) {
+  if (openSliceTaskId === null) return;
+  for (const lane of board.lanes) {
+    const task = lane.tasks.find((t) => t.id === openSliceTaskId);
+    if (task) {
+      renderSliceDialogContent(task, board.project_code_prefix);
+      return;
+    }
+  }
+  // The task itself is gone from the board (deleted) - nothing left to
+  // refresh, so close rather than keep showing a dialog for it.
+  openSliceTaskId = null;
+  document.getElementById("slice-dialog").close();
+}
+
+function wireSliceDialog() {
+  const dialog = document.getElementById("slice-dialog");
+  document.getElementById("slice-close").addEventListener("click", () => dialog.close());
+  // Covers every way the dialog can close (this button, Escape, a future
+  // form-method=dialog control) in one place, rather than resetting
+  // openSliceTaskId at each individual close site.
+  dialog.addEventListener("close", () => {
+    openSliceTaskId = null;
+  });
+}
+
 loadBoard();
 wireShutdownButton();
 wireReleaseNotesDialog();
 wirePlanDialog();
+wireSliceDialog();

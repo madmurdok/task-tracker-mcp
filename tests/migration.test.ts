@@ -958,3 +958,105 @@ describe("release_plans / release_plan_items (via SCHEMA_SQL)", () => {
     }
   });
 });
+
+describe("task_slices (via SCHEMA_SQL)", () => {
+  /**
+   * Same mechanism as release_plans above: a new table, created by SCHEMA_SQL's
+   * `CREATE TABLE IF NOT EXISTS` on every open, with no runMigrations entry.
+   * The seed is the current SCHEMA_SQL cut just before task_slices - exactly
+   * the shape a 0.8.0 tracker.db has on disk - so this cannot drift from the
+   * real previous schema the way a hand-copied fixture would.
+   */
+  it("adds task_slices to a pre-slices DB file without disturbing a single existing row", async () => {
+    const { SCHEMA_SQL } = await import("../src/db/schema.js");
+    const cut = SCHEMA_SQL.indexOf("CREATE TABLE IF NOT EXISTS task_slices");
+    expect(cut).toBeGreaterThan(0);
+    const previousSchema = SCHEMA_SQL.slice(0, cut);
+
+    const dir = mkdtempSync(path.join(tmpdir(), "ttmcp-pre-slices-"));
+    const dbPath = path.join(dir, "tracker.db");
+    try {
+      const seed = new Database(dbPath);
+      seed.exec(previousSchema);
+      seed.exec(`
+        INSERT INTO projects (id, name, root_path, code_prefix, created_at)
+          VALUES ('p1', 'Demo', '/tmp/demo', 'DEM', 'then');
+        INSERT INTO releases (id, project_id, version, sequence, created_at)
+          VALUES ('r1', 'p1', '0.8.0', 10, 'then');
+        INSERT INTO tasks (id, project_id, release_id, title, status, priority, task_number, created_at, updated_at)
+          VALUES ('t1', 'p1', 'r1', 'Existing task', 'in_progress', 3, 1, 'then', 'then');
+        INSERT INTO task_files (task_id, file_path) VALUES ('t1', 'src/a.ts');
+        INSERT INTO release_plans (id, release_id, status, created_at, updated_at)
+          VALUES ('pl1', 'r1', 'approved', 'then', 'then');
+        INSERT INTO release_plan_items (plan_id, task_id, step, position, added_at)
+          VALUES ('pl1', 't1', 1, 1, 'then');
+      `);
+      expect(
+        seed.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'task_slices'`).get(),
+      ).toBeUndefined();
+      const tables = ["projects", "releases", "tasks", "task_files", "release_plans", "release_plan_items"];
+      const before = Object.fromEntries(tables.map((t) => [t, seed.prepare(`SELECT * FROM ${t}`).all()]));
+      seed.close();
+
+      const { openDatabase } = await import("../src/db/connection.js");
+      let db: import("better-sqlite3").Database | undefined;
+      expect(() => {
+        db = openDatabase(dbPath);
+      }).not.toThrow();
+
+      const columns = (db!.prepare(`PRAGMA table_info(task_slices)`).all() as Array<{ name: string }>)
+        .map((c) => c.name)
+        .sort();
+      expect(columns).toEqual(
+        [
+          "id",
+          "task_id",
+          "phase",
+          "step",
+          "position",
+          "title",
+          "brief",
+          "exit_criterion",
+          "status",
+          "model",
+          "result",
+          "artifacts",
+          "metrics",
+          "started_at",
+          "completed_at",
+          "created_at",
+          "updated_at",
+        ].sort(),
+      );
+      expect(db!.prepare(`SELECT COUNT(*) AS cnt FROM task_slices`).get()).toEqual({ cnt: 0 });
+      for (const table of tables) {
+        expect(db!.prepare(`SELECT * FROM ${table}`).all(), table).toEqual(before[table]);
+      }
+
+      // The new table is usable against an existing task, and its CHECKs hold.
+      expect(() =>
+        db!.exec(
+          `INSERT INTO task_slices (id, task_id, phase, step, position, title, created_at, updated_at)
+           VALUES ('s1', 't1', 'design', 1, 1, 'Decide', 'now', 'now')`,
+        ),
+      ).not.toThrow();
+      expect(() =>
+        db!.exec(
+          `INSERT INTO task_slices (id, task_id, phase, step, position, title, created_at, updated_at)
+           VALUES ('s2', 't1', 'deploy', 2, 1, 'Nope', 'now', 'now')`,
+        ),
+      ).toThrow(/CHECK constraint failed/);
+      db!.close();
+
+      // Reopen: the slice written through the first open survives.
+      const again = openDatabase(dbPath);
+      expect(again.prepare(`SELECT id, status, artifacts, metrics FROM task_slices`).all()).toEqual([
+        { id: "s1", status: "pending", artifacts: "[]", metrics: null },
+      ]);
+      expect(again.prepare(`SELECT * FROM tasks`).all()).toEqual(before.tasks);
+      again.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

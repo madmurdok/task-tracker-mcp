@@ -357,6 +357,184 @@ a {
   color: var(--info);
 }
 
+/* Same shell plan-dialog/release-notes-dialog use - only the body differs,
+   because a slicing needs phase/step structure a <pre> can't give it. */
+#slice-dialog {
+  max-width: 34rem;
+  width: 90vw;
+  max-height: 80vh;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--surface);
+  color: var(--text);
+  padding: 1.25rem;
+}
+
+#slice-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.4);
+}
+
+#slice-title {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+}
+
+.slice-phases {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.slice-phase-title {
+  margin: 0 0 0.375rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+/* One .slice-step per distinct step number inside a phase - a shared step is
+   the parallel group (TTM-84), rendered as more than one .slice-row inside
+   the same box rather than one row per step. */
+.slice-step {
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  padding: 0.5rem 0.625rem;
+  background: var(--bg);
+  margin-bottom: 0.5rem;
+}
+
+.slice-step:last-child {
+  margin-bottom: 0;
+}
+
+.slice-step-label {
+  display: block;
+  margin-bottom: 0.25rem;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.slice-row + .slice-row {
+  margin-top: 0.25rem;
+  padding-top: 0.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.slice-row-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  width: 100%;
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.slice-label {
+  font-weight: 600;
+}
+
+.slice-title {
+  flex: 1 1 auto;
+}
+
+.slice-model {
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
+.slice-status {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+/* Five visibly distinct statuses (TTM-84): done struck through (same
+   treatment done/cancelled plan items and cards already get), in_progress
+   highlighted, pending left plain (no rule needed), failed red, skipped
+   muted. */
+.slice-row[data-status="done"] .slice-label,
+.slice-row[data-status="done"] .slice-title {
+  text-decoration: line-through;
+  color: var(--muted);
+}
+
+.slice-row[data-status="in_progress"] {
+  background: var(--info-bg);
+  border-radius: 0.25rem;
+  padding: 0.125rem 0.25rem;
+  margin: -0.125rem -0.25rem;
+}
+
+.slice-row[data-status="in_progress"] .slice-status {
+  color: var(--info);
+}
+
+.slice-row[data-status="failed"] .slice-status {
+  color: var(--danger);
+}
+
+.slice-row[data-status="failed"] .slice-title {
+  color: var(--danger);
+}
+
+.slice-row[data-status="skipped"] {
+  opacity: 0.55;
+}
+
+.slice-details {
+  margin-top: 0.375rem;
+  padding-top: 0.375rem;
+  border-top: 1px dashed var(--border);
+  font-size: 0.8rem;
+}
+
+.slice-result {
+  margin: 0 0 0.375rem;
+  color: var(--muted);
+  white-space: pre-wrap;
+}
+
+.slice-artifacts-label {
+  margin: 0 0 0.25rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+
+.slice-artifacts {
+  margin: 0 0 0.375rem;
+  padding-left: 1.1rem;
+  font-size: 0.8rem;
+}
+
+.slice-metrics {
+  margin: 0;
+  padding: 0.375rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  background: var(--bg);
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+  overflow-x: auto;
+}
+
 .lane-columns {
   display: grid;
   grid-template-columns: repeat(5, minmax(15rem, 1fr));
@@ -479,6 +657,25 @@ a {
   font-size: 0.8rem;
   color: var(--muted);
   white-space: pre-wrap;
+}
+
+/* Only present when the task has slices (TTM-84) - a plain task (nothing to
+   drill into) has no button at all, same rule .card-toggle follows above. */
+.card-slices-button {
+  display: block;
+  margin-top: 0.375rem;
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 0.25rem;
+  background: var(--surface);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.card-slices-button:hover {
+  border-color: var(--accent);
 }
 
 .card-epic {
