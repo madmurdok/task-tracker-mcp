@@ -47,7 +47,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 35 registered tools over the same transport", async () => {
+  it("exercises all 36 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -92,6 +92,7 @@ describe("MCP server smoke test", () => {
         "approve_plan",
         "amend_task",
         "set_task_slices",
+        "revise_task_slices",
         "start_slice",
         "complete_slice",
       ].sort(),
@@ -240,8 +241,8 @@ describe("MCP server smoke test", () => {
 
     // TTM-87: approve_plan refuses an open batch task with no slices, so give
     // it a minimal placeholder slicing first - the real slicing exercised
-    // below (set_task_slices) replaces this one wholesale, same as any
-    // re-slicing does.
+    // below (set_task_slices) replaces this one wholesale, which it may only
+    // while every slice is still pending (TTM-89).
     await call("set_task_slices", {
       task_id: planTaskId,
       slices: [{ phase: "implement", title: "placeholder" }],
@@ -312,6 +313,26 @@ describe("MCP server smoke test", () => {
     expect(slicedTask.slices.map((sl: { label: string; status: string }) => [sl.label, sl.status])).toEqual([
       ["S1", "done"],
       ["S2", "pending"],
+    ]);
+
+    // revise_task_slices (TTM-89): S1 is done, so only the pending S2 is
+    // re-cut; S1 keeps its label and report, the new slice is S3.
+    const revised = await call("revise_task_slices", {
+      task_id: planTaskId,
+      slices: [[{ phase: "implement", title: "Build smaller" }, { phase: "verify", title: "Check" }]],
+      reason: "S1 decided the build splits in two",
+    });
+    expect(revised.slices.map((sl: { label: string; status: string; result: string | null }) => [sl.label, sl.status, sl.result])).toEqual([
+      ["S1", "done", "decided"],
+      ["S3", "pending", null],
+      ["S4", "pending", null],
+    ]);
+    const revisedTask = await call("get_task", { task_id: planTaskId });
+    expect(revisedTask.slice_revisions).toEqual([
+      expect.objectContaining({
+        reason: "S1 decided the build splits in two",
+        replaced_slices: [expect.objectContaining({ label: "S2", title: "Build", model: "opus" })],
+      }),
     ]);
   });
 
@@ -440,28 +461,46 @@ describe("MCP server smoke test", () => {
 
     await call("start_slice", { slice_id: `${code}/S1` });
 
-    // Replacing while S1 runs is refused and names it.
+    // Replacing while S1 runs is refused, names it, and points at revise_task_slices.
     const replace = await call("set_task_slices", { task_id: code, slices: [{ phase: "verify", title: "x" }] });
     expect(replace.isError).toBe(true);
-    expect(String(replace.payload)).toMatch(/S1 "Decide" \(in_progress\)/);
+    expect(String(replace.payload)).toMatch(/S1 "Decide" \(in_progress\).*use revise_task_slices/);
+
+    // A revision without a reason is refused by the schema.
+    const noReason = await call("revise_task_slices", { task_id: code, slices: [{ phase: "verify", title: "x" }] });
+    expect(noReason.isError).toBe(true);
+
+    // Revising keeps the running S1 and replaces the pending S2/S3 with S4.
+    const revised = await call("revise_task_slices", {
+      task_id: code,
+      slices: [{ phase: "implement", title: "Build once" }],
+      reason: "A and B turned out to be one change",
+    });
+    expect(revised.isError).toBeFalsy();
+    expect(revised.payload.slices.map((sl: { ref: string }) => sl.ref)).toEqual([`${code}/S1`, `${code}/S4`]);
+    expect(revised.payload.revision.replaced_slices.map((sl: { label: string }) => sl.label)).toEqual(["S2", "S3"]);
 
     const refused = await call("complete_task", { task_id: code, summary: "done?" });
     expect(refused.isError).toBe(true);
     expect(refused.payload.error).toBe("open_slices");
-    expect(refused.payload.message).toContain(
-      `S1 "Decide" (in_progress), S2 "Build A" (pending), S3 "Build B" (pending)`,
-    );
-    expect(refused.payload.open_slices.map((sl: { ref: string }) => sl.ref)).toEqual([
-      `${code}/S1`,
-      `${code}/S2`,
-      `${code}/S3`,
-    ]);
+    expect(refused.payload.message).toContain(`S1 "Decide" (in_progress), S4 "Build once" (pending)`);
+    expect(refused.payload.open_slices.map((sl: { ref: string }) => sl.ref)).toEqual([`${code}/S1`, `${code}/S4`]);
     expect((await call("get_task", { task_id: code })).payload.status).not.toBe("done");
 
     const forced = await call("complete_task", { task_id: code, summary: "done anyway", force: true });
     expect(forced.isError).toBeFalsy();
     expect(forced.payload.ok).toBe(true);
     expect((await call("get_task", { task_id: code })).payload.status).toBe("done");
+
+    const lateRevision = await call("revise_task_slices", {
+      task_id: code,
+      slices: [{ phase: "verify", title: "x" }],
+      reason: "too late",
+    });
+    expect(lateRevision.isError).toBe(true);
+    expect(String(lateRevision.payload)).toContain(
+      `Task ${code} is done; its slicing is a finished record and cannot be revised`,
+    );
   });
 
   it("exercises the full release lifecycle, including its distinct error shapes", async () => {
