@@ -496,7 +496,7 @@ export function upsertPlan(
  * caller's order. An id whose task row is gone renders as itself rather than
  * as a code for a task_number that does not exist.
  */
-function codesFor(db: DatabaseInstance, codePrefix: string, taskIds: string[]): string[] {
+export function codesFor(db: DatabaseInstance, codePrefix: string, taskIds: string[]): string[] {
   if (taskIds.length === 0) return [];
   const rows = db
     .prepare(
