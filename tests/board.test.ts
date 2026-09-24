@@ -11,6 +11,7 @@ import { createProject } from "../src/domain/projects.js";
 import { cancelRelease } from "../src/domain/lifecycle.js";
 import { approvePlan, upsertPlan } from "../src/domain/plans.js";
 import { createRelease } from "../src/domain/releases.js";
+import { setTaskSlices } from "../src/domain/slices.js";
 import { createTask } from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 
@@ -439,6 +440,46 @@ describe("getBoardData", () => {
 
     expect(byTask.get(a.id)?.new_since_approval).toBe(false);
     expect(byTask.get(c.id)?.new_since_approval).toBe(true);
+  });
+
+  it("carries a task's slices in step/position order (TTM-84), and an empty list for a task without any", () => {
+    const { db, project } = setup();
+    const sliced = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Sliced",
+      complexity_hint: "normal",
+    }).task;
+    const unsliced = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Unsliced",
+      complexity_hint: "normal",
+    }).task;
+
+    // Two slices sharing step 1 (parallel), then one alone in step 2 - listed
+    // here out of title order (B before A) so a re-sort by title, rather than
+    // by step/position, would show up as a failure.
+    setTaskSlices(db, sliced.id, [
+      [
+        { phase: "design", title: "B", model: "sonnet" },
+        { phase: "design", title: "A", model: "sonnet" },
+      ],
+      { phase: "implement", title: "C", model: "opus" },
+    ]);
+
+    const board = getBoardData(db, project.id);
+    const byId = new Map(board.lanes[0].tasks.map((task) => [task.id, task]));
+
+    expect(byId.get(unsliced.id)?.slices).toEqual([]);
+    expect(byId.get(sliced.id)?.slices.map((slice) => slice.label)).toEqual(["S1", "S2", "S3"]);
+    expect(byId.get(sliced.id)?.slices.map((slice) => slice.title)).toEqual(["B", "A", "C"]);
+    expect(
+      byId.get(sliced.id)?.slices.map((slice) => ({ step: slice.step, position: slice.position })),
+    ).toEqual([
+      { step: 1, position: 1 },
+      { step: 1, position: 2 },
+      { step: 2, position: 1 },
+    ]);
+    expect(byId.get(sliced.id)?.slices.map((slice) => slice.status)).toEqual(["pending", "pending", "pending"]);
   });
 });
 

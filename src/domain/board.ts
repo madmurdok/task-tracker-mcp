@@ -3,8 +3,29 @@ import { listEpics } from "./epics.js";
 import { getPlan, type PlanStatus } from "./plans.js";
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, type ReleaseStatus } from "./releases.js";
+import { listSlicesForTasks, type SlicePhase, type SliceStatus } from "./slices.js";
 import { displayStatus, type DisplayStatus } from "./taskStatus.js";
 import type { Task } from "./tasks.js";
+
+/**
+ * A slice (TTM-83), trimmed to what the board's "Slices N/M" button and
+ * dialog need - between the full TaskSlice (task_id/ref/brief/exit_criterion/
+ * started_at/completed_at/created_at/updated_at are agent-facing detail the
+ * dashboard never renders) and nothing at all.
+ */
+export interface BoardSlice {
+  id: string;
+  label: string;
+  phase: SlicePhase;
+  step: number;
+  position: number;
+  title: string;
+  status: SliceStatus;
+  model: string | null;
+  result: string | null;
+  artifacts: string[];
+  metrics: Record<string, unknown> | null;
+}
 
 export interface BoardTask {
   id: string;
@@ -17,6 +38,9 @@ export interface BoardTask {
   owner_session_id: string | null;
   is_stale: boolean;
   task_number: number;
+  // Step/position order, same as listTaskSlices; [] for an unsliced task.
+  // The dialog re-groups this by phase then step client-side (see board.js).
+  slices: BoardSlice[];
 }
 
 /**
@@ -140,6 +164,9 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
     .all(project.id) as Task[];
   const releases = listReleases(db, project.id);
   const epicNameById = new Map(listEpics(db, project.id).map((epic) => [epic.id, epic.name]));
+  // One query for every task's slices, not one per task (see
+  // listSlicesForTasks) - the board can list hundreds of tasks per poll.
+  const slicesByTaskId = listSlicesForTasks(db, tasks, project.code_prefix);
 
   const toBoardTask = (task: Task): BoardTask => ({
     id: task.id,
@@ -152,6 +179,19 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
     owner_session_id: task.owner_session_id,
     is_stale: isStale(task, nowIso),
     task_number: task.task_number,
+    slices: (slicesByTaskId.get(task.id) ?? []).map((slice) => ({
+      id: slice.id,
+      label: slice.label,
+      phase: slice.phase,
+      step: slice.step,
+      position: slice.position,
+      title: slice.title,
+      status: slice.status,
+      model: slice.model,
+      result: slice.result,
+      artifacts: slice.artifacts,
+      metrics: slice.metrics,
+    })),
   });
 
   const lanes: BoardLane[] = [];
