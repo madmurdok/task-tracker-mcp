@@ -51,7 +51,7 @@ export function registerPlanTools(server: McpServer, db: DatabaseInstance): void
     "approve_plan",
     {
       description:
-        "Record the owner's one-time sign-off on a release's plan: draft -> approved, stamping approved_by, approved_at and note. note (optional) is stored exactly as given - the approving human's verbatim words, not a summary or comment, because that quote is the whole value of the record: the party an approval authorises is the party calling this tool. Rejects if the plan has drifted from the batch (the error names the unplanned/orphaned tasks by code), if it's already approved (no re-stamping over the first approver), or if the release has no plan yet. project_id accepts a project id or its unique name; release_id accepts a release id or its version within that project.",
+        "Record the owner's one-time sign-off on a release's plan: draft -> approved, stamping approved_by, approved_at and note. note (optional) is stored exactly as given - the approving human's verbatim words, not a summary or comment, because that quote is the whole value of the record: the party an approval authorises is the party calling this tool. Rejects if the plan has drifted from the batch (the error names the unplanned/orphaned tasks by code), if any open (not done/cancelled) batch task has no slices (the error names them by code - slice them with set_task_slices first; no bypass), if it's already approved (no re-stamping over the first approver), or if the release has no plan yet. project_id accepts a project id or its unique name; release_id accepts a release id or its version within that project.",
       inputSchema: {
         project_id: z.string().min(1),
         release_id: z.string().min(1),

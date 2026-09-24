@@ -368,6 +368,9 @@ describe("getBoardData", () => {
       expect(Object.keys(item).sort()).toEqual(["new_since_approval", "note", "step", "task_id"]);
     }
 
+    // TTM-87: approve_plan refuses an open batch task with no slices.
+    setTaskSlices(db, a.id, [{ phase: "implement", title: "do it" }]);
+    setTaskSlices(db, b.id, [{ phase: "implement", title: "do it" }]);
     approvePlan(db, project.id, release.id, { approved_by: "valentin", note: "looks right" });
     const approvedPlan = getBoardData(db, project.id).lanes.find((l) => l.release_id === release.id)?.plan;
     expect(approvedPlan).toMatchObject({
@@ -419,6 +422,8 @@ describe("getBoardData", () => {
     const c = createTask(db, noopEstimator, { project_id: project.id, title: "C", complexity_hint: "normal" }).task;
 
     upsertPlan(db, project.id, release.id, { steps: [a.id] });
+    // TTM-87: approve_plan refuses an open batch task with no slices.
+    setTaskSlices(db, a.id, [{ phase: "implement", title: "do it" }]);
     const approved = approvePlan(db, project.id, release.id, { approved_by: "valentin" });
 
     // upsertPlan always demotes an approved plan back to draft the moment it
