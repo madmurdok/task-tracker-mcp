@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
-import { requireTask, runOne, withCode, type Task } from "./tasks.js";
+import { requireTask, runOne, taskCode, withCode, type Task } from "./tasks.js";
 
 /**
  * How one task is worked (TTM-83): an ordered list of slices, each with a
@@ -152,6 +152,46 @@ export function listTaskSlices(db: DatabaseInstance, taskRef: string): TaskSlice
 /** The slices still pending or in progress - what complete_task refuses over. */
 export function listOpenSlices(db: DatabaseInstance, taskRef: string): TaskSlice[] {
   return listTaskSlices(db, taskRef).filter((slice) => OPEN_STATUSES.includes(slice.status));
+}
+
+/**
+ * A whole project's slices in one query, keyed by task_id - what getBoardData
+ * needs (each card's "Slices N/M" button and its detail dialog) without
+ * querying task_slices once per task. A task with no slices maps to an empty
+ * array, same as listTaskSlices would return for it. Labels/refs are computed
+ * the same way slicesFor does - 1-based, step/position order per task - since
+ * the query orders by task_id then step then position, so resetting the
+ * per-task index on every task_id change reproduces slicesFor's own numbering
+ * exactly.
+ */
+export function listSlicesForTasks(
+  db: DatabaseInstance,
+  tasks: Array<Pick<Task, "id" | "task_number">>,
+  codePrefix: string,
+): Map<string, TaskSlice[]> {
+  const byTaskId = new Map<string, TaskSlice[]>(tasks.map((task) => [task.id, []]));
+  if (tasks.length === 0) return byTaskId;
+
+  const placeholders = tasks.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `SELECT * FROM task_slices WHERE task_id IN (${placeholders}) ORDER BY task_id ASC, step ASC, position ASC`,
+    )
+    .all(...tasks.map((task) => task.id)) as SliceRow[];
+
+  const taskNumberById = new Map(tasks.map((task) => [task.id, task.task_number]));
+  let currentTaskId: string | null = null;
+  let index = 0;
+  for (const row of rows) {
+    if (row.task_id !== currentTaskId) {
+      currentTaskId = row.task_id;
+      index = 0;
+    }
+    const code = taskCode(codePrefix, taskNumberById.get(row.task_id)!);
+    byTaskId.get(row.task_id)!.push(toSlice(row, index, code));
+    index++;
+  }
+  return byTaskId;
 }
 
 /** `TTM-83/S2`, or `<task uuid>/S2`. Case-insensitive on the `S`. */

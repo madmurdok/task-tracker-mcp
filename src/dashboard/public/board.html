@@ -37,6 +37,15 @@
     <ol id="plan-steps" class="plan-steps"></ol>
     <button type="button" id="plan-close">Close</button>
   </dialog>
+  <!-- One task's slices (TTM-83/84), grouped by phase then by step (a shared
+       step is a parallel group). Read-only like the plan dialog above, and
+       refreshed in place on every poll while open instead of being torn down
+       and reopened - see refreshSliceDialog in board.js. -->
+  <dialog id="slice-dialog">
+    <h2 id="slice-title"></h2>
+    <div id="slice-phases" class="slice-phases"></div>
+    <button type="button" id="slice-close">Close</button>
+  </dialog>
   <script src="board.js"></script>
 </body>
 </html>
