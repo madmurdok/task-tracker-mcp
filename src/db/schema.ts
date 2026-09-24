@@ -162,6 +162,45 @@ CREATE TABLE IF NOT EXISTS release_plan_items (
 );
 
 CREATE INDEX IF NOT EXISTS idx_release_plan_items_task_id ON release_plan_items(task_id);
+
+-- How one task is worked (TTM-83): its phases and slices, each slice a unit
+-- an orchestrating agent can hand to one model with one brief and one exit
+-- criterion, and whose report and cost come back here. Modelled on
+-- release_plan_items: slices sharing a step may run in parallel, position only
+-- orders them inside that step.
+--
+-- Written wholesale by set_task_slices and never reordered in place, which is
+-- what lets a slice's readable label (S1, S2, ... in step/position order) be
+-- computed at read time rather than stored: nothing can renumber a slicing
+-- except replacing it, and replacing it discards every old slice anyway.
+--
+-- artifacts is a JSON array of repo paths, metrics a free-form JSON object
+-- (reread_tokens, max_context, tool_uses, duration_ms, ...) - NULL until
+-- complete_slice records some, so "never measured" stays distinguishable
+-- from "measured, nothing to report".
+--
+-- The CHECKs below bake into the stored schema permanently (see the note on
+-- release_plans): widening one needs the widenTaskStatusCheck-style rebuild.
+CREATE TABLE IF NOT EXISTS task_slices (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  phase TEXT NOT NULL CHECK (phase IN ('design', 'implement', 'verify', 'measure')),
+  step INTEGER NOT NULL,
+  position INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  brief TEXT NOT NULL DEFAULT '',
+  exit_criterion TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'done', 'failed', 'skipped')),
+  model TEXT,
+  result TEXT,
+  artifacts TEXT NOT NULL DEFAULT '[]',
+  metrics TEXT,
+  started_at TEXT,
+  completed_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (task_id, step, position)
+);
 `;
 
 import type { DatabaseInstance } from "./connection.js";
@@ -539,8 +578,8 @@ function backfillTaskNumbers(db: DatabaseInstance): void {
  * A new *table* is the exception and needs nothing here: it doesn't exist
  * yet in any database, so `CREATE TABLE IF NOT EXISTS` in SCHEMA_SQL creates
  * it on old and new ones alike (openDatabase execs SCHEMA_SQL on every open,
- * before calling this). That is why `release_plans`/`release_plan_items` are
- * absent below and why adding an entry for them would be dead code - unlike
+ * before calling this). That is why `release_plans`/`release_plan_items` and
+ * `task_slices` are absent below and why adding an entry for them would be dead code - unlike
  * tasks.priority or tasks.release_id, there is no ADD COLUMN to sequence and
  * no ordering constraint against the CHECK-widening rebuilds.
  */

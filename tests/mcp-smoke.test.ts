@@ -47,7 +47,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 32 registered tools over the same transport", async () => {
+  it("exercises all 35 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -91,6 +91,9 @@ describe("MCP server smoke test", () => {
         "get_plan",
         "approve_plan",
         "amend_task",
+        "set_task_slices",
+        "start_slice",
+        "complete_slice",
       ].sort(),
     );
 
@@ -279,6 +282,28 @@ describe("MCP server smoke test", () => {
     expect(planAfterAmend.status).toBe("approved");
     expect(planAfterAmend.unplanned_task_ids).toEqual([]);
     expect(planAfterAmend.orphaned_task_ids).toEqual([]);
+
+    // Task slices (TTM-83): written by task uuid here, addressed by readable
+    // ref and by uuid below; the refusal shapes live in their own test.
+    const sliced = await call("set_task_slices", {
+      task_id: planTaskId,
+      slices: [{ phase: "design", title: "Decide" }, [{ phase: "implement", title: "Build", model: "opus" }]],
+    });
+    expect(sliced.slices.map((sl: { label: string }) => sl.label)).toEqual(["S1", "S2"]);
+    const startedSlice = await call("start_slice", { slice_id: sliced.slices[0].ref });
+    expect(startedSlice.status).toBe("in_progress");
+    const doneSlice = await call("complete_slice", {
+      slice_id: sliced.slices[0].id,
+      status: "done",
+      result: "decided",
+      metrics: { tool_uses: 3 },
+    });
+    expect(doneSlice).toMatchObject({ status: "done", result: "decided", metrics: { tool_uses: 3 } });
+    const slicedTask = await call("get_task", { task_id: planTaskId });
+    expect(slicedTask.slices.map((sl: { label: string; status: string }) => [sl.label, sl.status])).toEqual([
+      ["S1", "done"],
+      ["S2", "pending"],
+    ]);
   });
 
   it("list_projects returns an empty array when nothing is registered yet", async () => {
@@ -366,6 +391,68 @@ describe("MCP server smoke test", () => {
     });
     expect(forced.isError).toBeFalsy();
     expect(forced.payload.ok).toBe(true);
+  });
+
+  it("carries task slices end to end by task code, and complete_task's open_slices refusal with its names intact", async () => {
+    const client = await connectedClient(db);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      const content = result.content as Array<{ type: string; text: string }>;
+      let payload: unknown;
+      try {
+        payload = JSON.parse(content[0].text);
+      } catch {
+        payload = content[0].text;
+      }
+      return { isError: result.isError, payload: payload as any };
+    };
+
+    const { payload: project } = await call("create_project", { name: "Slices", root_path: "/tmp/slices" });
+    const { payload: created } = await call("create_task", {
+      project_id: project.project_id,
+      title: "Worked in slices",
+      complexity_hint: "normal",
+    });
+    const code = (await call("get_task", { task_id: created.task_id })).payload.code as string;
+    expect(code).toMatch(/^[A-Z]+-1$/);
+
+    const set = await call("set_task_slices", {
+      task_id: code,
+      slices: [
+        { phase: "design", title: "Decide", exit_criterion: "a written decision" },
+        [
+          { phase: "implement", title: "Build A" },
+          { phase: "implement", title: "Build B" },
+        ],
+      ],
+    });
+    expect(set.isError).toBeFalsy();
+    expect(set.payload.slices.map((sl: { ref: string }) => sl.ref)).toEqual([`${code}/S1`, `${code}/S2`, `${code}/S3`]);
+
+    await call("start_slice", { slice_id: `${code}/S1` });
+
+    // Replacing while S1 runs is refused and names it.
+    const replace = await call("set_task_slices", { task_id: code, slices: [{ phase: "verify", title: "x" }] });
+    expect(replace.isError).toBe(true);
+    expect(String(replace.payload)).toMatch(/S1 "Decide" \(in_progress\)/);
+
+    const refused = await call("complete_task", { task_id: code, summary: "done?" });
+    expect(refused.isError).toBe(true);
+    expect(refused.payload.error).toBe("open_slices");
+    expect(refused.payload.message).toContain(
+      `S1 "Decide" (in_progress), S2 "Build A" (pending), S3 "Build B" (pending)`,
+    );
+    expect(refused.payload.open_slices.map((sl: { ref: string }) => sl.ref)).toEqual([
+      `${code}/S1`,
+      `${code}/S2`,
+      `${code}/S3`,
+    ]);
+    expect((await call("get_task", { task_id: code })).payload.status).not.toBe("done");
+
+    const forced = await call("complete_task", { task_id: code, summary: "done anyway", force: true });
+    expect(forced.isError).toBeFalsy();
+    expect(forced.payload.ok).toBe(true);
+    expect((await call("get_task", { task_id: code })).payload.status).toBe("done");
   });
 
   it("exercises the full release lifecycle, including its distinct error shapes", async () => {

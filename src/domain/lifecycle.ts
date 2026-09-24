@@ -1,6 +1,7 @@
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireProject } from "./projects.js";
-import { resolveTaskId } from "./tasks.js";
+import { describeSlice, listOpenSlices, type TaskSlice } from "./slices.js";
+import { requireTask, resolveTaskId, withCode } from "./tasks.js";
 import { requireRelease } from "./releases.js";
 import { LOCK_LEASE_MS } from "./status.js";
 import { findUnblockedDependents, hasUnmetDependencies } from "./taskStatus.js";
@@ -192,6 +193,23 @@ export class CompletionVerificationError extends Error {
   }
 }
 
+/**
+ * Raised when complete_task is called on a task whose slicing (TTM-83) still
+ * has slices pending or in progress. A task is worked as its slices, so
+ * "done" with some of them never run is a claim the record contradicts.
+ * `force` skips this the same way it skips verification - it is the explicit
+ * "I know, finish it anyway".
+ */
+export class OpenSlicesError extends Error {
+  constructor(
+    message: string,
+    public readonly openSlices: TaskSlice[],
+  ) {
+    super(message);
+    this.name = "OpenSlicesError";
+  }
+}
+
 export function completeTask(
   db: DatabaseInstance,
   verifier: CompletionVerifier,
@@ -208,6 +226,17 @@ export function completeTask(
   }
 
   if (!force) {
+    // Before verification, not after: it is free, and verification may run a
+    // test_command that would be wasted on a completion refused anyway.
+    const open = listOpenSlices(db, taskId);
+    if (open.length > 0) {
+      const { code } = withCode(db, requireTask(db, taskId));
+      throw new OpenSlicesError(
+        `Task ${code} has open slices: ${open.map(describeSlice).join(", ")}; complete, fail or skip them, or pass force`,
+        open,
+      );
+    }
+
     const project = db
       .prepare(`SELECT root_path FROM projects WHERE id = ?`)
       .get(task.project_id) as { root_path: string };
