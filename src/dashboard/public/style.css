@@ -702,6 +702,54 @@ a {
   background: var(--warning-bg);
 }
 
+/* "Blocked by" chips (TTM-97): one per unmet dependency, only on a blocked
+   card. Clicking one jumps to the blocker's card; an off-board blocker (another
+   project) is not clickable and says so in its tooltip. */
+.card-blocked-by {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem;
+  margin-top: 0.375rem;
+  font-size: 0.75rem;
+}
+
+.card-blocked-by-label {
+  color: var(--danger);
+}
+
+.card-blocker-chip {
+  font: inherit;
+  font-size: 0.75rem;
+  padding: 0 0.375rem;
+  border: 1px solid var(--danger);
+  border-radius: 0.25rem;
+  background: var(--danger-bg);
+  color: var(--danger);
+  cursor: pointer;
+}
+
+.card-blocker-chip:hover {
+  text-decoration: underline;
+}
+
+.card-blocker-chip.is-offboard {
+  border-style: dashed;
+  cursor: help;
+}
+
+.card-blocker-chip.is-offboard:hover {
+  text-decoration: none;
+}
+
+/* The card a "Blocked by" chip jumped to. A static outline, not an animation:
+   a poll landing mid-highlight rebuilds the card, and an animation would
+   restart on the new node. */
+.card.is-highlighted {
+  outline: 3px solid var(--accent);
+  outline-offset: 1px;
+}
+
 /* Cancelled tasks stay visible, not hidden, same principle Item 6 already
    applied to status aggregation - just visually de-emphasized. */
 .card[data-status="cancelled"] {
