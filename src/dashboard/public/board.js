@@ -33,10 +33,104 @@ function laneTitle(lane) {
 // teardown+rebuild instead of snapping shut again.
 const expandedCards = new Set();
 
+// "Blocked by" chips (TTM-97) need to know, while a card is being built,
+// whether each blocker has a card of its own on this board and in which lane.
+// Rebuilt by renderBoard from each poll's payload before any lane is created,
+// keyed by task id: { laneKey, task }. A blocker absent from it is off the
+// board (another project).
+let boardTaskIndex = new Map();
+// The last payload renderBoard drew, so a chip click can redraw at once after
+// expanding a collapsed lane instead of waiting up to 1.5s for the next poll.
+let lastBoard = null;
+// The card a chip click is currently highlighting: { taskId, until }. Lives
+// outside the DOM for the same reason expandedCards does - a poll that lands
+// mid-highlight rebuilds every card, and createCard re-applies the class to
+// the new node until `until` passes, so the highlight neither vanishes early
+// nor restarts.
+let highlightedCard = null;
+const HIGHLIGHT_MS = 2000;
+
+function statusLabelOf(status) {
+  const column = STATUS_COLUMNS.find((c) => c.status === status);
+  return column ? column.label : status;
+}
+
+// The chip's hover text: title and status always; for a blocker with no card
+// on this board, also says so (clicking it does nothing). An on-board
+// blocker's status is read off its own card, so the chip and that card agree
+// (a pending blocker that is itself blocked shows "Blocked" on both).
+function blockerTooltip(blocker) {
+  const entry = boardTaskIndex.get(blocker.id);
+  const status = statusLabelOf(entry ? entry.task.status : blocker.status);
+  const base = `${blocker.code} - ${blocker.title} (${status})`;
+  return entry ? base : `${base} - not on this board`;
+}
+
+function isHighlighted(taskId) {
+  return highlightedCard !== null && highlightedCard.taskId === taskId && Date.now() < highlightedCard.until;
+}
+
+function findCardElement(taskId) {
+  return document.querySelector(`.card[data-task-id="${CSS.escape(taskId)}"]`);
+}
+
+// Expands the blocker's lane if it is collapsed (persisted exactly like a
+// header click, so the next poll keeps it open), redraws at once from the
+// last payload, then scrolls the blocker's card into view and highlights it.
+function jumpToCard(taskId) {
+  const entry = boardTaskIndex.get(taskId);
+  if (!entry) return;
+  if (collapsedLanes.has(entry.laneKey)) {
+    collapsedLanes.delete(entry.laneKey);
+    storeCollapse(entry.laneKey, false);
+  }
+  highlightedCard = { taskId, until: Date.now() + HIGHLIGHT_MS };
+  if (lastBoard) renderBoard(lastBoard);
+  const card = findCardElement(taskId);
+  if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+  setTimeout(() => {
+    if (highlightedCard && highlightedCard.taskId === taskId && Date.now() >= highlightedCard.until) {
+      highlightedCard = null;
+    }
+    const current = findCardElement(taskId);
+    if (current && !isHighlighted(taskId)) current.classList.remove("is-highlighted");
+  }, HIGHLIGHT_MS);
+}
+
+function createBlockedByRow(task) {
+  const row = document.createElement("div");
+  row.className = "card-blocked-by";
+
+  const label = document.createElement("span");
+  label.className = "card-blocked-by-label";
+  label.textContent = "Blocked by";
+  row.appendChild(label);
+
+  for (const blocker of task.blocked_by) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "card-blocker-chip";
+    // The readable code from the server (blocker's own project prefix),
+    // never the uuid.
+    chip.textContent = blocker.code;
+    chip.title = blockerTooltip(blocker);
+    if (boardTaskIndex.has(blocker.id)) {
+      chip.addEventListener("click", () => jumpToCard(blocker.id));
+    } else {
+      chip.classList.add("is-offboard");
+      chip.setAttribute("aria-disabled", "true");
+    }
+    row.appendChild(chip);
+  }
+  return row;
+}
+
 function createCard(task, statusLabel, codePrefix) {
   const card = document.createElement("article");
   card.className = "card";
   card.dataset.status = task.status;
+  card.dataset.taskId = task.id;
+  if (isHighlighted(task.id)) card.classList.add("is-highlighted");
   // is_stale is independent of status (only ever true alongside
   // "in_progress") - about to be auto-reclaimed by the next get_next_task
   // call, so it gets its own highlight rather than reusing a status color.
@@ -86,6 +180,13 @@ function createCard(task, statusLabel, codePrefix) {
   }
 
   card.appendChild(meta);
+
+  // Only for a blocked card: the server fills blocked_by only when status is
+  // "blocked", and the status check here keeps chips off any other card even
+  // if a payload disagreed.
+  if (task.status === "blocked" && task.blocked_by && task.blocked_by.length > 0) {
+    card.appendChild(createBlockedByRow(task));
+  }
 
   if (task.description) {
     const description = document.createElement("p");
@@ -330,6 +431,12 @@ function renderBoard(board) {
   title.textContent = board.project_name;
   document.title = `${board.project_name} - task-tracker-mcp dashboard`;
   driftBanner.hidden = !board.doc_drift;
+
+  lastBoard = board;
+  boardTaskIndex = new Map();
+  for (const lane of board.lanes) {
+    for (const task of lane.tasks) boardTaskIndex.set(task.id, { laneKey: laneKey(lane), task });
+  }
 
   // Called on every poll now, not just once - rebuild the lanes from scratch
   // each time rather than trying to patch the existing DOM in place.

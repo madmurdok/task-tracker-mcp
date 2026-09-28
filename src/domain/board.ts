@@ -4,8 +4,8 @@ import { getPlan, type PlanStatus } from "./plans.js";
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, type ReleaseStatus } from "./releases.js";
 import { listSlicesForTasks, type SlicePhase, type SliceStatus } from "./slices.js";
-import { displayStatus, type DisplayStatus } from "./taskStatus.js";
-import type { Task } from "./tasks.js";
+import { displayStatus, UNMET_DEPENDENCY_SQL, type DisplayStatus } from "./taskStatus.js";
+import { taskCode, type Task } from "./tasks.js";
 
 /**
  * A slice (TTM-83), trimmed to what the board's "Slices N/M" button and
@@ -41,6 +41,24 @@ export interface BoardTask {
   // Step/position order, same as listTaskSlices; [] for an unsliced task.
   // The dialog re-groups this by phase then step client-side (see board.js).
   slices: BoardSlice[];
+  // The unmet dependencies that make this task `blocked` (TTM-97), ordered by
+  // code. Filled only when `status === "blocked"`, so a card can never show
+  // "Blocked by" chips under a status that says otherwise: an in_progress task
+  // whose dependency was re-opened still has an unmet one, but displayStatus
+  // does not call it blocked, and neither does this list. [] otherwise.
+  blocked_by: BoardBlocker[];
+}
+
+/**
+ * One unmet dependency of a blocked task. `code` uses the blocker's *own*
+ * project's prefix (a dependency may cross projects), and the blocker may sit
+ * in any release or none - the card links to it wherever it is.
+ */
+export interface BoardBlocker {
+  id: string;
+  code: string;
+  title: string;
+  status: DisplayStatus;
 }
 
 /**
@@ -120,6 +138,48 @@ function isStale(task: Task, nowIso: string): boolean {
 }
 
 /**
+ * Every unmet dependency of every task in the project, keyed by the dependent
+ * task's id - one query per board, never one per task (the board can list
+ * hundreds of tasks per 1.5s poll; see listSlicesForTasks for the same shape).
+ * "Unmet" is UNMET_DEPENDENCY_SQL, the predicate hasUnmetDependencies uses to
+ * derive `blocked`. A blocker's own status is reported as stored: an unmet
+ * dependency is pending or in_progress by that same predicate.
+ */
+function listUnmetBlockers(db: DatabaseInstance, projectId: string): Map<string, BoardBlocker[]> {
+  const rows = db
+    .prepare(
+      `SELECT td.task_id AS dependent_id, t.id, t.title, t.status, t.task_number, p.code_prefix
+       FROM task_dependencies td
+       JOIN tasks d ON d.id = td.task_id
+       JOIN tasks t ON t.id = td.depends_on_task_id
+       JOIN projects p ON p.id = t.project_id
+       WHERE d.project_id = ? AND ${UNMET_DEPENDENCY_SQL}
+       ORDER BY td.task_id ASC, p.code_prefix ASC, t.task_number ASC`,
+    )
+    .all(projectId) as Array<{
+    dependent_id: string;
+    id: string;
+    title: string;
+    status: DisplayStatus;
+    task_number: number;
+    code_prefix: string;
+  }>;
+
+  const byTaskId = new Map<string, BoardBlocker[]>();
+  for (const row of rows) {
+    const list = byTaskId.get(row.dependent_id) ?? [];
+    list.push({
+      id: row.id,
+      code: taskCode(row.code_prefix, row.task_number),
+      title: row.title,
+      status: row.status,
+    });
+    byTaskId.set(row.dependent_id, list);
+  }
+  return byTaskId;
+}
+
+/**
  * Shapes a release's plan (if it has one) for the board - see BoardPlan for
  * what is deliberately left out. `drifted` is folded from the same two lists
  * getPlan already computed (planDrift, in plans.ts) rather than a second call
@@ -167,32 +227,37 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
   // One query for every task's slices, not one per task (see
   // listSlicesForTasks) - the board can list hundreds of tasks per poll.
   const slicesByTaskId = listSlicesForTasks(db, tasks, project.code_prefix);
+  const blockersByTaskId = listUnmetBlockers(db, project.id);
 
-  const toBoardTask = (task: Task): BoardTask => ({
-    id: task.id,
-    title: task.title,
-    description: task.description,
-    status: displayStatus(db, task),
-    priority: task.priority,
-    epic_id: task.epic_id,
-    epic_name: task.epic_id ? (epicNameById.get(task.epic_id) ?? null) : null,
-    owner_session_id: task.owner_session_id,
-    is_stale: isStale(task, nowIso),
-    task_number: task.task_number,
-    slices: (slicesByTaskId.get(task.id) ?? []).map((slice) => ({
-      id: slice.id,
-      label: slice.label,
-      phase: slice.phase,
-      step: slice.step,
-      position: slice.position,
-      title: slice.title,
-      status: slice.status,
-      model: slice.model,
-      result: slice.result,
-      artifacts: slice.artifacts,
-      metrics: slice.metrics,
-    })),
-  });
+  const toBoardTask = (task: Task): BoardTask => {
+    const status = displayStatus(db, task);
+    return {
+      id: task.id,
+      title: task.title,
+      description: task.description,
+      status,
+      priority: task.priority,
+      epic_id: task.epic_id,
+      epic_name: task.epic_id ? (epicNameById.get(task.epic_id) ?? null) : null,
+      owner_session_id: task.owner_session_id,
+      is_stale: isStale(task, nowIso),
+      task_number: task.task_number,
+      slices: (slicesByTaskId.get(task.id) ?? []).map((slice) => ({
+        id: slice.id,
+        label: slice.label,
+        phase: slice.phase,
+        step: slice.step,
+        position: slice.position,
+        title: slice.title,
+        status: slice.status,
+        model: slice.model,
+        result: slice.result,
+        artifacts: slice.artifacts,
+        metrics: slice.metrics,
+      })),
+      blocked_by: status === "blocked" ? (blockersByTaskId.get(task.id) ?? []) : [],
+    };
+  };
 
   const lanes: BoardLane[] = [];
 
