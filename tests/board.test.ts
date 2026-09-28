@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import { getBoardData } from "../src/domain/board.js";
 import { addDependency } from "../src/domain/dependencies.js";
@@ -32,7 +32,19 @@ function domElementStub(): any {
     disabled: false,
     dataset: {},
     children: [] as any[],
-    classList: { add() {}, toggle() {}, contains: () => false },
+    // A real (if minimal) class set: the TTM-97 highlight is a class, and a
+    // test has to see whether the rebuilt card carries it.
+    _classes: new Set<string>(),
+    classList: {
+      add: (name: string) => el._classes.add(name),
+      remove: (name: string) => el._classes.delete(name),
+      toggle: (name: string, force?: boolean) =>
+        (force ?? !el._classes.has(name)) ? el._classes.add(name) : el._classes.delete(name),
+      contains: (name: string) => el._classes.has(name),
+    },
+    scrollIntoView() {
+      el.scrollIntoViewCalls = (el.scrollIntoViewCalls ?? 0) + 1;
+    },
     appendChild(child: any) {
       el.children.push(child);
       return child;
@@ -51,7 +63,9 @@ function domElementStub(): any {
     addEventListener(type: string, handler: () => void) {
       (el._listeners[type] ??= []).push(handler);
     },
-    setAttribute() {},
+    setAttribute(name: string, value: string) {
+      (el.attributes ??= {})[name] = value;
+    },
     showModal() {
       el.showModalCalls = (el.showModalCalls ?? 0) + 1;
     },
@@ -82,12 +96,32 @@ function loadBoardScript(): any {
     if (!elementsById.has(id)) elementsById.set(id, domElementStub());
     return elementsById.get(id);
   };
+  // Only the one selector shape board.js uses - `.card[data-task-id="..."]`
+  // (jumpToCard) - resolved by walking the #board stub's tree.
+  const querySelector = (selector: string) => {
+    const match = /^\.card\[data-task-id="(.+)"\]$/.exec(selector);
+    if (!match) throw new Error(`unsupported selector in shim: ${selector}`);
+    const walk = (node: any): any => {
+      if (node.className === "card" && node.dataset?.taskId === match[1]) return node;
+      for (const child of node.children ?? []) {
+        const found = walk(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    return walk(getElementById("board"));
+  };
+  const timeouts: Array<() => void> = [];
   const sandbox: any = {
     document: {
       title: "",
       createElement: () => domElementStub(),
       getElementById,
+      querySelector,
     },
+    CSS: { escape: (value: string) => value },
+    setTimeout: (fn: () => void) => timeouts.push(fn),
+    _timeouts: timeouts,
     window: { location: { search: "" } },
     localStorage: {
       getItem: () => null,
@@ -565,6 +599,147 @@ describe("board.js laneTitle (client-side, via DOM shim)", () => {
   });
 });
 
+describe("getBoardData blocked_by (TTM-97)", () => {
+  function task(db: DatabaseInstance, projectId: string, title: string, releaseId?: string) {
+    return createTask(db, noopEstimator, {
+      project_id: projectId,
+      title,
+      complexity_hint: "normal",
+      ...(releaseId ? { release_id: releaseId } : {}),
+    }).task;
+  }
+  function setStatus(db: DatabaseInstance, taskId: string, status: string) {
+    db.prepare(`UPDATE tasks SET status = ? WHERE id = ?`).run(status, taskId);
+  }
+  function allTasks(db: DatabaseInstance, projectId: string) {
+    return new Map(
+      getBoardData(db, projectId)
+        .lanes.flatMap((lane) => lane.tasks)
+        .map((t) => [t.id, t]),
+    );
+  }
+
+  // Control: drop the `status === "blocked"` guard's lookup (always []) or the
+  // query's JOIN on the blocker - zero/one/two lengths and codes then fail.
+  it("lists 0, 1 and 2 unmet blockers by readable code, title and status", () => {
+    const { db, project } = setup();
+    const a = task(db, project.id, "A");
+    const b = task(db, project.id, "B");
+    const none = task(db, project.id, "None");
+    const one = task(db, project.id, "One");
+    const two = task(db, project.id, "Two");
+    addDependency(db, one.id, a.id);
+    addDependency(db, two.id, b.id);
+    addDependency(db, two.id, a.id);
+    setStatus(db, b.id, "in_progress");
+
+    const byId = allTasks(db, project.id);
+    const p = project.code_prefix;
+    expect(byId.get(none.id)?.blocked_by).toEqual([]);
+    expect(byId.get(one.id)?.blocked_by).toEqual([{ id: a.id, code: `${p}-${a.task_number}`, title: "A", status: "pending" }]);
+    // Ordered by code, not by insertion order of the dependencies.
+    expect(byId.get(two.id)?.blocked_by).toEqual([
+      { id: a.id, code: `${p}-${a.task_number}`, title: "A", status: "pending" },
+      { id: b.id, code: `${p}-${b.task_number}`, title: "B", status: "in_progress" },
+    ]);
+  });
+
+  // Control: remove UNMET_DEPENDENCY_SQL from listUnmetBlockers' WHERE (list
+  // every dependency) - the done and cancelled blockers then show up.
+  it("leaves out a done and a cancelled dependency, keeping the unmet one", () => {
+    const { db, project } = setup();
+    const done = task(db, project.id, "Done dep");
+    const cancelled = task(db, project.id, "Cancelled dep");
+    const open = task(db, project.id, "Open dep");
+    const dependent = task(db, project.id, "Dependent");
+    const onlyMet = task(db, project.id, "Only met deps");
+    for (const dep of [done, cancelled, open]) addDependency(db, dependent.id, dep.id);
+    addDependency(db, onlyMet.id, done.id);
+    addDependency(db, onlyMet.id, cancelled.id);
+    setStatus(db, done.id, "done");
+    setStatus(db, cancelled.id, "cancelled");
+
+    const byId = allTasks(db, project.id);
+    expect(byId.get(dependent.id)?.status).toBe("blocked");
+    expect(byId.get(dependent.id)?.blocked_by.map((b) => b.id)).toEqual([open.id]);
+    expect(byId.get(onlyMet.id)?.status).toBe("pending");
+    expect(byId.get(onlyMet.id)?.blocked_by).toEqual([]);
+  });
+
+  // Control: fill blocked_by regardless of status (drop the
+  // `status === "blocked" ?` guard in toBoardTask) - the in_progress task with
+  // an unmet dependency then carries a blocker, and the invariant fails.
+  it("fills blocked_by exactly when status is 'blocked', for every task on the board", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "1.0.0" });
+    const a = task(db, project.id, "A");
+    const b = task(db, project.id, "B", release.id);
+    const c = task(db, project.id, "C", release.id);
+    const d = task(db, project.id, "D");
+    const running = task(db, project.id, "Running with an unmet dep");
+    addDependency(db, b.id, a.id);
+    addDependency(db, c.id, b.id);
+    addDependency(db, d.id, c.id);
+    addDependency(db, running.id, a.id);
+    setStatus(db, running.id, "in_progress");
+    const doneOne = task(db, project.id, "Done with an unmet dep");
+    addDependency(db, doneOne.id, a.id);
+    setStatus(db, doneOne.id, "done");
+
+    const tasks = getBoardData(db, project.id).lanes.flatMap((lane) => lane.tasks);
+    expect(tasks.filter((t) => t.status === "blocked").length).toBeGreaterThan(0);
+    for (const t of tasks) {
+      expect({ title: t.title, hasBlockers: t.blocked_by.length > 0 }).toEqual({
+        title: t.title,
+        hasBlockers: t.status === "blocked",
+      });
+    }
+  });
+
+  // Control: key the blockers' code off the *board's* project prefix instead
+  // of the blocker's own (p.code_prefix -> project.code_prefix), or filter the
+  // query by the blocker's project/release - the cross-project and
+  // other-release blockers then vanish or carry the wrong prefix.
+  it("lists blockers in another release, in no release, and in another project, with their own project's code", () => {
+    const { db, project } = setup();
+    const release = createRelease(db, { project_id: project.id, version: "1.0.0" });
+    const other = createProject(db, { name: "Other", root_path: "/tmp/other" });
+    const backlogDep = task(db, project.id, "Backlog dep");
+    const foreignDep = task(db, other.id, "Foreign dep");
+    const dependent = task(db, project.id, "Dependent", release.id);
+    addDependency(db, dependent.id, backlogDep.id);
+    addDependency(db, dependent.id, foreignDep.id);
+
+    const blockedBy = allTasks(db, project.id).get(dependent.id)?.blocked_by ?? [];
+    expect(blockedBy.map((b) => b.code).sort()).toEqual(
+      [`${project.code_prefix}-${backlogDep.task_number}`, `${other.code_prefix}-${foreignDep.task_number}`].sort(),
+    );
+    expect(other.code_prefix).not.toBe(project.code_prefix);
+  });
+
+  // Control: query per task (e.g. call a per-task blockers lookup inside
+  // toBoardTask) - the count of task_dependencies statements that return
+  // blocker rows then grows with the task count instead of staying 1.
+  it("loads blockers with one query per board, whatever the task count", () => {
+    function blockerQueries(taskCount: number): number {
+      const { db, project } = setup();
+      const root = task(db, project.id, "Root");
+      for (let i = 0; i < taskCount; i++) addDependency(db, task(db, project.id, `T${i}`).id, root.id);
+      const spy = vi.spyOn(db, "prepare");
+      getBoardData(db, project.id);
+      // hasUnmetDependencies (via displayStatus) is per task by design and
+      // pre-dates TTM-97; it selects COUNT(*), so it is excluded here.
+      const count = spy.mock.calls.filter(
+        ([sql]) => String(sql).includes("task_dependencies") && !String(sql).includes("COUNT(*)"),
+      ).length;
+      spy.mockRestore();
+      return count;
+    }
+    expect(blockerQueries(2)).toBe(1);
+    expect(blockerQueries(20)).toBe(1);
+  });
+});
+
 describe("board.js createLane for a cancelled release (client-side, via DOM shim)", () => {
   function laneStub(overrides: Record<string, unknown> = {}): any {
     return {
@@ -808,5 +983,110 @@ describe("board.js groupSlicesByPhase (client-side, via DOM shim)", () => {
     expect(groups[0].steps).toHaveLength(1);
     expect(groups[0].steps[0].slices.map((sl: any) => sl.label)).toEqual(["S1", "S2"]);
     expect(groups[1].phase).toBe("verify");
+  });
+});
+
+describe("board.js Blocked by chips (TTM-97, client-side, via DOM shim)", () => {
+  function blockedTask(blockedBy: any[], overrides: Record<string, unknown> = {}): any {
+    return {
+      id: "t-blocked",
+      title: "Blocked one",
+      description: "",
+      status: "blocked",
+      priority: 0,
+      epic_id: null,
+      epic_name: null,
+      owner_session_id: null,
+      is_stale: false,
+      task_number: 5,
+      slices: [],
+      blocked_by: blockedBy,
+      ...overrides,
+    };
+  }
+  const blockerA = { id: "t-a", code: "DEM-1", title: "Blocker A", status: "pending" };
+  const foreign = { id: "t-x", code: "OTH-9", title: "Foreign", status: "in_progress" };
+
+  function boardWith(lanes: any[]): any {
+    return { project_id: "p", project_name: "Demo", project_code_prefix: "DEM", doc_drift: false, lanes };
+  }
+  function lane(releaseId: string | null, tasks: any[], releaseStatus: string | null = null): any {
+    return {
+      release_id: releaseId,
+      release_version: releaseId ? "1.0.0" : null,
+      release_name: null,
+      release_status: releaseStatus,
+      release_notes: null,
+      release_cancellation_reason: null,
+      tasks,
+      plan: null,
+    };
+  }
+  function blockedRow(card: any): any {
+    return card.children.find((c: any) => c.className === "card-blocked-by");
+  }
+  function cardIn(sandbox: any, taskId: string): any {
+    return sandbox.document.querySelector(`.card[data-task-id="${taskId}"]`);
+  }
+
+  // Control: render the chip's text from blocker.id instead of blocker.code,
+  // or drop the "not on this board" suffix / the is-offboard branch in
+  // createBlockedByRow - the code, tooltip or clickability assertions fail.
+  it("renders one chip per blocker with its code; an off-board one says so and is not clickable", () => {
+    const sandbox = loadBoardScript();
+    const blocked = blockedTask([blockerA, foreign]);
+    const blockerCard = { ...blockedTask([], { id: "t-a", title: "Blocker A", status: "blocked", task_number: 1 }) };
+    sandbox.renderBoard(boardWith([lane(null, [blocked, blockerCard])]));
+
+    const row = blockedRow(cardIn(sandbox, "t-blocked"));
+    const chips = row.children.slice(1);
+    expect(row.children[0].textContent).toBe("Blocked by");
+    expect(chips.map((c: any) => c.textContent)).toEqual(["DEM-1", "OTH-9"]);
+    // An on-board blocker's status is read off its own card (Blocked), not the
+    // stored status in the payload (pending).
+    expect(chips[0].title).toBe("DEM-1 - Blocker A (Blocked)");
+    expect(chips[1].title).toBe("OTH-9 - Foreign (In progress) - not on this board");
+    expect(chips[0]._listeners.click?.length ?? 0).toBe(1);
+    expect(chips[1]._listeners.click?.length ?? 0).toBe(0);
+  });
+
+  // Control: drop the `task.status === "blocked"` check (and have the payload
+  // carry blockers anyway) or the length check - chips then appear on a
+  // pending card / an empty row on a blocked one.
+  it("shows no row for a blocked card with no blockers, nor for a non-blocked card whatever the payload says", () => {
+    const { createCard } = loadBoardScript();
+    expect(blockedRow(createCard(blockedTask([]), "Blocked", "DEM"))).toBeUndefined();
+    expect(blockedRow(createCard(blockedTask([blockerA], { status: "pending" }), "Pending", "DEM"))).toBeUndefined();
+  });
+
+  // Control: skip the collapsedLanes.delete in jumpToCard (lane stays shut),
+  // or drop the isHighlighted re-apply in createCard (the next poll's rebuilt
+  // card loses the highlight) - the corresponding assertion fails.
+  it("clicking a chip expands the blocker's collapsed lane, scrolls to its card, and keeps the highlight across a re-render", () => {
+    const sandbox = loadBoardScript();
+    const blocked = blockedTask([blockerA]);
+    const blockerCard = blockedTask([], { id: "t-a", title: "Blocker A", status: "pending", task_number: 1 });
+    // A released lane defaults to collapsed.
+    const board = boardWith([lane(null, [blocked]), lane("r1", [blockerCard], "released")]);
+    sandbox.renderBoard(board);
+    const releasedLaneColumns = () => sandbox.document.getElementById("board").children[1].children[1];
+    expect(releasedLaneColumns().hidden).toBe(true);
+
+    const chip = blockedRow(cardIn(sandbox, "t-blocked")).children[1];
+    fireClick(chip);
+
+    expect(releasedLaneColumns().hidden).toBe(false);
+    const target = cardIn(sandbox, "t-a");
+    expect(target.scrollIntoViewCalls).toBe(1);
+    expect(target.classList.contains("is-highlighted")).toBe(true);
+
+    // The next poll rebuilds every node: the lane stays open, the new card
+    // is still highlighted, and nothing scrolls again.
+    sandbox.renderBoard(board);
+    expect(releasedLaneColumns().hidden).toBe(false);
+    const rebuilt = cardIn(sandbox, "t-a");
+    expect(rebuilt).not.toBe(target);
+    expect(rebuilt.classList.contains("is-highlighted")).toBe(true);
+    expect(rebuilt.scrollIntoViewCalls).toBeUndefined();
   });
 });

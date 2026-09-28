@@ -22,6 +22,15 @@ import type { Task } from "./tasks.js";
 export type DisplayStatus = "pending" | "in_progress" | "blocked" | "done" | "cancelled";
 
 /**
+ * The one spelling of "this dependency is still unmet", as an SQL predicate
+ * over a `tasks` row aliased `t` (the dependency itself). Shared by
+ * hasUnmetDependencies (which derives `blocked`) and the board's blocked_by
+ * lookup (board.ts), so a card can never list a blocker that the status rule
+ * does not count, or miss one it does.
+ */
+export const UNMET_DEPENDENCY_SQL = `t.status NOT IN ('done', 'cancelled')`;
+
+/**
  * `status = blocked` is never stored (see schema) - it's computed here from unmet
  * dependencies at query time, so it can't drift out of sync with the graph.
  */
@@ -31,7 +40,7 @@ export function hasUnmetDependencies(db: DatabaseInstance, taskId: string): bool
       `SELECT COUNT(*) AS cnt
        FROM task_dependencies td
        JOIN tasks t ON t.id = td.depends_on_task_id
-       WHERE td.task_id = ? AND t.status NOT IN ('done', 'cancelled')`,
+       WHERE td.task_id = ? AND ${UNMET_DEPENDENCY_SQL}`,
     )
     .get(taskId) as { cnt: number };
   return row.cnt > 0;
@@ -50,9 +59,8 @@ export function findUnblockedDependents(db: DatabaseInstance, taskId: string): s
 
   return dependents
     .filter((dep) => {
-      const dependentTask = db
-        .prepare(`SELECT status FROM tasks WHERE id = ?`)
-        .get(dep.task_id) as { status: string } | undefined;
+      const dependentTask = db.prepare(`SELECT status FROM tasks WHERE id = ?`).get(dep.task_id) as
+        { status: string } | undefined;
       return dependentTask?.status === "pending" && !hasUnmetDependencies(db, dep.task_id);
     })
     .map((dep) => dep.task_id);
