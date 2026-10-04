@@ -2,6 +2,15 @@ import type { DatabaseInstance } from "../db/connection.js";
 import type { Task } from "./tasks.js";
 
 /**
+ * How long a hand-out (via get_next_task), an explicit claim_task, or a
+ * start_slice that starts a still-pending task holds the task before it's
+ * considered stale and eligible for automatic reclaim by a later get_next_task
+ * call (v2 ownership semantics - v1 only guaranteed no duplicate hand-out, see
+ * the doc's Non-goals/Failure Modes).
+ */
+export const LOCK_LEASE_MS = 30 * 60 * 1000;
+
+/**
  * The parts of a task's status that are *derived from the dependency graph*
  * rather than stored on the row - `blocked`, and everything that reads it.
  *

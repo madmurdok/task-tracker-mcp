@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireTask, runOne, taskCode, withCode, type Task } from "./tasks.js";
+import { hasUnmetDependencies, LOCK_LEASE_MS } from "./taskStatus.js";
 
 /**
  * How one task is worked (TTM-83): an ordered list of slices, each with a
@@ -8,8 +9,9 @@ import { requireTask, runOne, taskCode, withCode, type Task } from "./tasks.js";
  * The task-level analogue of a release plan (plans.ts), and deliberately the
  * same shape: steps run in order, slices sharing a step may run in parallel.
  *
- * IMPORT DIRECTION: this module imports tasks.ts only. lifecycle.ts (the
- * complete_task guard) and status.ts (get_task) import it, never the reverse.
+ * IMPORT DIRECTION: this module imports tasks.ts and taskStatus.ts only.
+ * lifecycle.ts (the complete_task guard) and status.ts (get_task) import it,
+ * never the reverse.
  */
 export type SlicePhase = "design" | "implement" | "verify" | "measure";
 export type SliceStatus = "pending" | "in_progress" | "done" | "failed" | "skipped";
@@ -448,22 +450,54 @@ export function reviseTaskSlices(
   return run();
 }
 
-/** pending -> in_progress, stamping started_at. Refuses any other status. */
+/**
+ * pending -> in_progress, stamping started_at. Refuses any other status.
+ *
+ * Starting a slice is starting its task's work, so a task still `pending`
+ * moves to `in_progress` with it (TTM-98), under a fresh lease and with its
+ * owner left as it was - exactly what get_next_task's hand-out writes. Moving
+ * the task rather than returning a warning field: the failure this closes is
+ * an orchestrator that started a parallel task's slices without claiming it,
+ * and the board then showed the task pending while its agent ran; a warning
+ * fixes that only if the caller reads it, whereas the move makes the board
+ * true by construction. The cost is that start_slice now writes the task row,
+ * so it applies claim_task's gate first: a pending task with unmet
+ * dependencies is refused, slice and task both left untouched, rather than
+ * started ahead of its prerequisite. An `in_progress` task is not touched (its
+ * holder and lease stay as they are), nor is a done/cancelled one.
+ */
 export function startSlice(db: DatabaseInstance, sliceRef: string): TaskSlice {
   const slice = requireSlice(db, sliceRef);
   if (slice.status !== "pending") {
     throw new Error(`Slice ${slice.ref} is ${slice.status}; only a pending slice can be started`);
   }
   const now = new Date().toISOString();
-  runOne(
-    db.prepare(
-      `UPDATE task_slices SET status = 'in_progress', started_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'`,
-    ),
-    `start_slice ${sliceRef}`,
-    now,
-    now,
-    slice.id,
-  );
+  const run = db.transaction(() => {
+    const task = db.prepare(`SELECT status FROM tasks WHERE id = ?`).get(slice.task_id) as
+      | { status: string }
+      | undefined;
+    if (task?.status === "pending") {
+      if (hasUnmetDependencies(db, slice.task_id)) {
+        throw new Error(
+          `Slice ${slice.ref} cannot start: its task is pending and blocked by unmet dependencies`,
+        );
+      }
+      const lockExpiresAt = new Date(Date.parse(now) + LOCK_LEASE_MS).toISOString();
+      db.prepare(
+        `UPDATE tasks SET status = 'in_progress', lock_expires_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'`,
+      ).run(lockExpiresAt, now, slice.task_id);
+    }
+    runOne(
+      db.prepare(
+        `UPDATE task_slices SET status = 'in_progress', started_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'`,
+      ),
+      `start_slice ${sliceRef}`,
+      now,
+      now,
+      slice.id,
+    );
+  });
+  run();
   return requireSlice(db, slice.id);
 }
 
