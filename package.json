@@ -6,7 +6,8 @@
   "private": true,
   "main": "dist/index.js",
   "bin": {
-    "task-tracker-status": "dist/cli/status.js"
+    "task-tracker-status": "dist/cli/status.js",
+    "task-tracker-session-end": "dist/cli/session-end.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
