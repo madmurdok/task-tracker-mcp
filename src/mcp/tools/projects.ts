@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DatabaseInstance } from "../../db/connection.js";
-import { checkDocSync, createProject, listProjects } from "../../domain/projects.js";
+import { checkDocSync, createProject, listProjects, setDesignDoc } from "../../domain/projects.js";
 import { jsonResult } from "../toolResult.js";
 
 export function registerProjectTools(server: McpServer, db: DatabaseInstance): void {
@@ -47,6 +47,26 @@ export function registerProjectTools(server: McpServer, db: DatabaseInstance): v
     async ({ project_id, acknowledge }) => {
       const result = checkDocSync(db, project_id, { acknowledge });
       return jsonResult(result);
+    },
+  );
+
+  server.registerTool(
+    "set_design_doc",
+    {
+      description:
+        "Set or clear the design doc tracked for an existing project, so a project registered without design_doc_path can still get drift detection. design_doc_path is resolved against the project's root_path and hashed now as the new baseline, as create_project does; pass null to stop tracking (check_doc_sync then reports tracked:false). Rejects a path that cannot be read, naming the resolved path, and stores nothing. project_id accepts a project id or its unique name.",
+      inputSchema: {
+        project_id: z.string().min(1),
+        design_doc_path: z.string().min(1).nullable(),
+      },
+    },
+    async ({ project_id, design_doc_path }) => {
+      const project = setDesignDoc(db, project_id, design_doc_path);
+      return jsonResult({
+        project_id: project.id,
+        design_doc_path: project.design_doc_path,
+        design_doc_hash: project.design_doc_hash,
+      });
     },
   );
 }

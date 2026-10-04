@@ -1,12 +1,13 @@
 {
   "name": "task-tracker-mcp",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Local MCP server for agent-driven task planning and cross-session handoff",
   "type": "module",
   "private": true,
   "main": "dist/index.js",
   "bin": {
-    "task-tracker-status": "dist/cli/status.js"
+    "task-tracker-status": "dist/cli/status.js",
+    "task-tracker-session-end": "dist/cli/session-end.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",

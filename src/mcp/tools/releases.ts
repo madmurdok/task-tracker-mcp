@@ -7,7 +7,12 @@ import {
   releaseIt,
   ReleaseNotAllDoneError,
 } from "../../domain/lifecycle.js";
-import { createRelease, setReleaseSequence, setTaskRelease } from "../../domain/releases.js";
+import {
+  createRelease,
+  setReleaseDetails,
+  setReleaseSequence,
+  setTaskRelease,
+} from "../../domain/releases.js";
 import { getReleaseStatus, listReleasesWithStatus } from "../../domain/status.js";
 import type { CompletionVerifier } from "../../domain/verification.js";
 import { jsonResult, notAllDoneResult, verificationFailedResult } from "../toolResult.js";
@@ -134,6 +139,29 @@ export function registerReleaseTools(
     async ({ project_id, release_id, sequence }) => {
       setReleaseSequence(db, project_id, release_id, sequence);
       return jsonResult({ ok: true });
+    },
+  );
+
+  server.registerTool(
+    "set_release_details",
+    {
+      description:
+        "Rename a release and/or rewrite its description - the only release fields that can change after create_release. Pass at least one of name and description; an omitted field is left as is, and null or \"\" clears it to empty (a release should have a real name or none, never a placeholder). Nothing else is writable here: version is an identifier (unique, accepted as release_id), status, released_at, release_notes and cancellation_reason belong to release_it/cancel_release, and sequence has set_release_sequence. Not blocked by the release being released or cancelled: those freeze task membership, and release_notes are built from task titles, completion summaries and cancellation reasons, never from the release's name or description. project_id accepts a project id or its unique name; release_id accepts a release id or its version within that project.",
+      inputSchema: {
+        project_id: z.string().min(1),
+        release_id: z.string().min(1),
+        name: z.string().nullable().optional(),
+        description: z.string().nullable().optional(),
+      },
+    },
+    async ({ project_id, release_id, name, description }) => {
+      const release = setReleaseDetails(db, { project_id, release_id, name, description });
+      return jsonResult({
+        release_id: release.id,
+        version: release.version,
+        name: release.name,
+        description: release.description,
+      });
     },
   );
 }

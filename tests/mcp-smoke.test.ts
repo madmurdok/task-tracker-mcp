@@ -1,10 +1,13 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
+import { getBoardData } from "../src/domain/board.js";
 import { createServer } from "../src/mcp/server.js";
 
 async function connectedClient(db: DatabaseInstance) {
@@ -47,7 +50,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 36 registered tools over the same transport", async () => {
+  it("exercises all 38 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -62,6 +65,7 @@ describe("MCP server smoke test", () => {
         "create_project",
         "list_projects",
         "check_doc_sync",
+        "set_design_doc",
         "create_epic",
         "list_epics",
         "get_epic_status",
@@ -85,6 +89,7 @@ describe("MCP server smoke test", () => {
         "cancel_release",
         "set_task_release",
         "set_release_sequence",
+        "set_release_details",
         "create_tasks",
         "delete_task",
         "create_plan",
@@ -110,6 +115,14 @@ describe("MCP server smoke test", () => {
       design_doc_path: null,
       stored_hash: null,
       current_hash: null,
+    });
+
+    // Clearing an already-untracked project is a valid no-op; the full
+    // set/clear round trip against a real file has its own test below.
+    expect(await call("set_design_doc", { project_id: "Demo", design_doc_path: null })).toEqual({
+      project_id,
+      design_doc_path: null,
+      design_doc_hash: null,
     });
 
     const { epic_id } = await call("create_epic", { project_id, name: "Auth rework" });
@@ -207,6 +220,15 @@ describe("MCP server smoke test", () => {
       title: "Ship it",
       complexity_hint: "normal",
     });
+
+    // set_release_details (TTM-79): rename a release that already has a task.
+    const renamed = await call("set_release_details", {
+      project_id,
+      release_id: "1.0",
+      name: "First cut",
+    });
+    expect(renamed).toEqual({ release_id: planReleaseId, version: "1.0", name: "First cut", description: "" });
+    expect(db.prepare("SELECT name FROM releases WHERE id = ?").get(planReleaseId)).toEqual({ name: "First cut" });
 
     const plan = await call("create_plan", {
       project_id,
@@ -353,6 +375,65 @@ describe("MCP server smoke test", () => {
     expect(JSON.parse(content[0].text)).toEqual({ projects: [] });
   });
 
+  it("set_design_doc tracks a doc on a project created without one, clears it, and refuses bad paths", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "ttmcp-smoke-setdoc-"));
+    try {
+      writeFileSync(path.join(dir, "design.md"), "# Design\n");
+      const client = await connectedClient(db);
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const result = await client.callTool({ name, arguments: args });
+        const content = result.content as Array<{ type: string; text: string }>;
+        return { isError: result.isError, text: content[0].text };
+      };
+      const ok = async (name: string, args: Record<string, unknown>) => {
+        const result = await call(name, args);
+        expect(result.isError).toBeFalsy();
+        return JSON.parse(result.text);
+      };
+
+      const { project_id } = await ok("create_project", { name: "Late doc", root_path: dir });
+      expect(await ok("check_doc_sync", { project_id })).toMatchObject({ tracked: false });
+
+      const expectedHash = createHash("sha256").update("# Design\n").digest("hex");
+      expect(await ok("set_design_doc", { project_id, design_doc_path: "design.md" })).toEqual({
+        project_id,
+        design_doc_path: "design.md",
+        design_doc_hash: expectedHash,
+      });
+      expect(await ok("check_doc_sync", { project_id: "Late doc" })).toEqual({
+        tracked: true,
+        in_sync: true,
+        design_doc_path: "design.md",
+        stored_hash: expectedHash,
+        current_hash: expectedHash,
+      });
+
+      const unreadable = await call("set_design_doc", { project_id, design_doc_path: "missing.md" });
+      expect(unreadable.isError).toBe(true);
+      expect(unreadable.text).toContain(`Design doc not readable: ${path.resolve(dir, "missing.md")}`);
+
+      const empty = await call("set_design_doc", { project_id, design_doc_path: "" });
+      expect(empty.isError).toBe(true);
+      expect(empty.text).toMatch(/design_doc_path/);
+
+      // Neither refusal touched the stored doc.
+      expect(await ok("check_doc_sync", { project_id })).toMatchObject({
+        tracked: true,
+        design_doc_path: "design.md",
+        stored_hash: expectedHash,
+      });
+
+      expect(await ok("set_design_doc", { project_id, design_doc_path: null })).toEqual({
+        project_id,
+        design_doc_path: null,
+        design_doc_hash: null,
+      });
+      expect(await ok("check_doc_sync", { project_id })).toMatchObject({ tracked: false });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("rejects an unknown project ref and a duplicate project name with isError", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
@@ -369,6 +450,71 @@ describe("MCP server smoke test", () => {
     const duplicate = await call("create_project", { name: "Demo", root_path: "/tmp/other" });
     expect(duplicate.isError).toBe(true);
     expect(duplicate.text).toMatch(/Project name already in use: Demo/);
+  });
+
+  it("set_release_details renames a release with tasks, keeps every other column, and refuses an empty call (TTM-79)", async () => {
+    const client = await connectedClient(db);
+    const callRaw = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      const content = result.content as Array<{ type: string; text: string }>;
+      return { isError: result.isError, text: content[0].text };
+    };
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const { isError, text } = await callRaw(name, args);
+      expect(isError).toBeFalsy();
+      return JSON.parse(text);
+    };
+
+    const { project_id } = await call("create_project", { name: "Demo", root_path: "/tmp/demo" });
+    const { release_id } = await call("create_release", {
+      project_id,
+      version: "0.4.0",
+      name: "TBD",
+      description: "placeholder",
+    });
+    const { task_id } = await call("create_task", {
+      project_id,
+      release_id,
+      title: "already assigned",
+      complexity_hint: "normal",
+    });
+    // Shipped, so status/released_at/release_notes all carry values a stray
+    // write would visibly change.
+    db.prepare(
+      `UPDATE releases SET status = 'released', released_at = '2026-10-01T00:00:00.000Z', release_notes = 'notes' WHERE id = ?`,
+    ).run(release_id);
+    const rowOf = () => db.prepare("SELECT * FROM releases WHERE id = ?").get(release_id) as Record<string, unknown>;
+    const before = rowOf();
+
+    // Extra keys naming frozen columns ride along; none may land.
+    const renamed = await call("set_release_details", {
+      project_id: "Demo",
+      release_id: "0.4.0",
+      name: "Slices",
+      description: null,
+      version: "9.9.9",
+      status: "planned",
+      release_notes: "rewritten",
+      released_at: "1999-01-01T00:00:00.000Z",
+      cancellation_reason: "rewritten",
+      sequence: 999,
+    });
+    expect(renamed).toEqual({ release_id, version: "0.4.0", name: "Slices", description: "" });
+    expect(rowOf()).toEqual({ ...before, name: "Slices", description: "" });
+
+    const { releases } = await call("list_releases", { project_id });
+    expect(releases).toEqual([expect.objectContaining({ id: release_id, name: "Slices", total: 1 })]);
+    const lane = getBoardData(db, project_id).lanes.find((l) => l.release_id === release_id);
+    expect(lane?.release_name).toBe("Slices");
+    expect(lane?.tasks.map((t) => t.id)).toEqual([task_id]);
+
+    const empty = await callRaw("set_release_details", { project_id, release_id });
+    expect(empty.isError).toBe(true);
+    expect(empty.text).toMatch(/set_release_details needs at least one of name or description/);
+    const unknown = await callRaw("set_release_details", { project_id, release_id: "missing", name: "x" });
+    expect(unknown.isError).toBe(true);
+    expect(unknown.text).toMatch(/Unknown release: missing/);
+    expect(rowOf()).toEqual({ ...before, name: "Slices", description: "" });
   });
 
   it("returns a distinct conflict shape for claim_task ownership contention", async () => {
@@ -401,6 +547,48 @@ describe("MCP server smoke test", () => {
     expect(payload.lock_expires_at).toBeTruthy();
   });
 
+  it("carries reclaimed_from in get_next_task's JSON only on a reclaim (TTM-78)", async () => {
+    const client = await connectedClient(db);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      expect(result.isError).toBeFalsy();
+      const content = result.content as Array<{ type: string; text: string }>;
+      return JSON.parse(content[0].text);
+    };
+
+    const T0 = Date.parse("2026-10-04T09:00:00.000Z");
+    // Date only: the transport's promises and timers stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(T0);
+      const project = await call("create_project", { name: "Demo", root_path: "/tmp/demo" });
+      const created = await call("create_task", {
+        project_id: project.project_id,
+        title: "Solo task",
+        complexity_hint: "normal",
+      });
+
+      const fresh = await call("get_next_task", { project_id: project.project_id });
+      expect(fresh.task.id).toBe(created.task_id);
+      expect("reclaimed_from" in fresh).toBe(false);
+
+      await call("claim_task", { task_id: created.task_id, session_id: "session-1" });
+      const lease = 2 * 60 * 60 * 1000;
+      vi.setSystemTime(T0 + lease + 60 * 1000);
+
+      const reclaimed = await call("get_next_task", { project_id: project.project_id });
+      expect(reclaimed.task.id).toBe(created.task_id);
+      expect(reclaimed.task.owner_session_id).toBeNull();
+      expect(reclaimed.reclaimed_from).toEqual({
+        owner_session_id: "session-1",
+        lock_expires_at: new Date(T0 + lease).toISOString(),
+        last_activity_at: new Date(T0).toISOString(),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("returns a distinct verification_failed shape when complete_task's checks don't pass, and force skips them", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
@@ -431,6 +619,51 @@ describe("MCP server smoke test", () => {
     });
     expect(forced.isError).toBeFalsy();
     expect(forced.payload.ok).toBe(true);
+  });
+
+  it("adds unverified_paths to complete_task's JSON only when a declared path is outside the repository", async () => {
+    const repo = mkdtempSync(path.join(tmpdir(), "ttmcp-smoke-repo-"));
+    const outside = mkdtempSync(path.join(tmpdir(), "ttmcp-smoke-outside-"));
+    try {
+      execSync("git init -q && git config user.email t@example.com && git config user.name T", { cwd: repo });
+      writeFileSync(path.join(repo, "README.md"), "init\n");
+      execSync("git add . && git commit -q -m init", { cwd: repo });
+      const ext = path.join(outside, "CLAUDE.md");
+      writeFileSync(ext, "global\n");
+
+      const client = await connectedClient(db);
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const result = await client.callTool({ name, arguments: args });
+        const content = result.content as Array<{ type: string; text: string }>;
+        return { isError: result.isError, payload: JSON.parse(content[0].text) };
+      };
+
+      const { payload: project } = await call("create_project", { name: "Demo", root_path: repo });
+      const { payload: mixed } = await call("create_task", {
+        project_id: project.project_id,
+        title: "Repo file plus a global one",
+        file_paths: ["config.json", ext],
+        complexity_hint: "normal",
+      });
+      const { payload: inRepo } = await call("create_task", {
+        project_id: project.project_id,
+        title: "Repo file only",
+        file_paths: ["config.json"],
+        complexity_hint: "normal",
+      });
+      writeFileSync(path.join(repo, "config.json"), "{}\n");
+
+      const withExternal = await call("complete_task", { task_id: mixed.task_id, summary: "done" });
+      expect(withExternal.isError).toBeFalsy();
+      expect(withExternal.payload).toEqual({ ok: true, unblocked_task_ids: [], unverified_paths: [ext] });
+
+      const allInRepo = await call("complete_task", { task_id: inRepo.task_id, summary: "done" });
+      expect(allInRepo.isError).toBeFalsy();
+      expect(allInRepo.payload).toEqual({ ok: true, unblocked_task_ids: [] });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   it("carries task slices end to end by task code, and complete_task's open_slices refusal with its names intact", async () => {

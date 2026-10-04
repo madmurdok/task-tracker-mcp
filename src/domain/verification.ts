@@ -1,8 +1,17 @@
 import { execFileSync, execSync } from "node:child_process";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 export interface VerificationResult {
   passed: boolean;
   reason: string;
+  /**
+   * Declared paths the check could not look at (outside the project's git
+   * repository). Set only when non-empty, so a caller that reports only
+   * failures can still tell a pass apart from "all verified".
+   */
+  uncheckedPaths?: string[];
 }
 
 export interface CompletionVerificationInput {
@@ -58,17 +67,37 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
     testCommand,
     changesSinceIso,
   }: CompletionVerificationInput): VerificationResult {
+    // Declared paths outside the repository pass through unchecked; the
+    // passing verdict still names them so nobody reads it as "all verified".
+    let uncheckedPaths: string[] = [];
     if (filePaths.length > 0) {
-      const fileCheck = this.checkFilesChanged(rootPath, filePaths, changesSinceIso);
-      if (!fileCheck.passed) return fileCheck;
+      const fileCheck = this.checkFilesChanged(
+        rootPath,
+        filePaths,
+        changesSinceIso,
+      );
+      if (!fileCheck.passed) {
+        return {
+          passed: false,
+          reason: fileCheck.reason,
+          ...withUnchecked(fileCheck.external),
+        };
+      }
+      uncheckedPaths = fileCheck.external;
     }
 
     if (testCommand) {
       const testCheck = this.runTestCommand(rootPath, testCommand);
-      if (!testCheck.passed) return testCheck;
+      if (!testCheck.passed) {
+        return { ...testCheck, ...withUnchecked(uncheckedPaths) };
+      }
     }
 
-    return { passed: true, reason: "verification passed" };
+    return {
+      passed: true,
+      reason: `verification passed${externalNote(uncheckedPaths)}`,
+      ...withUnchecked(uncheckedPaths),
+    };
   }
 
   /**
@@ -114,40 +143,88 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
     rootPath: string,
     filePaths: string[],
     changesSinceIso: string | undefined,
-  ): VerificationResult {
-    let status: string;
-    try {
-      // --porcelain (unlike `git diff --stat`) also surfaces brand-new
-      // untracked files, which is the common case for a task that adds a file.
-      status = execFileSync("git", ["status", "--porcelain", "--", ...filePaths], {
-        cwd: rootPath,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-    } catch (error) {
-      // Not a git repo, git missing, unreadable path: a verdict, never a throw.
+  ): VerificationResult & { external: string[] } {
+    const root = gitRepoOf(rootPath);
+    if (!root.ok) {
+      // Not a git repo, git missing: a verdict, never a throw.
       return {
         passed: false,
-        reason: `could not check git status: ${error instanceof Error ? error.message : String(error)}`,
+        reason: `could not check git status: ${root.error}`,
+        external: [],
       };
     }
 
-    if (status.trim().length > 0) {
-      return { passed: true, reason: "changes detected in declared files (uncommitted)" };
+    const { groups, external } = partitionDeclaredPaths(
+      rootPath,
+      root.repo,
+      filePaths,
+    );
+    const note = externalNote(external);
+
+    if (groups.size === 0) {
+      return {
+        passed: false,
+        reason:
+          `none of this task's declared files are inside the project's git repository ` +
+          `(${rootPath}), so none could be checked: ${external.join(", ")}`,
+        external,
+      };
     }
 
     const since = parseSinceMs(changesSinceIso);
-    if (since !== null) {
-      const committedAtMs = this.lastCommitTouching(rootPath, filePaths);
-      if (committedAtMs !== null && committedAtMs >= since) {
+    let committedMatch = false;
+    for (const [cwd, paths] of groups) {
+      let status: string;
+      try {
+        // --porcelain (unlike `git diff --stat`) also surfaces brand-new
+        // untracked files, which is the common case for a task that adds a file.
+        status = execFileSync(
+          "git",
+          ["status", "--porcelain", "--", ...paths],
+          {
+            cwd,
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+          },
+        );
+      } catch (error) {
+        // Unreadable path, broken worktree: a verdict, never a throw.
+        return {
+          passed: false,
+          reason: `could not check git status: ${error instanceof Error ? error.message : String(error)}`,
+          external,
+        };
+      }
+
+      if (status.trim().length > 0) {
         return {
           passed: true,
-          reason: "changes detected in declared files (committed since the task was created)",
+          reason: `changes detected in declared files (uncommitted)${note}`,
+          external,
         };
+      }
+
+      if (since !== null && !committedMatch) {
+        // Each worktree's own HEAD: a linked worktree's commits live on its
+        // branch, not on the project root's.
+        const committedAtMs = this.lastCommitTouching(cwd, paths);
+        committedMatch = committedAtMs !== null && committedAtMs >= since;
       }
     }
 
-    return { passed: false, reason: "no changes detected in this task's declared files" };
+    if (committedMatch) {
+      return {
+        passed: true,
+        reason: `changes detected in declared files (committed since the task was created)${note}`,
+        external,
+      };
+    }
+
+    return {
+      passed: false,
+      reason: `no changes detected in this task's declared files${note}`,
+      external,
+    };
   }
 
   /**
@@ -161,7 +238,10 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
    * Detached HEAD and linked worktrees need no special handling - both resolve
    * HEAD to a real commit, and `git log` walks from it exactly as usual.
    */
-  private lastCommitTouching(rootPath: string, filePaths: string[]): number | null {
+  private lastCommitTouching(
+    rootPath: string,
+    filePaths: string[],
+  ): number | null {
     try {
       const output = execFileSync(
         "git",
@@ -178,7 +258,10 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
     }
   }
 
-  private runTestCommand(rootPath: string, testCommand: string): VerificationResult {
+  private runTestCommand(
+    rootPath: string,
+    testCommand: string,
+  ): VerificationResult {
     try {
       execSync(testCommand, { cwd: rootPath, stdio: "pipe" });
       return { passed: true, reason: "test command passed" };
@@ -188,5 +271,159 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
         reason: `test command failed: ${error instanceof Error ? error.message : String(error)}`,
       };
     }
+  }
+}
+
+interface GitRepo {
+  /** Worktree top level, realpath'd. */
+  toplevel: string;
+  /** The repository's shared git dir - identical across all its worktrees. */
+  commonDir: string;
+}
+
+type GitRepoLookup = { ok: true; repo: GitRepo } | { ok: false; error: string };
+
+/** The reason-text suffix naming declared paths the check could not look at. */
+function externalNote(external: string[]): string {
+  return external.length > 0
+    ? `; not checked, outside the project's git repository: ${external.join(", ")}`
+    : "";
+}
+
+/** `uncheckedPaths` only when there are any, so the result stays compact. */
+function withUnchecked(external: string[]): Pick<VerificationResult, "uncheckedPaths"> {
+  return external.length > 0 ? { uncheckedPaths: external } : {};
+}
+
+/** The repository and worktree `dir` belongs to, or why there is none. */
+function gitRepoOf(dir: string): GitRepoLookup {
+  try {
+    const [toplevel, commonDir] = execFileSync(
+      "git",
+      [
+        "rev-parse",
+        "--path-format=absolute",
+        "--show-toplevel",
+        "--git-common-dir",
+      ],
+      { cwd: dir, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    )
+      .trim()
+      .split("\n");
+    return {
+      ok: true,
+      repo: {
+        toplevel: realpathSync(toplevel),
+        commonDir: realpathSync(commonDir),
+      },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * A declared path made absolute with symlinks resolved as far as the path
+ * exists (a declared file may be deleted, or not yet exist), so it can be
+ * compared with git's realpath'd top levels - on macOS /tmp is /private/tmp.
+ * A leading `~` is the user's home: declared paths like `~/.claude/CLAUDE.md`
+ * are written that way, and resolving one against rootPath would silently
+ * turn it into a never-changing in-repo path.
+ */
+function resolveDeclaredPath(rootPath: string, declared: string): string {
+  const expanded =
+    declared === "~" || declared.startsWith("~/")
+      ? path.join(os.homedir(), declared.slice(1))
+      : declared;
+  let existing = path.resolve(rootPath, expanded);
+  const missing: string[] = [];
+  while (!existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    missing.unshift(path.basename(existing));
+    existing = parent;
+  }
+  try {
+    return path.join(realpathSync(existing), ...missing);
+  } catch {
+    return path.join(existing, ...missing);
+  }
+}
+
+/**
+ * Splits declared paths into per-worktree pathspec groups (keyed by the cwd
+ * to run git in) and the paths outside the project's repository.
+ *
+ * Why this exists: one `git status -- <paths>` fatals on ANY pathspec outside
+ * the repository ("is outside repository"), so a single external declared
+ * path (e.g. ~/.claude/CLAUDE.md) used to sink the check for every in-repo
+ * path too, with a "could not check git status" that read like a broken repo.
+ *
+ * In-repo is decided by asking git, not by comparing against rootPath: each
+ * path's nearest existing directory is resolved with `git rev-parse
+ * --git-common-dir`, and the path is in-repo when that matches rootPath's
+ * common dir. A lexical "is it under rootPath" test gets linked worktrees
+ * wrong both ways (TTM-74 is where worktrees already bit): a worktree of the
+ * same repo elsewhere on disk would read as external, and one nested inside
+ * the checkout (e.g. .claude/worktrees/x) as rootPath's own files, where git
+ * status from rootPath would silently see only an untracked directory.
+ * Paths in rootPath's own worktree keep their declared spelling and run from
+ * rootPath (unchanged behaviour); paths in another worktree of the same repo
+ * run from that worktree's top level, against its own HEAD.
+ *
+ * External paths are reported as unverifiable rather than checked by mtime
+ * against created_at. The check already answers only "has a declared file
+ * plausibly moved during this task's lifetime" (see checkFilesChanged's
+ * accepted false positive), so the in-repo paths carry the verdict on their
+ * own; an mtime test would add a second, weaker evidence source (mtime moves
+ * on checkout, copy, touch, editor saves) for files that are, by definition,
+ * outside the task's branch. Naming them in the reason keeps it honest.
+ */
+function partitionDeclaredPaths(
+  rootPath: string,
+  root: GitRepo,
+  filePaths: string[],
+): { groups: Map<string, string[]>; external: string[] } {
+  const groups = new Map<string, string[]>();
+  const external: string[] = [];
+  const repoByDir = new Map<string, GitRepoLookup>();
+
+  for (const declared of filePaths) {
+    const absolute = resolveDeclaredPath(rootPath, declared);
+    let dir = absolute;
+    while (!existsSync(dir) || !isDirectory(dir)) {
+      const parent = path.dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+    let lookup = repoByDir.get(dir);
+    if (!lookup) {
+      lookup = gitRepoOf(dir);
+      repoByDir.set(dir, lookup);
+    }
+
+    if (!lookup.ok || lookup.repo.commonDir !== root.commonDir) {
+      external.push(declared);
+      continue;
+    }
+    const isRootWorktree = lookup.repo.toplevel === root.toplevel;
+    const cwd = isRootWorktree ? rootPath : lookup.repo.toplevel;
+    const pathspec = isRootWorktree ? declared : absolute;
+    const group = groups.get(cwd);
+    if (group) group.push(pathspec);
+    else groups.set(cwd, [pathspec]);
+  }
+
+  return { groups, external };
+}
+
+function isDirectory(p: string): boolean {
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
   }
 }

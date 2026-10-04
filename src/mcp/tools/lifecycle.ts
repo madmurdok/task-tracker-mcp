@@ -32,7 +32,7 @@ export function registerLifecycleTools(
     "claim_task",
     {
       description:
-        "Take a specific task into work: moves a pending, unblocked task straight to in_progress, or attaches/renews ownership on a task already in_progress (e.g. right after get_next_task). Use this to hand a specific task to a specific session instead of pulling from the priority queue. Rejects with a conflict error if another session's lock is still active, a blocked error if the task has unmet dependencies, or a not_claimable error if it's already done/cancelled. Accepts a task's uuid or its code (`TTM-63`).",
+        "Take a specific task into work: moves a pending, unblocked task straight to in_progress, or attaches/renews ownership on a task already in_progress (e.g. right after get_next_task). Either way the task gets a lease of 2 h from now; slice writes (start_slice, complete_slice, set_task_slices, revise_task_slices) renew it while work goes on, add_handoff_note does not. Use this to hand a specific task to a specific session instead of pulling from the priority queue. Rejects with a conflict error if another session's lock is still active, a blocked error if the task has unmet dependencies, or a not_claimable error if it's already done/cancelled. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         session_id: z.string().min(1),
@@ -111,7 +111,7 @@ export function registerLifecycleTools(
     "complete_task",
     {
       description:
-        "Mark a task done and report which dependent tasks are now unblocked. Refuses with error:'open_slices' while any of the task's slices (see set_task_slices) is still pending or in_progress, naming each one (`S2 \"title\" (pending)`) - complete, fail or skip them first. Verifies the task's declared files actually changed (and runs test_command, if given) before accepting the completion. Pass force to skip both the open-slices guard and verification. Accepts a task's uuid or its code (`TTM-63`).",
+        "Mark a task done and report which dependent tasks are now unblocked. Refuses with error:'open_slices' while any of the task's slices (see set_task_slices) is still pending or in_progress, naming each one (`S2 \"title\" (pending)`) - complete, fail or skip them first. Verifies the task's declared files actually changed (and runs test_command, if given) before accepting the completion. Declared paths outside the project's git repository cannot be checked: a passing completion then lists them in unverified_paths (the field is absent otherwise). Pass force to skip both the open-slices guard and verification. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         summary: z.string().optional(),

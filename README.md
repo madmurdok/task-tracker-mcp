@@ -33,10 +33,11 @@ npm run dashboard  # read-only live web dashboard, see below
 
 `create_project`, `list_projects`, `create_epic`, `list_epics`, `get_epic_status`,
 `create_release`, `list_releases`, `get_release_status`, `release_it`,
-`cancel_release`, `set_task_release`, `set_release_sequence`, `create_task`, `set_task_priority`,
+`cancel_release`, `set_task_release`, `set_release_sequence`, `set_release_details`, `create_task`,
+`set_task_priority`,
 `amend_task`, `cancel_task`, `delete_task`, `add_dependency`, `split_task`, `get_next_task`, `get_task`,
 `set_task_slices`, `revise_task_slices`, `start_slice`, `complete_slice`,
-`list_tasks`, `get_project_status`, `claim_task`, `release_task`, `check_doc_sync`,
+`list_tasks`, `get_project_status`, `claim_task`, `release_task`, `check_doc_sync`, `set_design_doc`,
 `add_handoff_note`, `complete_task`, `create_plan`, `get_plan`, `approve_plan`.
 
 Every tool that takes a `project_id` also accepts the project's unique `name`
@@ -52,6 +53,17 @@ npm run build
 npm run status                        # list every registered project
 npm run status <project_id_or_name>   # that project's status + full task list
 ```
+
+## SessionEnd hook CLI
+
+`dist/cli/session-end.js` (bin `task-tracker-session-end`) is meant to run as a
+Claude Code `SessionEnd` hook: it reads the hook's JSON from stdin and expires
+the leases of the `in_progress` tasks the ending `session_id` owns, so the next
+`get_next_task` reclaims them (with `reclaimed_from`) instead of waiting out the
+2 h lease. It writes nothing to stdout/stderr, always exits 0, and appends one
+line per run to `session-end-YYYY-MM.log` beside the DB. Installing the hook
+(script + `~/.claude/settings.json` entry) is a manual, owner-approved step; see
+`docs/design/TTM-100-session-end.md` section 5.
 
 ## Dashboard
 

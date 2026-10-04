@@ -1,7 +1,7 @@
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireProject } from "./projects.js";
 import { describeSlice, listOpenSlices, type TaskSlice } from "./slices.js";
-import { requireTask, resolveTaskId, withCode } from "./tasks.js";
+import { requireTask, resolveTaskId, withCode, withCodes } from "./tasks.js";
 import { requireRelease } from "./releases.js";
 import { LOCK_LEASE_MS } from "./status.js";
 import { findUnblockedDependents, hasUnmetDependencies } from "./taskStatus.js";
@@ -166,8 +166,40 @@ export function releaseTask(db: DatabaseInstance, input: ReleaseTaskInput): void
   run();
 }
 
+/**
+ * Ends the leases of every task the given session still holds, for the
+ * SessionEnd hook (docs/design/TTM-100-session-end.md, sections 2-3).
+ *
+ * Expire, not release: the row stays `in_progress` with its owner, and only
+ * `lock_expires_at` moves to `now - 1 ms`, so the next get_next_task reclaims
+ * it with `reclaimed_from` (TTM-78) and a resumed session's slice write renews
+ * it. The 1 ms lets a reclaim in the same millisecond see `lock_expires_at <
+ * now`; `MIN` never moves an already-lapsed lease later; `IS NOT NULL` mirrors
+ * renewLease (a legacy NULL-lease row stays unreclaimable). `updated_at` is
+ * deliberately untouched: a session ending is not work on the task.
+ *
+ * Returns the expired tasks' codes (e.g. `TTM-100`).
+ */
+export function expireSessionLeases(db: DatabaseInstance, sessionId: string, nowIso: string): string[] {
+  const endedAt = new Date(new Date(nowIso).getTime() - 1).toISOString();
+  const rows = db
+    .prepare(
+      `UPDATE tasks SET lock_expires_at = MIN(lock_expires_at, ?)
+       WHERE owner_session_id = ? AND status = 'in_progress' AND lock_expires_at IS NOT NULL
+       RETURNING project_id, task_number`,
+    )
+    .all(endedAt, sessionId) as Array<{ project_id: string; task_number: number }>;
+  return withCodes(db, rows).map((row) => row.code);
+}
+
 export interface CompleteTaskResult {
   unblocked_task_ids: string[];
+  /**
+   * Declared paths verification passed without checking (outside the
+   * project's git repository). Present only when non-empty; absent on a
+   * forced completion, which runs no verification at all.
+   */
+  unverified_paths?: string[];
 }
 
 export interface CompleteTaskInput {
@@ -225,6 +257,7 @@ export function completeTask(
     throw new Error(`Unknown task_id: ${taskId}`);
   }
 
+  let unverifiedPaths: string[] = [];
   if (!force) {
     // Before verification, not after: it is free, and verification may run a
     // test_command that would be wasted on a completion refused anyway.
@@ -261,6 +294,7 @@ export function completeTask(
         result.reason,
       );
     }
+    unverifiedPaths = result.uncheckedPaths ?? [];
   }
 
   const run = db.transaction((): CompleteTaskResult => {
@@ -286,7 +320,10 @@ export function completeTask(
       `UPDATE tasks SET status = 'done', completion_summary = ?, lock_expires_at = NULL, updated_at = ? WHERE id = ?`,
     ).run(summary ?? null, new Date().toISOString(), taskId);
 
-    return { unblocked_task_ids: findUnblockedDependents(db, taskId) };
+    return {
+      unblocked_task_ids: findUnblockedDependents(db, taskId),
+      ...(unverifiedPaths.length > 0 ? { unverified_paths: unverifiedPaths } : {}),
+    };
   });
 
   return run();

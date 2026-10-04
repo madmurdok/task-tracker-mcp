@@ -13,7 +13,7 @@ import {
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, requireRelease, type Release } from "./releases.js";
 import { listSliceRevisions, listTaskSlices, type TaskSlice, type TaskSliceRevision } from "./slices.js";
-import { displayStatus, hasUnmetDependencies, type DisplayStatus } from "./taskStatus.js";
+import { displayStatus, hasUnmetDependencies, LOCK_LEASE_MS, type DisplayStatus } from "./taskStatus.js";
 import { listTaskFilePaths, requireTask, type Task, withCode, taskCode} from "./tasks.js";
 
 // Re-exported, not redefined: `DisplayStatus` moved to the taskStatus.ts leaf
@@ -61,8 +61,36 @@ export interface ProjectStatus {
  */
 export type ReportedPlanStatus = PlanStatus | "drifted" | "none";
 
+/**
+ * The previous holder of a task get_next_task just reclaimed (TTM-78), read
+ * before the hand-out cleared it. Reclaim is automatic and runs on elapsed
+ * time alone, which cannot tell a dead session from a paused one (usage limit,
+ * overnight, waiting on the owner) - so the answer says it happened and leaves
+ * the receiver to confirm the previous holder is gone before working on it.
+ *
+ * `last_activity_at` is the latest tracker write about the task: its own
+ * `updated_at`, its slices' `created_at`/`started_at`/`completed_at`, and its
+ * handoff notes' `created_at`. The slice stamps are included because
+ * renewLease (the slice heartbeat) deliberately leaves `updated_at` alone, so
+ * `updated_at` by itself would miss exactly the activity that keeps a lease
+ * alive; `created_at` covers set/revise_task_slices, which renew it too.
+ * Handoff notes do not renew the lease but are counted: a note written after
+ * the last slice event is still a sign of a worker. Never null - `updated_at`
+ * is always set.
+ */
+export interface ReclaimedFrom {
+  owner_session_id: string | null;
+  lock_expires_at: string;
+  last_activity_at: string;
+}
+
 type NextTaskOutcome =
-  | { task: TaskDetail }
+  /**
+   * `reclaimed_from` only when the task was in_progress under a lapsed lease;
+   * absent (no key) on a fresh hand-out of a pending task, so that answer stays
+   * exactly what it always was.
+   */
+  | { task: TaskDetail; reclaimed_from?: ReclaimedFrom }
   | { task: null; reason: "all_done" }
   | { task: null; reason: "all_blocked"; blocked_on: string[] }
   /**
@@ -135,13 +163,9 @@ export function getTaskDetail(db: DatabaseInstance, taskId: string): TaskDetail 
   };
 }
 
-/**
- * How long a hand-out (via get_next_task) or an explicit claim_task holds a
- * task before it's considered stale and eligible for automatic reclaim by a
- * later get_next_task call (v2 ownership semantics - v1 only guaranteed no
- * duplicate hand-out, see the doc's Non-goals/Failure Modes).
- */
-export const LOCK_LEASE_MS = 30 * 60 * 1000;
+// Defined in taskStatus.ts so slices.ts (start_slice) can grant the same
+// lease without importing this module; re-exported for existing importers.
+export { LOCK_LEASE_MS };
 
 function withLease(nowIso: string): string {
   return new Date(Date.parse(nowIso) + LOCK_LEASE_MS).toISOString();
@@ -152,12 +176,46 @@ function handOut(
   candidate: Task,
   nowIso: string,
   ownerSessionId: string | null,
-): NextTaskOutcome {
+): { task: TaskDetail } {
   const lockExpiresAt = withLease(nowIso);
   db.prepare(
     `UPDATE tasks SET status = 'in_progress', owner_session_id = ?, lock_expires_at = ?, updated_at = ? WHERE id = ?`,
   ).run(ownerSessionId, lockExpiresAt, nowIso, candidate.id);
   return { task: getTaskDetail(db, candidate.id) };
+}
+
+/** See `ReclaimedFrom` for which writes count as activity. */
+function lastActivityAt(db: DatabaseInstance, task: Task): string {
+  // Every timestamp here is `toISOString()` output (fixed-width UTC), so MAX
+  // over the strings is the chronological maximum. Aggregate MAX skips the
+  // NULL started_at/completed_at of slices not yet run.
+  const row = db
+    .prepare(
+      `SELECT MAX(t) AS last FROM (
+         SELECT created_at AS t FROM task_slices WHERE task_id = ?
+         UNION ALL SELECT started_at FROM task_slices WHERE task_id = ?
+         UNION ALL SELECT completed_at FROM task_slices WHERE task_id = ?
+         UNION ALL SELECT created_at FROM handoff_notes WHERE task_id = ?
+       )`,
+    )
+    .get(task.id, task.id, task.id, task.id) as { last: string | null };
+  return row.last !== null && row.last > task.updated_at ? row.last : task.updated_at;
+}
+
+/**
+ * Hands out an in_progress task whose lease has lapsed, with the owner cleared,
+ * and reports who held it. The one reclaim path for both selection strategies,
+ * so the two report it identically. `task` is the row as read before the
+ * hand-out: handOut overwrites its owner, lease and updated_at.
+ */
+function reclaim(db: DatabaseInstance, task: Task, nowIso: string): NextTaskOutcome {
+  const reclaimedFrom: ReclaimedFrom = {
+    owner_session_id: task.owner_session_id,
+    // Non-null: both callers select only tasks whose lease is set and lapsed.
+    lock_expires_at: task.lock_expires_at!,
+    last_activity_at: lastActivityAt(db, task),
+  };
+  return { ...handOut(db, task, nowIso, null), reclaimed_from: reclaimedFrom };
 }
 
 /**
@@ -218,8 +276,9 @@ function pickByPriority(db: DatabaseInstance, scope: HandOutScope, nowIso: strin
     }
   }
 
-  // No fresh pending work - see if an in_progress task's lock has expired
-  // (its session died or never completed) and can be automatically reclaimed.
+  // No fresh pending work - see if an in_progress task's lock has expired and
+  // can be automatically reclaimed. Its session may have died, or only paused
+  // (elapsed time cannot tell which), so the answer carries reclaimed_from.
   const reclaimable = db
     .prepare(
       `SELECT * FROM tasks
@@ -231,7 +290,7 @@ function pickByPriority(db: DatabaseInstance, scope: HandOutScope, nowIso: strin
     .get(scope.id, nowIso) as Task | undefined;
 
   if (reclaimable) {
-    return handOut(db, reclaimable, nowIso, null);
+    return reclaim(db, reclaimable, nowIso);
   }
 
   return exhausted(db, scope, pendingTasks);
@@ -253,6 +312,34 @@ function pickByPriority(db: DatabaseInstance, scope: HandOutScope, nowIso: strin
  * plan says step 1 comes first, and a dead session's abandoned task is still
  * step 1's work.
  *
+ * Within one step the two shapes are NOT interleaved by position: every
+ * unclaimed pending task in the step is handed out before any task of that
+ * step is reclaimed (TTM-98). A step's tasks run in parallel, so a sibling
+ * nobody has started yet is the step's missing work, whereas a lapsed lease on
+ * one already handed out most often means a live orchestrator outran the lease
+ * rather than a dead one - reclaiming it first handed the same task out twice
+ * and left its sibling unclaimed while an agent worked on it (g-mesh 3.20.0,
+ * step [GM-486, GM-490]). Across steps the order above is unchanged: a
+ * reclaimable step-1 task still beats a pending step-2 one.
+ *
+ * So the two paths differ only in order: pickByPriority reclaims nothing while
+ * any pending task in the pool is unblocked, and then takes the oldest lapsed
+ * lease; this walker reclaims within the first step that has no unclaimed
+ * pending task, in position order. Whichever path reclaims, it goes through
+ * `reclaim`, so the answer carries the same `reclaimed_from` marker (TTM-78)
+ * naming the previous holder - the receiver confirms that holder is gone
+ * before working on it, because a lapsed lease may be a paused session rather
+ * than a dead one.
+ *
+ * A task held under a live lease is never handed out again, including when
+ * every task of its step is so held: get_next_task hands out work nobody holds,
+ * and a holder resumes its own task by id (get_task/claim_task), which it
+ * already has. Returning a held task "for resuming" would be the very
+ * duplicate hand-out above, to whichever session asked next. Such a step
+ * contributes no candidate and the walk moves on to the next step, exactly as
+ * it always has for a held task; if no step has a candidate the answer is the
+ * same all_done/all_blocked any exhausted pool gets.
+ *
  * A task in the batch but absent from the plan is not a candidate and is not
  * looked for here: that set being non-empty *is* drift, so the caller has
  * already refused before reaching this function.
@@ -268,32 +355,53 @@ function pickByPlan(
   // still pending and still waiting on something.
   const blocked: Task[] = [];
 
+  // getPlan returns items in step then position order, so consecutive runs of
+  // one step number are exactly the plan's steps, each still in position order.
+  const steps: PlanItem[][] = [];
   for (const item of items) {
-    // getPlan JOINs items to tasks, and the item row cascades on task delete,
-    // so this row always exists; the guard narrows the type rather than
-    // handling a case that can occur.
-    const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(item.task_id) as Task | undefined;
-    if (!task) continue;
+    const last = steps[steps.length - 1];
+    if (last && last[0]!.step === item.step) last.push(item);
+    else steps.push([item]);
+  }
 
-    if (task.status === "done" || task.status === "cancelled") continue;
+  for (const step of steps) {
+    const reclaimable: Task[] = [];
 
-    if (task.status === "pending") {
-      if (hasUnmetDependencies(db, task.id)) {
-        blocked.push(task);
-        continue;
+    for (const item of step) {
+      // getPlan JOINs items to tasks, and the item row cascades on task delete,
+      // so this row always exists; the guard narrows the type rather than
+      // handling a case that can occur.
+      const task = db.prepare(`SELECT * FROM tasks WHERE id = ?`).get(item.task_id) as Task | undefined;
+      if (!task) continue;
+
+      if (task.status === "done" || task.status === "cancelled") continue;
+
+      if (task.status === "pending") {
+        if (hasUnmetDependencies(db, task.id)) {
+          blocked.push(task);
+          continue;
+        }
+        return handOut(db, task, nowIso, task.owner_session_id);
       }
-      return handOut(db, task, nowIso, task.owner_session_id);
+
+      // in_progress: someone holds it. Reclaimable only once the lease it was
+      // handed out under has lapsed - the same predicate as pickByPriority's
+      // reclaim branch, `IS NOT NULL` included, because an in_progress task
+      // with no lease was never handed out by this path and is not this path's
+      // to take back. String comparison, not Date parsing: these are all
+      // `toISOString()` output, fixed-width UTC, so lexicographic order is
+      // chronological order - the same assumption the SQL above already makes.
+      // Collected, not returned: the step's pending tasks go first.
+      if (task.lock_expires_at !== null && task.lock_expires_at < nowIso) {
+        reclaimable.push(task);
+      }
     }
 
-    // in_progress: someone holds it. Reclaimable only once the lease it was
-    // handed out under has lapsed - the same predicate as pickByPriority's
-    // reclaim branch, `IS NOT NULL` included, because an in_progress task with
-    // no lease was never handed out by this path and is not this path's to take
-    // back. String comparison, not Date parsing: these are all
-    // `toISOString()` output, fixed-width UTC, so lexicographic order is
-    // chronological order - the same assumption the SQL above already makes.
-    if (task.lock_expires_at !== null && task.lock_expires_at < nowIso) {
-      return handOut(db, task, nowIso, null);
+    // In position order, not pickByPriority's oldest-lease-first: the plan's
+    // order is the one being followed here.
+    const reclaimCandidate = reclaimable[0];
+    if (reclaimCandidate) {
+      return reclaim(db, reclaimCandidate, nowIso);
     }
   }
 
@@ -302,6 +410,8 @@ function pickByPlan(
 
 /**
  * Hands out the next task to work, marking it in_progress under a fresh lease.
+ * A task reclaimed from a lapsed lease, on either path, carries
+ * `reclaimed_from` (see `ReclaimedFrom`).
  *
  * Unscoped (no `releaseRef`) it behaves as it always has: project-wide,
  * priority order, the stale-lock reclaim, all_done/all_blocked. It gains one

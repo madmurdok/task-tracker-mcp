@@ -132,8 +132,9 @@ function createCard(task, statusLabel, codePrefix) {
   card.dataset.taskId = task.id;
   if (isHighlighted(task.id)) card.classList.add("is-highlighted");
   // is_stale is independent of status (only ever true alongside
-  // "in_progress") - about to be auto-reclaimed by the next get_next_task
-  // call, so it gets its own highlight rather than reusing a status color.
+  // "in_progress") - no lease-renewing activity for a whole lease (2 h), so
+  // the next get_next_task may reclaim it. A signal to look, not proof the
+  // session died; it gets its own highlight rather than a status color.
   if (task.is_stale) card.classList.add("is-stale");
 
   const title = document.createElement("h4");
@@ -175,7 +176,13 @@ function createCard(task, statusLabel, codePrefix) {
   if (task.is_stale) {
     const stale = document.createElement("span");
     stale.className = "card-stale-flag";
-    stale.textContent = "stale lock";
+    // stale_since is the last lease grant/renewal (see BoardTask in
+    // board.ts), shown in the viewer's local time.
+    const since = task.stale_since ? new Date(task.stale_since) : null;
+    stale.textContent = since
+      ? `no activity since ${since.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+      : "no recent activity";
+    if (since) stale.title = `No hand-out, claim or slice write since ${since.toLocaleString()}`;
     meta.appendChild(stale);
   }
 

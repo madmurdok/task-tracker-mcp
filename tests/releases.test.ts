@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
+import { getBoardData } from "../src/domain/board.js";
 import { createEpic } from "../src/domain/epics.js";
 import { cancelRelease } from "../src/domain/lifecycle.js";
 import { createProject } from "../src/domain/projects.js";
@@ -8,6 +9,7 @@ import {
   getRelease,
   listReleases,
   requireRelease,
+  setReleaseDetails,
   setReleaseSequence,
   setTaskRelease,
 } from "../src/domain/releases.js";
@@ -614,6 +616,201 @@ describe("setReleaseSequence", () => {
     expect(() => setReleaseSequence(db, project.id, "missing-release", 5)).toThrow(
       /Unknown release: missing-release/,
     );
+  });
+});
+
+describe("setReleaseDetails (TTM-79)", () => {
+  // The whole row, read straight from the table - a frozen-field check that
+  // only compared the columns someone thought of would miss a new one.
+  function rowOf(db: DatabaseInstance, releaseId: string): Record<string, unknown> {
+    return db.prepare("SELECT * FROM releases WHERE id = ?").get(releaseId) as Record<string, unknown>;
+  }
+
+  // Every column except the two setReleaseDetails owns.
+  function frozenColumns(row: Record<string, unknown>): Record<string, unknown> {
+    const { name: _name, description: _description, ...rest } = row;
+    return rest;
+  }
+
+  function placeholderRelease(db: DatabaseInstance, projectId: string) {
+    return createRelease(db, {
+      project_id: projectId,
+      version: "0.4.0",
+      name: "TBD",
+      description: "placeholder description",
+    });
+  }
+
+  it("renames only: the description is left as it was", () => {
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+
+    const result = setReleaseDetails(db, { project_id: project.id, release_id: release.id, name: "Slices" });
+
+    expect(result).toMatchObject({ id: release.id, name: "Slices", description: "placeholder description" });
+    expect(rowOf(db, release.id)).toMatchObject({ name: "Slices", description: "placeholder description" });
+  });
+
+  it("rewrites the description only: the name is left as it was", () => {
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+
+    setReleaseDetails(db, { project_id: project.id, release_id: release.id, description: "Slice tracking" });
+
+    expect(rowOf(db, release.id)).toMatchObject({ name: "TBD", description: "Slice tracking" });
+  });
+
+  it("sets both in one call", () => {
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+
+    setReleaseDetails(db, {
+      project_id: project.id,
+      release_id: release.id,
+      name: "Slices",
+      description: "Slice tracking",
+    });
+
+    expect(rowOf(db, release.id)).toMatchObject({ name: "Slices", description: "Slice tracking" });
+  });
+
+  it.each([
+    ["null", null],
+    ["an empty string", ""],
+  ])("clears both fields to \"\" when given %s", (_label, cleared) => {
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+
+    const result = setReleaseDetails(db, {
+      project_id: project.id,
+      release_id: release.id,
+      name: cleared,
+      description: cleared,
+    });
+
+    expect(result).toMatchObject({ name: "", description: "" });
+    expect(rowOf(db, release.id)).toMatchObject({ name: "", description: "" });
+  });
+
+  it("refuses a call with neither field and writes nothing", () => {
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+    const before = rowOf(db, release.id);
+
+    expect(() => setReleaseDetails(db, { project_id: project.id, release_id: release.id })).toThrow(
+      "set_release_details needs at least one of name or description",
+    );
+    expect(rowOf(db, release.id)).toEqual(before);
+  });
+
+  it("names the unknown release, and the unknown project, in its errors", () => {
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+
+    expect(() =>
+      setReleaseDetails(db, { project_id: project.id, release_id: "missing-release", name: "x" }),
+    ).toThrow(/Unknown release: missing-release/);
+    expect(() =>
+      setReleaseDetails(db, { project_id: "missing-project", release_id: release.id, name: "x" }),
+    ).toThrow(/Unknown project: missing-project/);
+  });
+
+  it("resolves the release by version and the project by name", () => {
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+
+    setReleaseDetails(db, { project_id: "Demo", release_id: "0.4.0", name: "Slices" });
+
+    expect(rowOf(db, release.id)).toMatchObject({ name: "Slices" });
+  });
+
+  it("renames a released release, leaving its notes, timestamp and status alone", () => {
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+    db.prepare(
+      `UPDATE releases SET status = 'released', released_at = '2026-10-01T00:00:00.000Z', release_notes = 'notes' WHERE id = ?`,
+    ).run(release.id);
+    const before = rowOf(db, release.id);
+
+    setReleaseDetails(db, { project_id: project.id, release_id: release.id, name: "Slices" });
+
+    const after = rowOf(db, release.id);
+    expect(after).toMatchObject({
+      name: "Slices",
+      status: "released",
+      released_at: "2026-10-01T00:00:00.000Z",
+      release_notes: "notes",
+    });
+    expect(frozenColumns(after)).toEqual(frozenColumns(before));
+  });
+
+  it("renames a cancelled release, leaving its cancellation reason and status alone", () => {
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+    markCancelled(db, release.id);
+    const before = rowOf(db, release.id);
+
+    setReleaseDetails(db, { project_id: project.id, release_id: release.id, name: "Abandoned" });
+
+    const after = rowOf(db, release.id);
+    expect(after).toMatchObject({
+      name: "Abandoned",
+      status: "cancelled",
+      cancellation_reason: "bench gate said no",
+    });
+    expect(frozenColumns(after)).toEqual(frozenColumns(before));
+  });
+
+  it("cannot write any other column, even when the caller passes one", () => {
+    // The guard against a future "update from the input object" refactor:
+    // every key below names a real column, and none of them may land.
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+    db.prepare(
+      `UPDATE releases SET status = 'released', released_at = '2026-10-01T00:00:00.000Z', release_notes = 'notes', cancellation_reason = 'kept' WHERE id = ?`,
+    ).run(release.id);
+    const before = rowOf(db, release.id);
+
+    const result = setReleaseDetails(db, {
+      project_id: project.id,
+      release_id: release.id,
+      name: "Slices",
+      description: "Slice tracking",
+      id: "hijacked-id",
+      version: "9.9.9",
+      sequence: 999,
+      status: "planned",
+      release_notes: "rewritten",
+      released_at: "1999-01-01T00:00:00.000Z",
+      cancellation_reason: "rewritten",
+      created_at: "1999-01-01T00:00:00.000Z",
+    } as any);
+
+    const after = rowOf(db, release.id);
+    expect(after).toMatchObject({ name: "Slices", description: "Slice tracking" });
+    expect(frozenColumns(after)).toEqual(frozenColumns(before));
+    expect(frozenColumns(result as unknown as Record<string, unknown>)).toEqual(frozenColumns(before));
+  });
+
+  it("renames a release that already has tasks, and list/board read the new name", () => {
+    const { db, project } = setup();
+    const release = placeholderRelease(db, project.id);
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      release_id: release.id,
+      title: "already assigned",
+      complexity_hint: "normal",
+    });
+
+    setReleaseDetails(db, { project_id: project.id, release_id: release.id, name: "Slices" });
+
+    expect(requireTask(db, task.id).release_id).toBe(release.id);
+    expect(listReleasesWithStatus(db, project.id)).toEqual([
+      expect.objectContaining({ id: release.id, name: "Slices", total: 1 }),
+    ]);
+    const lane = getBoardData(db, project.id).lanes.find((l) => l.release_id === release.id);
+    expect(lane?.release_name).toBe("Slices");
+    expect(lane?.tasks.map((t) => t.id)).toEqual([task.id]);
   });
 });
 
