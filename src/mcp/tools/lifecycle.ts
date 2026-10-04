@@ -32,7 +32,7 @@ export function registerLifecycleTools(
     "claim_task",
     {
       description:
-        "Take a specific task into work: moves a pending, unblocked task straight to in_progress, or attaches/renews ownership on a task already in_progress (e.g. right after get_next_task). Use this to hand a specific task to a specific session instead of pulling from the priority queue. Rejects with a conflict error if another session's lock is still active, a blocked error if the task has unmet dependencies, or a not_claimable error if it's already done/cancelled. Accepts a task's uuid or its code (`TTM-63`).",
+        "Take a specific task into work: moves a pending, unblocked task straight to in_progress, or attaches/renews ownership on a task already in_progress (e.g. right after get_next_task). Either way the task gets a lease of 2 h from now; slice writes (start_slice, complete_slice, set_task_slices, revise_task_slices) renew it while work goes on, add_handoff_note does not. Use this to hand a specific task to a specific session instead of pulling from the priority queue. Rejects with a conflict error if another session's lock is still active, a blocked error if the task has unmet dependencies, or a not_claimable error if it's already done/cancelled. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         session_id: z.string().min(1),

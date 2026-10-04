@@ -203,7 +203,7 @@ describe("start_slice starts its task (TTM-98)", () => {
     expect(storedTask(db, task.id)).toMatchObject({ status: "pending", lock_expires_at: null });
   });
 
-  it("leaves an in_progress task's owner and lease untouched", () => {
+  it("keeps an in_progress task's owner and renews its lease (TTM-78)", () => {
     const { db, task } = setup();
     setTaskSlices(db, task.code, [{ phase: "implement", title: "a" }]);
     claimTask(db, task.code, "holder");
@@ -211,13 +211,15 @@ describe("start_slice starts its task (TTM-98)", () => {
     const held = new Date(Date.now() + 5 * 60 * 1000).toISOString();
     db.prepare(`UPDATE tasks SET lock_expires_at = ? WHERE id = ?`).run(held, task.id);
 
+    const before = Date.now();
     expect(startSlice(db, `${task.code}/S1`).status).toBe("in_progress");
+    const after = Date.now();
 
-    expect(storedTask(db, task.id)).toEqual({
-      status: "in_progress",
-      owner_session_id: "holder",
-      lock_expires_at: held,
-    });
+    const stored = storedTask(db, task.id);
+    expect(stored).toMatchObject({ status: "in_progress", owner_session_id: "holder" });
+    const lease = Date.parse(stored.lock_expires_at!);
+    expect(lease).toBeGreaterThanOrEqual(before + LOCK_LEASE_MS);
+    expect(lease).toBeLessThanOrEqual(after + LOCK_LEASE_MS);
   });
 });
 

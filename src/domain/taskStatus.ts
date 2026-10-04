@@ -6,9 +6,44 @@ import type { Task } from "./tasks.js";
  * start_slice that starts a still-pending task holds the task before it's
  * considered stale and eligible for automatic reclaim by a later get_next_task
  * call (v2 ownership semantics - v1 only guaranteed no duplicate hand-out, see
- * the doc's Non-goals/Failure Modes).
+ * the doc's Non-goals/Failure Modes). Slice activity renews it (renewLease).
+ *
+ * 2 hours because the lease must outlast one slice between two renewals: the
+ * measured p95 slice duration is 121.6 min (TTM-78 design note, tracker DB of
+ * 2026-10-04), so 2 h covers 95% of slices. Past it, a lapsed lease means no
+ * tracker activity for 2 h - the previous 30 min lapsed under live work.
  */
-export const LOCK_LEASE_MS = 30 * 60 * 1000;
+export const LOCK_LEASE_MS = 2 * 60 * 60 * 1000;
+
+/**
+ * Heartbeat: pushes an in_progress task's lease out to `nowIso` + LOCK_LEASE_MS,
+ * called by the slice writers (start_slice, complete_slice, set_task_slices,
+ * revise_task_slices) inside their transactions.
+ *
+ * `MAX` keeps whichever expiry is later, so a renewal never shortens a lease.
+ * Comparing as text is correct because every writer stores
+ * `Date.toISOString()` - a fixed-width UTC `YYYY-MM-DDTHH:mm:ss.sssZ` string,
+ * whose lexicographic order is its chronological order (the same assumption
+ * isLockActive and the board's isStale already make).
+ *
+ * Guarded to `status = 'in_progress' AND lock_expires_at IS NOT NULL`: it
+ * never creates a lease on a row without one (a legacy NULL-lease row stays
+ * as it was) and never touches a pending, done or cancelled task. It does
+ * renew a lease that already lapsed: activity after a lapse proves the worker
+ * is alive (a resumed session). Owner is left as it is.
+ *
+ * Deliberately NOT called by add_handoff_note: a handoff note is the last act
+ * of a stopping session (CLAUDE.md, the Stop hook), so renewing on it would
+ * hide exactly the task whose worker just went away. Nor by get_task or any
+ * other read - a read that writes would be a surprise.
+ */
+export function renewLease(db: DatabaseInstance, taskId: string, nowIso: string): void {
+  const renewedUntil = new Date(Date.parse(nowIso) + LOCK_LEASE_MS).toISOString();
+  db.prepare(
+    `UPDATE tasks SET lock_expires_at = MAX(lock_expires_at, ?)
+     WHERE id = ? AND status = 'in_progress' AND lock_expires_at IS NOT NULL`,
+  ).run(renewedUntil, taskId);
+}
 
 /**
  * The parts of a task's status that are *derived from the dependency graph*
