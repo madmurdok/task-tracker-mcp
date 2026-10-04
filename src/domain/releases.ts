@@ -292,9 +292,9 @@ export interface SetReleaseDetailsInput {
  * Not blocked by `released` or `cancelled` status, unlike
  * requireAssignableRelease's freeze. That freeze protects task *membership*,
  * because release_notes were generated from exactly the tasks in the release
- * at release_it time; the notes are built from task titles and summaries
- * only, never from the release's name or description, so relabelling a past
- * release cannot drift them. And the motivating case - a placeholder name
+ * at release_it time; the notes are built from task titles, completion
+ * summaries and cancellation reasons only, never from the release's name or
+ * description, so relabelling a past release cannot drift them. And the motivating case - a placeholder name
  * that should have been a real one, or left empty - is no less wrong on a
  * release that has already shipped or been abandoned.
  *
