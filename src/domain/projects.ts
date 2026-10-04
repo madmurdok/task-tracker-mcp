@@ -136,6 +136,55 @@ export function createProject(db: DatabaseInstance, input: CreateProjectInput): 
   return project;
 }
 
+/**
+ * Sets or clears the design doc tracked for an existing project, hashing it
+ * now exactly as createProject does, so a project registered without a doc
+ * can still get drift detection (checkDocSync's `acknowledge` only re-baselines
+ * a path that is already set).
+ *
+ * A focused setter rather than a general `update_project`, following the
+ * set_task_priority precedent (its own single-purpose tool rather than a
+ * general "update_task", since priority was the only mutable field that
+ * problem needed). The same holds here: the doc is the only project field
+ * that needs to change after creation, and the others would each carry a
+ * cost a general setter hides - `name` is an identifier every tool accepts in
+ * place of the id, `code_prefix` is baked into every task code already
+ * handed out, and changing `root_path` would silently re-resolve the doc
+ * against a different directory under an old hash.
+ *
+ * Unlike createProject, an unreadable path is refused rather than stored
+ * with a null hash: here the caller is explicitly asking for tracking, and a
+ * stored path that never hashed would just report drift forever. The error
+ * names the resolved path, since a path relative to the wrong root is the
+ * usual cause. Passing null clears both columns, after which checkDocSync
+ * reports `tracked: false`.
+ */
+export function setDesignDoc(
+  db: DatabaseInstance,
+  projectRef: string,
+  designDocPath: string | null,
+): Project {
+  const project = requireProject(db, projectRef);
+
+  let designDocHash: string | null = null;
+  if (designDocPath !== null) {
+    designDocHash = hashDesignDoc(project.root_path, designDocPath);
+    if (designDocHash === null) {
+      throw new Error(
+        `Design doc not readable: ${path.resolve(project.root_path, designDocPath)}`,
+      );
+    }
+  }
+
+  db.prepare(`UPDATE projects SET design_doc_path = ?, design_doc_hash = ? WHERE id = ?`).run(
+    designDocPath,
+    designDocHash,
+    project.id,
+  );
+
+  return { ...project, design_doc_path: designDocPath, design_doc_hash: designDocHash };
+}
+
 export interface DocSyncResult {
   tracked: boolean;
   in_sync: boolean;
