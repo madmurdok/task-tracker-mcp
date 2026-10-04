@@ -99,7 +99,7 @@ export function registerSliceTools(server: McpServer, db: DatabaseInstance): voi
   server.registerTool(
     "start_slice",
     {
-      description: `Mark a slice in progress: pending -> in_progress, stamping started_at. Refuses any slice that is not pending. Compact default: {ok, ref, label, status}.${VERBOSE_HELP} ${SLICE_ID_HELP}`,
+      description: `Mark a slice in progress: pending -> in_progress, stamping started_at. Refuses any slice that is not pending. Starting a slice starts its task: a task still pending moves to in_progress too, under a fresh lease (owner unchanged), as get_next_task would - so a task worked without being claimed still shows in progress on the board. A pending task with unmet dependencies is refused instead, slice and task left untouched; an in_progress task is not touched. Compact default: {ok, ref, label, status}.${VERBOSE_HELP} ${SLICE_ID_HELP}`,
       inputSchema: { slice_id: z.string().min(1), verbose: z.boolean().optional() },
     },
     async ({ slice_id, verbose }) => {
