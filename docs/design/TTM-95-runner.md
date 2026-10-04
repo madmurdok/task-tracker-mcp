@@ -1,6 +1,27 @@
 # TTM-95: a headless runner, one fresh session per task
 
-Status: design, awaiting approval. Branch `feat/TTM-95-headless-runner`.
+Status: deferred (2026-10-04). Not approved; kept as a record of the ideas.
+
+## Why deferred
+
+The owner reviewed the design and declined the runner for now. The deciding
+point: in `claude -p` a session cannot ask the owner anything, so every
+question becomes a stop - a `NEEDS_OWNER:` note, the loop halts, and the owner
+answers later with a `--resume ... --owner-says` command. Questions that come
+up mid-task (design reviews, scope changes, stop-and-ask cases) would sit
+unanswered until the owner next looks at a terminal or the tracker, which is
+less convenient than answering in an interactive session.
+
+Points settled in that discussion, worth keeping if this is revisited:
+- The runner targets only the orchestrator's context growth; subagents are
+  already fresh per slice, and inside each task the orchestrator still slices
+  and delegates as it does today.
+- A session cannot start another orchestrator session; the runner has to be an
+  external process the owner starts (a script looping `claude -p`). Running
+  `claude -p` from an agent's Bash would keep the parent session waiting and
+  growing, which defeats the purpose.
+- The cheap alternative without automation: one task per session, the owner
+  starting a fresh session that picks up via `get_next_task`.
 
 ## Goal
 
