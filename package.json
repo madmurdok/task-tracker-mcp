@@ -1,6 +1,6 @@
 {
   "name": "task-tracker-mcp",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Local MCP server for agent-driven task planning and cross-session handoff",
   "type": "module",
   "private": true,
