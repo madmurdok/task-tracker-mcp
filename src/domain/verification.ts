@@ -283,7 +283,6 @@ interface GitRepo {
 
 type GitRepoLookup = { ok: true; repo: GitRepo } | { ok: false; error: string };
 
-/** The repository and worktree `dir` belongs to, or why there is none. */
 /** The reason-text suffix naming declared paths the check could not look at. */
 function externalNote(external: string[]): string {
   return external.length > 0
@@ -296,6 +295,7 @@ function withUnchecked(external: string[]): Pick<VerificationResult, "uncheckedP
   return external.length > 0 ? { uncheckedPaths: external } : {};
 }
 
+/** The repository and worktree `dir` belongs to, or why there is none. */
 function gitRepoOf(dir: string): GitRepoLookup {
   try {
     const [toplevel, commonDir] = execFileSync(
