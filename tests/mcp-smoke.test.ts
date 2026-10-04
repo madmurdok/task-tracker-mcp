@@ -6,6 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
+import { getBoardData } from "../src/domain/board.js";
 import { createServer } from "../src/mcp/server.js";
 
 async function connectedClient(db: DatabaseInstance) {
@@ -218,6 +219,15 @@ describe("MCP server smoke test", () => {
       title: "Ship it",
       complexity_hint: "normal",
     });
+
+    // set_release_details (TTM-79): rename a release that already has a task.
+    const renamed = await call("set_release_details", {
+      project_id,
+      release_id: "1.0",
+      name: "First cut",
+    });
+    expect(renamed).toEqual({ release_id: planReleaseId, version: "1.0", name: "First cut", description: "" });
+    expect(db.prepare("SELECT name FROM releases WHERE id = ?").get(planReleaseId)).toEqual({ name: "First cut" });
 
     const plan = await call("create_plan", {
       project_id,
@@ -439,6 +449,71 @@ describe("MCP server smoke test", () => {
     const duplicate = await call("create_project", { name: "Demo", root_path: "/tmp/other" });
     expect(duplicate.isError).toBe(true);
     expect(duplicate.text).toMatch(/Project name already in use: Demo/);
+  });
+
+  it("set_release_details renames a release with tasks, keeps every other column, and refuses an empty call (TTM-79)", async () => {
+    const client = await connectedClient(db);
+    const callRaw = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      const content = result.content as Array<{ type: string; text: string }>;
+      return { isError: result.isError, text: content[0].text };
+    };
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const { isError, text } = await callRaw(name, args);
+      expect(isError).toBeFalsy();
+      return JSON.parse(text);
+    };
+
+    const { project_id } = await call("create_project", { name: "Demo", root_path: "/tmp/demo" });
+    const { release_id } = await call("create_release", {
+      project_id,
+      version: "0.4.0",
+      name: "TBD",
+      description: "placeholder",
+    });
+    const { task_id } = await call("create_task", {
+      project_id,
+      release_id,
+      title: "already assigned",
+      complexity_hint: "normal",
+    });
+    // Shipped, so status/released_at/release_notes all carry values a stray
+    // write would visibly change.
+    db.prepare(
+      `UPDATE releases SET status = 'released', released_at = '2026-10-01T00:00:00.000Z', release_notes = 'notes' WHERE id = ?`,
+    ).run(release_id);
+    const rowOf = () => db.prepare("SELECT * FROM releases WHERE id = ?").get(release_id) as Record<string, unknown>;
+    const before = rowOf();
+
+    // Extra keys naming frozen columns ride along; none may land.
+    const renamed = await call("set_release_details", {
+      project_id: "Demo",
+      release_id: "0.4.0",
+      name: "Slices",
+      description: null,
+      version: "9.9.9",
+      status: "planned",
+      release_notes: "rewritten",
+      released_at: "1999-01-01T00:00:00.000Z",
+      cancellation_reason: "rewritten",
+      sequence: 999,
+    });
+    expect(renamed).toEqual({ release_id, version: "0.4.0", name: "Slices", description: "" });
+    expect(rowOf()).toEqual({ ...before, name: "Slices", description: "" });
+
+    const { releases } = await call("list_releases", { project_id });
+    expect(releases).toEqual([expect.objectContaining({ id: release_id, name: "Slices", total: 1 })]);
+    const lane = getBoardData(db, project_id).lanes.find((l) => l.release_id === release_id);
+    expect(lane?.release_name).toBe("Slices");
+    expect(lane?.tasks.map((t) => t.id)).toEqual([task_id]);
+
+    const empty = await callRaw("set_release_details", { project_id, release_id });
+    expect(empty.isError).toBe(true);
+    expect(empty.text).toMatch(/set_release_details needs at least one of name or description/);
+    const unknown = await callRaw("set_release_details", { project_id, release_id: "missing", name: "x" });
+    expect(unknown.isError).toBe(true);
+    expect(unknown.text).toMatch(/Unknown release: missing/);
+    expect(rowOf()).toEqual({ ...before, name: "Slices", description: "" });
   });
 
   it("returns a distinct conflict shape for claim_task ownership contention", async () => {
