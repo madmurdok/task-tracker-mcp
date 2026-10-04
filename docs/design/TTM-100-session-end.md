@@ -51,7 +51,7 @@ Update (one statement, one transaction):
 UPDATE tasks SET lock_expires_at = MIN(lock_expires_at, :endedAt)
 WHERE owner_session_id = :sid AND status = 'in_progress'
   AND lock_expires_at IS NOT NULL
-RETURNING id
+RETURNING project_id, task_number   -- returned as task codes (TTM-NN) for the log
 ```
 
 - `:endedAt` = now minus 1 ms, so a `get_next_task` in the same millisecond
@@ -160,7 +160,7 @@ exit 0
 7. DB unavailable (path to a missing file, and to an unreadable/garbage file):
    exit 0, empty stdout/stderr, no DB file created, log line written. Control:
    use `openDatabase` -> a DB file appears; remove the try/catch -> non-zero.
-8. Bad stdin (empty, non-JSON, no session_id): exit 0, log line. 9. Unit: `expireSessionLeases` returns the expired ids; same-id `startSlice`
+8. Bad stdin (empty, non-JSON, no session_id): exit 0, log line. 9. Unit: `expireSessionLeases` returns the expired task codes (not uuids); same-id `startSlice`
    afterwards renews the lease (resume case).
 
 ## Risks
