@@ -1,11 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import { createProject } from "../src/domain/projects.js";
 import { createTask } from "../src/domain/tasks.js";
 import { addDependency } from "../src/domain/dependencies.js";
 import { approvePlan, upsertPlan } from "../src/domain/plans.js";
 import { createRelease } from "../src/domain/releases.js";
-import { setTaskSlices } from "../src/domain/slices.js";
+import { claimTask } from "../src/domain/lifecycle.js";
+import { completeSlice, setTaskSlices, startSlice } from "../src/domain/slices.js";
+import { LOCK_LEASE_MS } from "../src/domain/taskStatus.js";
 import { getNextTask, getProjectStatus, getTaskDetail, listTasks } from "../src/domain/status.js";
 import { addHandoffNote } from "../src/domain/handoffNotes.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
@@ -745,5 +747,155 @@ describe("getTaskDetail", () => {
   it("throws for an unknown task_id", () => {
     const db = openDatabase(":memory:");
     expect(() => getTaskDetail(db, "missing")).toThrow(/Unknown task_id: missing/);
+  });
+});
+
+/**
+ * TTM-78: what a reclaim reports, and which writes leave the lease alone.
+ * Time moves with vi.setSystemTime; leases are written only by the real
+ * writers, so the arithmetic under test is the one that runs.
+ */
+describe("reclaimed_from and the lease (TTM-78)", () => {
+  const T0 = Date.parse("2026-10-04T09:00:00.000Z");
+  const MINUTE = 60 * 1000;
+  const at = (offsetMs: number) => vi.setSystemTime(T0 + offsetMs);
+  const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString();
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    at(0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function leaseOf(db: DatabaseInstance, taskId: string): string | null {
+    return (db.prepare(`SELECT lock_expires_at FROM tasks WHERE id = ?`).get(taskId) as {
+      lock_expires_at: string | null;
+    }).lock_expires_at;
+  }
+
+  /**
+   * "s1" claims at T0, runs its one slice from +10 to +20 min (the last lease
+   * renewal, so the lease runs to +20 min + LOCK_LEASE_MS), optionally leaves a
+   * handoff note at +30 min, then goes silent until a minute past the lease.
+   */
+  function workThenGoSilent(db: DatabaseInstance, task: Task, withNote: boolean): void {
+    claimTask(db, task.id, "s1");
+    at(10 * MINUTE);
+    startSlice(db, `${task.id}/S1`);
+    at(20 * MINUTE);
+    completeSlice(db, `${task.id}/S1`, { status: "done", result: "did it" });
+    if (withNote) {
+      at(30 * MINUTE);
+      addHandoffNote(db, { task_id: task.id, session_id: "s1", decisions: "stopping here" });
+    }
+    at(20 * MINUTE + LOCK_LEASE_MS + MINUTE);
+  }
+
+  /** The approved single-task plan a pickByPlan reclaim needs. */
+  function plannedTask() {
+    const { db, project, release, makeTask } = setupBatch();
+    const task = makeTask("planned");
+    upsertPlan(db, project.id, release.version, { steps: [task.id] });
+    sliceAll(db, task);
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+    return { db, project, release, task };
+  }
+
+  it("reports the previous holder on an unscoped reclaim, with the last slice write as last activity", () => {
+    const { db, project, makeTask } = setup();
+    const task = makeTask("held");
+    sliceAll(db, task);
+    workThenGoSilent(db, task, false);
+
+    const result = getNextTask(db, project.id);
+
+    expect(result.task?.id).toBe(task.id);
+    expect(result.task?.owner_session_id).toBeNull();
+    expect(result).toMatchObject({
+      reclaimed_from: {
+        owner_session_id: "s1",
+        lock_expires_at: iso(20 * MINUTE + LOCK_LEASE_MS),
+        // completed_at, later than the task's updated_at (the claim, at T0):
+        // the slice heartbeat does not touch updated_at.
+        last_activity_at: iso(20 * MINUTE),
+      },
+    });
+  });
+
+  it("counts a handoff note written after the last slice write as the last activity", () => {
+    const { db, project, makeTask } = setup();
+    const task = makeTask("held");
+    sliceAll(db, task);
+    workThenGoSilent(db, task, true);
+
+    const result = getNextTask(db, project.id);
+
+    expect(result).toMatchObject({
+      reclaimed_from: {
+        owner_session_id: "s1",
+        // The note did not renew the lease...
+        lock_expires_at: iso(20 * MINUTE + LOCK_LEASE_MS),
+        // ...but it is the latest sign of a worker.
+        last_activity_at: iso(30 * MINUTE),
+      },
+    });
+  });
+
+  it("reports the same marker when the plan walker reclaims", () => {
+    const { db, project, release, task } = plannedTask();
+    workThenGoSilent(db, task, true);
+
+    const result = getNextTask(db, project.id, release.version);
+
+    expect(result.plan_status).toBe("approved");
+    expect(result.task?.id).toBe(task.id);
+    expect(result.task?.owner_session_id).toBeNull();
+    expect(result).toMatchObject({
+      reclaimed_from: {
+        owner_session_id: "s1",
+        lock_expires_at: iso(20 * MINUTE + LOCK_LEASE_MS),
+        last_activity_at: iso(30 * MINUTE),
+      },
+    });
+  });
+
+  it("reports the marker on a batch's priority-order reclaim (no plan)", () => {
+    const { db, project, release, makeTask } = setupBatch();
+    const task = makeTask("unplanned");
+    sliceAll(db, task);
+    workThenGoSilent(db, task, false);
+
+    const result = getNextTask(db, project.id, release.version);
+
+    expect(result.plan_status).toBe("none");
+    expect(result).toMatchObject({ reclaimed_from: { owner_session_id: "s1" } });
+  });
+
+  it("adds no reclaimed_from key to a fresh hand-out of a pending task, on either path", () => {
+    const { db, project, makeTask } = setup();
+    makeTask("pending");
+    const unscoped = getNextTask(db, project.id);
+    expect(unscoped.task).not.toBeNull();
+    expect("reclaimed_from" in unscoped).toBe(false);
+
+    const planned = plannedTask();
+    const walked = getNextTask(planned.db, planned.project.id, planned.release.version);
+    expect(walked.task?.id).toBe(planned.task.id);
+    expect("reclaimed_from" in walked).toBe(false);
+  });
+
+  it("does not move the lease on add_handoff_note or get_task", () => {
+    const { db, makeTask } = setup();
+    const task = makeTask("held");
+    claimTask(db, task.id, "s1");
+    expect(leaseOf(db, task.id)).toBe(iso(LOCK_LEASE_MS));
+
+    at(60 * MINUTE);
+    addHandoffNote(db, { task_id: task.id, session_id: "s1", decisions: "pausing" });
+    expect(leaseOf(db, task.id)).toBe(iso(LOCK_LEASE_MS));
+    getTaskDetail(db, task.id);
+    expect(leaseOf(db, task.id)).toBe(iso(LOCK_LEASE_MS));
   });
 });

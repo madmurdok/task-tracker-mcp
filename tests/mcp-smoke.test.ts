@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import { getBoardData } from "../src/domain/board.js";
 import { createServer } from "../src/mcp/server.js";
@@ -545,6 +545,48 @@ describe("MCP server smoke test", () => {
       current_owner_session_id: "session-1",
     });
     expect(payload.lock_expires_at).toBeTruthy();
+  });
+
+  it("carries reclaimed_from in get_next_task's JSON only on a reclaim (TTM-78)", async () => {
+    const client = await connectedClient(db);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const result = await client.callTool({ name, arguments: args });
+      expect(result.isError).toBeFalsy();
+      const content = result.content as Array<{ type: string; text: string }>;
+      return JSON.parse(content[0].text);
+    };
+
+    const T0 = Date.parse("2026-10-04T09:00:00.000Z");
+    // Date only: the transport's promises and timers stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(T0);
+      const project = await call("create_project", { name: "Demo", root_path: "/tmp/demo" });
+      const created = await call("create_task", {
+        project_id: project.project_id,
+        title: "Solo task",
+        complexity_hint: "normal",
+      });
+
+      const fresh = await call("get_next_task", { project_id: project.project_id });
+      expect(fresh.task.id).toBe(created.task_id);
+      expect("reclaimed_from" in fresh).toBe(false);
+
+      await call("claim_task", { task_id: created.task_id, session_id: "session-1" });
+      const lease = 2 * 60 * 60 * 1000;
+      vi.setSystemTime(T0 + lease + 60 * 1000);
+
+      const reclaimed = await call("get_next_task", { project_id: project.project_id });
+      expect(reclaimed.task.id).toBe(created.task_id);
+      expect(reclaimed.task.owner_session_id).toBeNull();
+      expect(reclaimed.reclaimed_from).toEqual({
+        owner_session_id: "session-1",
+        lock_expires_at: new Date(T0 + lease).toISOString(),
+        last_activity_at: new Date(T0).toISOString(),
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("returns a distinct verification_failed shape when complete_task's checks don't pass, and force skips them", async () => {

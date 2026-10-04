@@ -2,16 +2,16 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import vm from "node:vm";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import { getBoardData } from "../src/domain/board.js";
 import { addDependency } from "../src/domain/dependencies.js";
 import { createEpic } from "../src/domain/epics.js";
 import { createProject } from "../src/domain/projects.js";
-import { cancelRelease } from "../src/domain/lifecycle.js";
+import { cancelRelease, claimTask } from "../src/domain/lifecycle.js";
 import { approvePlan, upsertPlan } from "../src/domain/plans.js";
 import { createRelease } from "../src/domain/releases.js";
-import { setTaskSlices } from "../src/domain/slices.js";
+import { setTaskSlices, startSlice } from "../src/domain/slices.js";
 import { LOCK_LEASE_MS } from "../src/domain/taskStatus.js";
 import { createTask } from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
@@ -1090,5 +1090,57 @@ describe("board.js Blocked by chips (TTM-97, client-side, via DOM shim)", () => 
     expect(rebuilt).not.toBe(target);
     expect(rebuilt.classList.contains("is-highlighted")).toBe(true);
     expect(rebuilt.scrollIntoViewCalls).toBeUndefined();
+  });
+});
+
+describe("getBoardData stale_since (TTM-78)", () => {
+  const T0 = Date.parse("2026-10-04T09:00:00.000Z");
+  const MINUTE = 60 * 1000;
+  const at = (offsetMs: number) => vi.setSystemTime(T0 + offsetMs);
+  const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString();
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    at(0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function card(db: DatabaseInstance, projectId: string, taskId: string) {
+    return getBoardData(db, projectId)
+      .lanes.flatMap((lane) => lane.tasks)
+      .find((t) => t.id === taskId);
+  }
+
+  it("is the last lease renewal once stale, and null while the lease is live", () => {
+    const { db, project } = setup();
+    const task = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Held",
+      complexity_hint: "normal",
+    }).task;
+    setTaskSlices(db, task.id, [{ phase: "implement", title: "a" }]);
+    claimTask(db, task.id, "holder");
+    at(40 * MINUTE);
+    startSlice(db, `${task.id}/S1`);
+
+    at(40 * MINUTE + LOCK_LEASE_MS - MINUTE);
+    expect(card(db, project.id, task.id)).toMatchObject({ is_stale: false, stale_since: null });
+
+    at(40 * MINUTE + LOCK_LEASE_MS + MINUTE);
+    // The slice start at +40 min, not the claim at T0 nor the lease's expiry.
+    expect(card(db, project.id, task.id)).toMatchObject({ is_stale: true, stale_since: iso(40 * MINUTE) });
+  });
+
+  it("is null on a task that is not in progress", () => {
+    const { db, project } = setup();
+    const task = createTask(db, noopEstimator, {
+      project_id: project.id,
+      title: "Pending",
+      complexity_hint: "normal",
+    }).task;
+    at(10 * LOCK_LEASE_MS);
+    expect(card(db, project.id, task.id)).toMatchObject({ is_stale: false, stale_since: null });
   });
 });

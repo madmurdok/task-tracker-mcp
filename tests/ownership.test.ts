@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openDatabase } from "../src/db/connection.js";
+import { getBoardData } from "../src/domain/board.js";
+import { approvePlan, upsertPlan } from "../src/domain/plans.js";
 import { createProject } from "../src/domain/projects.js";
+import { createRelease } from "../src/domain/releases.js";
+import { completeSlice, setTaskSlices, startSlice } from "../src/domain/slices.js";
+import { LOCK_LEASE_MS } from "../src/domain/taskStatus.js";
 import { createTask } from "../src/domain/tasks.js";
 import { getNextTask } from "../src/domain/status.js";
 import { cancelTask, claimTask, completeTask, releaseTask, TaskConflictError } from "../src/domain/lifecycle.js";
@@ -143,5 +148,144 @@ describe("ownership across sessions (A2 + A3 end to end)", () => {
       lock_expires_at: null,
     });
     abandoned.db.close();
+  });
+});
+
+/**
+ * TTM-78: the lease against the clock. Time is moved with vi.setSystemTime
+ * and the lease is only ever written by the real writers (claim_task and the
+ * slice heartbeats), so the lease arithmetic under test is the one that runs -
+ * no test here writes lock_expires_at.
+ */
+describe("a lease against the clock (TTM-78)", () => {
+  const T0 = Date.parse("2026-10-04T09:00:00.000Z");
+  const MINUTE = 60 * 1000;
+  const at = (offsetMs: number) => vi.setSystemTime(T0 + offsetMs);
+  const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString();
+
+  beforeEach(() => {
+    // Date only: better-sqlite3 is synchronous, nothing here waits on a timer.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    at(0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function holder(db: ReturnType<typeof openDatabase>, taskId: string) {
+    return db.prepare(`SELECT status, owner_session_id FROM tasks WHERE id = ?`).get(taskId) as {
+      status: string;
+      owner_session_id: string | null;
+    };
+  }
+
+  function boardCard(db: ReturnType<typeof openDatabase>, projectId: string, taskId: string) {
+    const card = getBoardData(db, projectId)
+      .lanes.flatMap((lane) => lane.tasks)
+      .find((t) => t.id === taskId);
+    if (!card) throw new Error(`task ${taskId} not on the board`);
+    return card;
+  }
+
+  /**
+   * The acceptance demo: a task held well past the old 30-minute lease, and
+   * past what claim_task's own lease would cover, kept alive only by its slice
+   * writes. `next` is the hand-out under test (unscoped, or one release batch
+   * under an approved plan); the task is its pool's only one, so a pending
+   * task can never mask a reclaim.
+   */
+  function outliveTheLease(
+    db: ReturnType<typeof openDatabase>,
+    projectId: string,
+    taskId: string,
+    next: () => ReturnType<typeof getNextTask>,
+  ) {
+    claimTask(db, taskId, "session-1");
+    startSlice(db, `${taskId}/S1`);
+
+    // Past the old 30-minute lease: a slice is still running.
+    at(31 * MINUTE);
+    expect(boardCard(db, projectId, taskId).is_stale).toBe(false);
+    expect(next().task).toBeNull();
+    completeSlice(db, `${taskId}/S1`, { status: "done", result: "slice 1" });
+    startSlice(db, `${taskId}/S2`);
+
+    // Just under a whole lease after the last slice write - and 30 minutes
+    // past the lease claim_task granted at T0, so only the renewal holds it.
+    at(31 * MINUTE + LOCK_LEASE_MS - MINUTE);
+    expect(T0 + 31 * MINUTE + LOCK_LEASE_MS - MINUTE).toBeGreaterThan(T0 + LOCK_LEASE_MS);
+    const card = boardCard(db, projectId, taskId);
+    expect(card.is_stale).toBe(false);
+    expect(card.stale_since).toBeNull();
+    expect(next().task).toBeNull();
+    expect(holder(db, taskId)).toEqual({ status: "in_progress", owner_session_id: "session-1" });
+
+    // The same task, silent for a whole lease, is stale and reclaimed - so the
+    // two checks above are not passing because staleness never fires.
+    at(31 * MINUTE + LOCK_LEASE_MS + MINUTE);
+    expect(boardCard(db, projectId, taskId).is_stale).toBe(true);
+    const reclaimed = next();
+    expect(reclaimed.task?.id).toBe(taskId);
+    expect(reclaimed).toMatchObject({ reclaimed_from: { owner_session_id: "session-1" } });
+  }
+
+  it("keeps a task whose slices outlast the old lease held, unscoped", () => {
+    const { db, project, task } = setup();
+    setTaskSlices(db, task.id, [
+      { phase: "implement", title: "slice 1" },
+      { phase: "verify", title: "slice 2" },
+    ]);
+
+    outliveTheLease(db, project.id, task.id, () => getNextTask(db, project.id));
+  });
+
+  it("keeps a task whose slices outlast the old lease held, walking an approved plan", () => {
+    const db = openDatabase(":memory:");
+    const project = createProject(db, { name: "Demo", root_path: "/tmp/demo" });
+    const release = createRelease(db, { project_id: project.id, version: "0.1" });
+    const { task } = createTask(db, noopEstimator, {
+      project_id: project.id,
+      release_id: release.id,
+      title: "Long task",
+      complexity_hint: "normal",
+    });
+    upsertPlan(db, project.id, release.version, { steps: [task.id] });
+    setTaskSlices(db, task.id, [
+      { phase: "implement", title: "slice 1" },
+      { phase: "verify", title: "slice 2" },
+    ]);
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+
+    outliveTheLease(db, project.id, task.id, () => {
+      const result = getNextTask(db, project.id, release.version);
+      // Still the plan walker answering, not a refusal that also returns null.
+      expect(result.plan_status).toBe("approved");
+      return result;
+    });
+  });
+
+  it("hands a genuinely dead session's task to a new session once the lease lapses, and not before", () => {
+    const { db, project, task } = setup();
+    getNextTask(db, project.id);
+    claimTask(db, task.id, "session-1");
+    // session-1 dies here: no slice write, no release, nothing after the claim.
+
+    // A worker that never heartbeats is held for the whole lease, no less
+    // than the 30 minutes it used to get.
+    at(LOCK_LEASE_MS - MINUTE);
+    expect(() => claimTask(db, task.id, "session-2")).toThrow(TaskConflictError);
+    expect(boardCard(db, project.id, task.id).is_stale).toBe(false);
+    expect(holder(db, task.id).owner_session_id).toBe("session-1");
+
+    at(LOCK_LEASE_MS + MINUTE);
+    expect(boardCard(db, project.id, task.id)).toMatchObject({ is_stale: true, stale_since: iso(0) });
+    expect(() => claimTask(db, task.id, "session-2")).not.toThrow();
+    expect(
+      db.prepare(`SELECT status, owner_session_id, lock_expires_at FROM tasks WHERE id = ?`).get(task.id),
+    ).toEqual({
+      status: "in_progress",
+      owner_session_id: "session-2",
+      lock_expires_at: iso(2 * LOCK_LEASE_MS + MINUTE),
+    });
   });
 });
