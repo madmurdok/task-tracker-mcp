@@ -254,3 +254,72 @@ export function setReleaseSequence(
   const release = requireRelease(db, project.id, releaseRef);
   db.prepare(`UPDATE releases SET sequence = ? WHERE id = ?`).run(sequence, release.id);
 }
+
+export interface SetReleaseDetailsInput {
+  project_id: string;
+  release_id: string;
+  /** Omitted leaves the name as is; null or "" clears it to "". */
+  name?: string | null;
+  /** Omitted leaves the description as is; null or "" clears it to "". */
+  description?: string | null;
+}
+
+/**
+ * Renames a release and/or rewrites its description - the only two release
+ * fields createRelease writes that had no way to change afterwards, so a
+ * placeholder name given at creation was permanent.
+ *
+ * One setter for both fields rather than one per field, and still not a
+ * general "update_release". The set_task_priority precedent (its own
+ * single-purpose tool rather than a general "update_task") and setDesignDoc
+ * (projects.ts) both argue for a setter scoped to exactly the fields a
+ * problem needs, excluding every field whose change carries a cost a general
+ * setter would hide. Here the problem needs two fields, and they carry the
+ * same (zero) cost: both are free-text labels that nothing resolves by,
+ * nothing derives from and no invariant constrains. Two tools would be
+ * identical twins differing only in a column name. Every other column stays
+ * out, each for its own reason:
+ * - `version` is an identifier: unique per project, accepted in place of the
+ *   id by every release_id argument, and the name of a release branch and a
+ *   bumped manifest outside this database.
+ * - `status`, `released_at`, `release_notes` and `cancellation_reason` are
+ *   owned by the lifecycle (releaseIt, cancelRelease), which set them once,
+ *   together, behind their own gates.
+ * - `sequence` has its own setter, setReleaseSequence.
+ * The UPDATE below names its two columns literally rather than building a
+ * column list from the input, so no input shape can reach any other column.
+ *
+ * Not blocked by `released` or `cancelled` status, unlike
+ * requireAssignableRelease's freeze. That freeze protects task *membership*,
+ * because release_notes were generated from exactly the tasks in the release
+ * at release_it time; the notes are built from task titles and summaries
+ * only, never from the release's name or description, so relabelling a past
+ * release cannot drift them. And the motivating case - a placeholder name
+ * that should have been a real one, or left empty - is no less wrong on a
+ * release that has already shipped or been abandoned.
+ *
+ * Clearing is allowed: null and "" both store "" (the columns are NOT NULL
+ * DEFAULT '', the same value createRelease stores for an omitted field),
+ * since "a real name or none" makes "none" a legitimate target. Passing
+ * neither field is refused rather than treated as a no-op, as it is almost
+ * certainly a caller mistake.
+ */
+export function setReleaseDetails(db: DatabaseInstance, input: SetReleaseDetailsInput): Release {
+  if (input.name === undefined && input.description === undefined) {
+    throw new Error("set_release_details needs at least one of name or description");
+  }
+  const project = requireProject(db, input.project_id);
+  const release = requireRelease(db, project.id, input.release_id);
+
+  const name = input.name === undefined ? release.name : (input.name ?? "");
+  const description =
+    input.description === undefined ? release.description : (input.description ?? "");
+
+  db.prepare(`UPDATE releases SET name = ?, description = ? WHERE id = ?`).run(
+    name,
+    description,
+    release.id,
+  );
+
+  return { ...release, name, description };
+}
