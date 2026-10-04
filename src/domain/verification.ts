@@ -6,6 +6,12 @@ import path from "node:path";
 export interface VerificationResult {
   passed: boolean;
   reason: string;
+  /**
+   * Declared paths the check could not look at (outside the project's git
+   * repository). Set only when non-empty, so a caller that reports only
+   * failures can still tell a pass apart from "all verified".
+   */
+  uncheckedPaths?: string[];
 }
 
 export interface CompletionVerificationInput {
@@ -63,23 +69,35 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
   }: CompletionVerificationInput): VerificationResult {
     // Declared paths outside the repository pass through unchecked; the
     // passing verdict still names them so nobody reads it as "all verified".
-    let uncheckedNote = "";
+    let uncheckedPaths: string[] = [];
     if (filePaths.length > 0) {
       const fileCheck = this.checkFilesChanged(
         rootPath,
         filePaths,
         changesSinceIso,
       );
-      if (!fileCheck.passed) return { passed: false, reason: fileCheck.reason };
-      uncheckedNote = fileCheck.uncheckedNote;
+      if (!fileCheck.passed) {
+        return {
+          passed: false,
+          reason: fileCheck.reason,
+          ...withUnchecked(fileCheck.external),
+        };
+      }
+      uncheckedPaths = fileCheck.external;
     }
 
     if (testCommand) {
       const testCheck = this.runTestCommand(rootPath, testCommand);
-      if (!testCheck.passed) return testCheck;
+      if (!testCheck.passed) {
+        return { ...testCheck, ...withUnchecked(uncheckedPaths) };
+      }
     }
 
-    return { passed: true, reason: `verification passed${uncheckedNote}` };
+    return {
+      passed: true,
+      reason: `verification passed${externalNote(uncheckedPaths)}`,
+      ...withUnchecked(uncheckedPaths),
+    };
   }
 
   /**
@@ -125,14 +143,14 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
     rootPath: string,
     filePaths: string[],
     changesSinceIso: string | undefined,
-  ): VerificationResult & { uncheckedNote: string } {
+  ): VerificationResult & { external: string[] } {
     const root = gitRepoOf(rootPath);
     if (!root.ok) {
       // Not a git repo, git missing: a verdict, never a throw.
       return {
         passed: false,
         reason: `could not check git status: ${root.error}`,
-        uncheckedNote: "",
+        external: [],
       };
     }
 
@@ -141,10 +159,7 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
       root.repo,
       filePaths,
     );
-    const externalNote =
-      external.length > 0
-        ? `; not checked, outside the project's git repository: ${external.join(", ")}`
-        : "";
+    const note = externalNote(external);
 
     if (groups.size === 0) {
       return {
@@ -152,7 +167,7 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
         reason:
           `none of this task's declared files are inside the project's git repository ` +
           `(${rootPath}), so none could be checked: ${external.join(", ")}`,
-        uncheckedNote: externalNote,
+        external,
       };
     }
 
@@ -177,15 +192,15 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
         return {
           passed: false,
           reason: `could not check git status: ${error instanceof Error ? error.message : String(error)}`,
-          uncheckedNote: externalNote,
+          external,
         };
       }
 
       if (status.trim().length > 0) {
         return {
           passed: true,
-          reason: `changes detected in declared files (uncommitted)${externalNote}`,
-          uncheckedNote: externalNote,
+          reason: `changes detected in declared files (uncommitted)${note}`,
+          external,
         };
       }
 
@@ -200,15 +215,15 @@ export class GitDiffCompletionVerifier implements CompletionVerifier {
     if (committedMatch) {
       return {
         passed: true,
-        reason: `changes detected in declared files (committed since the task was created)${externalNote}`,
-        uncheckedNote: externalNote,
+        reason: `changes detected in declared files (committed since the task was created)${note}`,
+        external,
       };
     }
 
     return {
       passed: false,
-      reason: `no changes detected in this task's declared files${externalNote}`,
-      uncheckedNote: externalNote,
+      reason: `no changes detected in this task's declared files${note}`,
+      external,
     };
   }
 
@@ -269,6 +284,18 @@ interface GitRepo {
 type GitRepoLookup = { ok: true; repo: GitRepo } | { ok: false; error: string };
 
 /** The repository and worktree `dir` belongs to, or why there is none. */
+/** The reason-text suffix naming declared paths the check could not look at. */
+function externalNote(external: string[]): string {
+  return external.length > 0
+    ? `; not checked, outside the project's git repository: ${external.join(", ")}`
+    : "";
+}
+
+/** `uncheckedPaths` only when there are any, so the result stays compact. */
+function withUnchecked(external: string[]): Pick<VerificationResult, "uncheckedPaths"> {
+  return external.length > 0 ? { uncheckedPaths: external } : {};
+}
+
 function gitRepoOf(dir: string): GitRepoLookup {
   try {
     const [toplevel, commonDir] = execFileSync(

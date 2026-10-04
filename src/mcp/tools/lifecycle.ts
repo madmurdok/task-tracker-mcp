@@ -111,7 +111,7 @@ export function registerLifecycleTools(
     "complete_task",
     {
       description:
-        "Mark a task done and report which dependent tasks are now unblocked. Refuses with error:'open_slices' while any of the task's slices (see set_task_slices) is still pending or in_progress, naming each one (`S2 \"title\" (pending)`) - complete, fail or skip them first. Verifies the task's declared files actually changed (and runs test_command, if given) before accepting the completion. Pass force to skip both the open-slices guard and verification. Accepts a task's uuid or its code (`TTM-63`).",
+        "Mark a task done and report which dependent tasks are now unblocked. Refuses with error:'open_slices' while any of the task's slices (see set_task_slices) is still pending or in_progress, naming each one (`S2 \"title\" (pending)`) - complete, fail or skip them first. Verifies the task's declared files actually changed (and runs test_command, if given) before accepting the completion. Declared paths outside the project's git repository cannot be checked: a passing completion then lists them in unverified_paths (the field is absent otherwise). Pass force to skip both the open-slices guard and verification. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         summary: z.string().optional(),

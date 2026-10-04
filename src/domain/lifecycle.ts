@@ -168,6 +168,12 @@ export function releaseTask(db: DatabaseInstance, input: ReleaseTaskInput): void
 
 export interface CompleteTaskResult {
   unblocked_task_ids: string[];
+  /**
+   * Declared paths verification passed without checking (outside the
+   * project's git repository). Present only when non-empty; absent on a
+   * forced completion, which runs no verification at all.
+   */
+  unverified_paths?: string[];
 }
 
 export interface CompleteTaskInput {
@@ -225,6 +231,7 @@ export function completeTask(
     throw new Error(`Unknown task_id: ${taskId}`);
   }
 
+  let unverifiedPaths: string[] = [];
   if (!force) {
     // Before verification, not after: it is free, and verification may run a
     // test_command that would be wasted on a completion refused anyway.
@@ -261,6 +268,7 @@ export function completeTask(
         result.reason,
       );
     }
+    unverifiedPaths = result.uncheckedPaths ?? [];
   }
 
   const run = db.transaction((): CompleteTaskResult => {
@@ -286,7 +294,10 @@ export function completeTask(
       `UPDATE tasks SET status = 'done', completion_summary = ?, lock_expires_at = NULL, updated_at = ? WHERE id = ?`,
     ).run(summary ?? null, new Date().toISOString(), taskId);
 
-    return { unblocked_task_ids: findUnblockedDependents(db, taskId) };
+    return {
+      unblocked_task_ids: findUnblockedDependents(db, taskId),
+      ...(unverifiedPaths.length > 0 ? { unverified_paths: unverifiedPaths } : {}),
+    };
   });
 
   return run();
