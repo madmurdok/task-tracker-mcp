@@ -1,6 +1,25 @@
 # TTM-78: a lease that outlives long tasks
 
-Status: design, awaiting approval. Branch `fix/TTM-78-lease-outlives-long-tasks`.
+Status: approved with changes by the owner, 2026-10-04 (see "Owner decision").
+Branch `fix/TTM-78-lease-outlives-long-tasks`.
+
+## Owner decision (2026-10-04)
+
+1. Reclaim: **R1, not R2** - keep automatic reclaim, but mark it so the
+   receiving agent checks before continuing ("выдача с пометкой чтобы агент
+   проверил"). get_next_task's answer for a reclaimed task carries
+   `reclaimed_from: { owner_session_id, lock_expires_at, last_activity_at }`
+   and the tool description tells the caller to confirm the previous holder is
+   gone (its agent finished or died, its branch idle) before working on it.
+   Both paths (unscoped and plan walker) report it the same way; their
+   ordering difference stays and stays documented in `pickByPlan`.
+2. Lease 2 h: accepted.
+3. `add_handoff_note` does not renew: accepted.
+4. A SessionEnd hook that releases a session's tasks: a separate task, in this
+   batch, after TTM-78.
+
+Sections below that describe R2 (`reclaimable`, no silent reclaim) are
+superseded by point 1.
 
 ## Problem
 
