@@ -12,6 +12,7 @@ import { cancelRelease } from "../src/domain/lifecycle.js";
 import { approvePlan, upsertPlan } from "../src/domain/plans.js";
 import { createRelease } from "../src/domain/releases.js";
 import { setTaskSlices } from "../src/domain/slices.js";
+import { LOCK_LEASE_MS } from "../src/domain/taskStatus.js";
 import { createTask } from "../src/domain/tasks.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 
@@ -301,7 +302,7 @@ describe("getBoardData", () => {
       stale.id,
     );
     db.prepare(`UPDATE tasks SET status = 'in_progress', lock_expires_at = ? WHERE id = ?`).run(
-      new Date(now.getTime() + 30 * 60 * 1000).toISOString(),
+      new Date(now.getTime() + LOCK_LEASE_MS).toISOString(),
       fresh.id,
     );
 
@@ -998,6 +999,7 @@ describe("board.js Blocked by chips (TTM-97, client-side, via DOM shim)", () => 
       epic_name: null,
       owner_session_id: null,
       is_stale: false,
+      stale_since: null,
       task_number: 5,
       slices: [],
       blocked_by: blockedBy,

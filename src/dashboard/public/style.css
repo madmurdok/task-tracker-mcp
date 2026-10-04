@@ -695,8 +695,8 @@ a {
 }
 
 /* is-stale is independent of status (only ever paired with in_progress) -
-   an in_progress card whose lock lease has already expired, about to be
-   auto-reclaimed by the next get_next_task call. */
+   an in_progress card with no lease-renewing activity for a whole lease
+   (2 h), which the next get_next_task may reclaim. A signal, not a verdict. */
 .card.is-stale {
   border-color: var(--warning);
   background: var(--warning-bg);
