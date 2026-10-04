@@ -62,6 +62,7 @@ describe("MCP server smoke test", () => {
         "create_project",
         "list_projects",
         "check_doc_sync",
+        "set_design_doc",
         "create_epic",
         "list_epics",
         "get_epic_status",
