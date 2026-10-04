@@ -28,7 +28,9 @@ export const LOCK_LEASE_MS = 2 * 60 * 60 * 1000;
  *
  * Guarded to `status = 'in_progress' AND lock_expires_at IS NOT NULL`: it
  * never creates a lease on a row without one (a legacy NULL-lease row stays
- * as it was) and never touches a pending, done or cancelled task. It does
+ * as it was; SQLite's MAX(NULL, x) is NULL too, so the guard states the intent
+ * rather than being the only thing enforcing it) and never touches a pending,
+ * done or cancelled task. It does
  * renew a lease that already lapsed: activity after a lapse proves the worker
  * is alive (a resumed session). Owner is left as it is.
  *
