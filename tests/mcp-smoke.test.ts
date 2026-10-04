@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -111,6 +112,14 @@ describe("MCP server smoke test", () => {
       design_doc_path: null,
       stored_hash: null,
       current_hash: null,
+    });
+
+    // Clearing an already-untracked project is a valid no-op; the full
+    // set/clear round trip against a real file has its own test below.
+    expect(await call("set_design_doc", { project_id: "Demo", design_doc_path: null })).toEqual({
+      project_id,
+      design_doc_path: null,
+      design_doc_hash: null,
     });
 
     const { epic_id } = await call("create_epic", { project_id, name: "Auth rework" });
@@ -352,6 +361,65 @@ describe("MCP server smoke test", () => {
     const result = await client.callTool({ name: "list_projects", arguments: {} });
     const content = result.content as Array<{ type: string; text: string }>;
     expect(JSON.parse(content[0].text)).toEqual({ projects: [] });
+  });
+
+  it("set_design_doc tracks a doc on a project created without one, clears it, and refuses bad paths", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "ttmcp-smoke-setdoc-"));
+    try {
+      writeFileSync(path.join(dir, "design.md"), "# Design\n");
+      const client = await connectedClient(db);
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const result = await client.callTool({ name, arguments: args });
+        const content = result.content as Array<{ type: string; text: string }>;
+        return { isError: result.isError, text: content[0].text };
+      };
+      const ok = async (name: string, args: Record<string, unknown>) => {
+        const result = await call(name, args);
+        expect(result.isError).toBeFalsy();
+        return JSON.parse(result.text);
+      };
+
+      const { project_id } = await ok("create_project", { name: "Late doc", root_path: dir });
+      expect(await ok("check_doc_sync", { project_id })).toMatchObject({ tracked: false });
+
+      const expectedHash = createHash("sha256").update("# Design\n").digest("hex");
+      expect(await ok("set_design_doc", { project_id, design_doc_path: "design.md" })).toEqual({
+        project_id,
+        design_doc_path: "design.md",
+        design_doc_hash: expectedHash,
+      });
+      expect(await ok("check_doc_sync", { project_id: "Late doc" })).toEqual({
+        tracked: true,
+        in_sync: true,
+        design_doc_path: "design.md",
+        stored_hash: expectedHash,
+        current_hash: expectedHash,
+      });
+
+      const unreadable = await call("set_design_doc", { project_id, design_doc_path: "missing.md" });
+      expect(unreadable.isError).toBe(true);
+      expect(unreadable.text).toContain(`Design doc not readable: ${path.resolve(dir, "missing.md")}`);
+
+      const empty = await call("set_design_doc", { project_id, design_doc_path: "" });
+      expect(empty.isError).toBe(true);
+      expect(empty.text).toMatch(/design_doc_path/);
+
+      // Neither refusal touched the stored doc.
+      expect(await ok("check_doc_sync", { project_id })).toMatchObject({
+        tracked: true,
+        design_doc_path: "design.md",
+        stored_hash: expectedHash,
+      });
+
+      expect(await ok("set_design_doc", { project_id, design_doc_path: null })).toEqual({
+        project_id,
+        design_doc_path: null,
+        design_doc_hash: null,
+      });
+      expect(await ok("check_doc_sync", { project_id })).toMatchObject({ tracked: false });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("rejects an unknown project ref and a duplicate project name with isError", async () => {
