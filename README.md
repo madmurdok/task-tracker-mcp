@@ -54,6 +54,17 @@ npm run status                        # list every registered project
 npm run status <project_id_or_name>   # that project's status + full task list
 ```
 
+## SessionEnd hook CLI
+
+`dist/cli/session-end.js` (bin `task-tracker-session-end`) is meant to run as a
+Claude Code `SessionEnd` hook: it reads the hook's JSON from stdin and expires
+the leases of the `in_progress` tasks the ending `session_id` owns, so the next
+`get_next_task` reclaims them (with `reclaimed_from`) instead of waiting out the
+2 h lease. It writes nothing to stdout/stderr, always exits 0, and appends one
+line per run to `session-end-YYYY-MM.log` beside the DB. Installing the hook
+(script + `~/.claude/settings.json` entry) is a manual, owner-approved step; see
+`docs/design/TTM-100-session-end.md` section 5.
+
 ## Dashboard
 
 Read-only, live-updating web view of a project's task graph — a project

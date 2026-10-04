@@ -120,6 +120,12 @@ graph TD
   file directly and calls the same domain functions (`getProjectStatus`,
   `listTasks`) the MCP tools use, so a human can eyeball progress without going
   through Claude or the MCP transport at all.
+- **SessionEnd CLI** (`src/cli/session-end.ts`) — run by a Claude Code
+  `SessionEnd` hook; opens the existing SQLite file without migrating it and
+  calls `expireSessionLeases`, which moves the ending session's `in_progress`
+  leases to "lapsed now" (owner and `updated_at` kept) so the TTM-78 reclaim
+  path picks them up. Silent, always exit 0, one line per run in
+  `session-end-YYYY-MM.log`. See `docs/design/TTM-100-session-end.md`.
 - **SQLite** — single file, WAL mode (safe concurrent reads, serialized writes).
 
 ## Data Flow
