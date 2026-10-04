@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseInstance } from "../db/connection.js";
 import { requireTask, runOne, taskCode, withCode, type Task } from "./tasks.js";
-import { hasUnmetDependencies, LOCK_LEASE_MS } from "./taskStatus.js";
+import { hasUnmetDependencies, LOCK_LEASE_MS, renewLease } from "./taskStatus.js";
 
 /**
  * How one task is worked (TTM-83): an ordered list of slices, each with a
@@ -324,6 +324,8 @@ function refuseFinishedTask(task: Task, code: string, verb: string): void {
  *   of it ran, so no label of it can be a record of anything yet.
  * - Refused on a done or cancelled task: its slicing is the record of how it
  *   was worked, and rewriting it afterwards would erase that record.
+ * - Renews an in_progress task's lease (renewLease, TTM-78), as
+ *   revise_task_slices, start_slice and complete_slice do.
  */
 export function setTaskSlices(
   db: DatabaseInstance,
@@ -344,8 +346,10 @@ export function setTaskSlices(
       );
     }
 
+    const now = new Date().toISOString();
     db.prepare(`DELETE FROM task_slices WHERE task_id = ?`).run(task.id);
-    insertSlices(db, task.id, rows, 1, new Date().toISOString());
+    insertSlices(db, task.id, rows, 1, now);
+    renewLease(db, task.id, now);
 
     return { task_id: task.id, code, slices: slicesFor(db, task) };
   });
@@ -422,6 +426,7 @@ export function reviseTaskSlices(
     const now = new Date().toISOString();
     db.prepare(`DELETE FROM task_slices WHERE task_id = ? AND status = 'pending'`).run(task.id);
     insertSlices(db, task.id, rows, firstLabel, now);
+    renewLease(db, task.id, now);
 
     const revision: TaskSliceRevision = {
       id: randomUUID(),
@@ -463,8 +468,9 @@ export function reviseTaskSlices(
  * true by construction. The cost is that start_slice now writes the task row,
  * so it applies claim_task's gate first: a pending task with unmet
  * dependencies is refused, slice and task both left untouched, rather than
- * started ahead of its prerequisite. An `in_progress` task is not touched (its
- * holder and lease stay as they are), nor is a done/cancelled one.
+ * started ahead of its prerequisite. An `in_progress` task keeps its holder
+ * and has its lease renewed (renewLease, TTM-78); a done/cancelled one is not
+ * touched.
  */
 export function startSlice(db: DatabaseInstance, sliceRef: string): TaskSlice {
   const slice = requireSlice(db, sliceRef);
@@ -486,6 +492,8 @@ export function startSlice(db: DatabaseInstance, sliceRef: string): TaskSlice {
       db.prepare(
         `UPDATE tasks SET status = 'in_progress', lock_expires_at = ?, updated_at = ? WHERE id = ? AND status = 'pending'`,
       ).run(lockExpiresAt, now, slice.task_id);
+    } else {
+      renewLease(db, slice.task_id, now);
     }
     runOne(
       db.prepare(
@@ -510,6 +518,8 @@ export function startSlice(db: DatabaseInstance, sliceRef: string): TaskSlice {
  * work that ran, and started_at is half of its duration. skipped is also
  * accepted straight from pending: a slice that never ran is the normal case
  * for a skip.
+ *
+ * Renews the task's lease (renewLease, TTM-78) in the same transaction.
  */
 export function completeSlice(db: DatabaseInstance, sliceRef: string, input: CompleteSliceInput): TaskSlice {
   const slice = requireSlice(db, sliceRef);
@@ -524,21 +534,25 @@ export function completeSlice(db: DatabaseInstance, sliceRef: string, input: Com
   }
 
   const now = new Date().toISOString();
-  runOne(
-    db.prepare(
-      `UPDATE task_slices
-       SET status = ?, result = ?, artifacts = ?, metrics = ?, completed_at = ?, updated_at = ?
-       WHERE id = ? AND status = ?`,
-    ),
-    `complete_slice ${sliceRef}`,
-    input.status,
-    input.result,
-    JSON.stringify(input.artifacts ?? []),
-    input.metrics === undefined ? null : JSON.stringify(input.metrics),
-    now,
-    now,
-    slice.id,
-    slice.status,
-  );
+  const run = db.transaction(() => {
+    runOne(
+      db.prepare(
+        `UPDATE task_slices
+         SET status = ?, result = ?, artifacts = ?, metrics = ?, completed_at = ?, updated_at = ?
+         WHERE id = ? AND status = ?`,
+      ),
+      `complete_slice ${sliceRef}`,
+      input.status,
+      input.result,
+      JSON.stringify(input.artifacts ?? []),
+      input.metrics === undefined ? null : JSON.stringify(input.metrics),
+      now,
+      now,
+      slice.id,
+      slice.status,
+    );
+    renewLease(db, slice.task_id, now);
+  });
+  run();
   return requireSlice(db, slice.id);
 }

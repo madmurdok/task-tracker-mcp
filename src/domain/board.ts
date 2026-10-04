@@ -4,7 +4,7 @@ import { getPlan, type PlanStatus } from "./plans.js";
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, type ReleaseStatus } from "./releases.js";
 import { listSlicesForTasks, type SlicePhase, type SliceStatus } from "./slices.js";
-import { displayStatus, UNMET_DEPENDENCY_SQL, type DisplayStatus } from "./taskStatus.js";
+import { displayStatus, LOCK_LEASE_MS, UNMET_DEPENDENCY_SQL, type DisplayStatus } from "./taskStatus.js";
 import { taskCode, type Task } from "./tasks.js";
 
 /**
@@ -37,6 +37,15 @@ export interface BoardTask {
   epic_name: string | null;
   owner_session_id: string | null;
   is_stale: boolean;
+  /**
+   * When the stale lock's lease was last granted or renewed (TTM-78):
+   * `lock_expires_at - LOCK_LEASE_MS`, i.e. the last hand-out, claim or slice
+   * write. Set only when `is_stale`, null otherwise. Derived from the task row
+   * rather than a per-task activity query, so it ignores the writes that do not
+   * renew a lease (add_handoff_note, amend_task) - the card reads it as "no
+   * activity since", meaning no lease-renewing activity.
+   */
+  stale_since: string | null;
   task_number: number;
   // Step/position order, same as listTaskSlices; [] for an unsliced task.
   // The dialog re-groups this by phase then step client-side (see board.js).
@@ -127,11 +136,12 @@ export interface BoardData {
 }
 
 /**
- * A task is "stale" once its lock has outlived the 30-minute lease
- * (LOCK_LEASE_MS in status.ts) but the session that held it never came back
- * to complete/split/release it - the same condition get_next_task's
- * reclaim logic checks, surfaced here as an early visual signal instead of
- * waiting for the next get_next_task call to silently reassign it.
+ * A task is "stale" once its lock has gone a whole lease (LOCK_LEASE_MS in
+ * taskStatus.ts, 2 h) with no tracker activity that renews it - no hand-out,
+ * claim or slice write (TTM-78). It is the same condition get_next_task's
+ * reclaim checks, surfaced early. A signal for a human, not a verdict: elapsed
+ * time cannot tell a dead session from a paused one (usage limit, overnight,
+ * waiting on the owner), which is also why a reclaim carries reclaimed_from.
  */
 function isStale(task: Task, nowIso: string): boolean {
   return task.status === "in_progress" && task.lock_expires_at !== null && task.lock_expires_at < nowIso;
@@ -241,6 +251,9 @@ export function getBoardData(db: DatabaseInstance, projectRef: string): BoardDat
       epic_name: task.epic_id ? (epicNameById.get(task.epic_id) ?? null) : null,
       owner_session_id: task.owner_session_id,
       is_stale: isStale(task, nowIso),
+      stale_since: isStale(task, nowIso)
+        ? new Date(Date.parse(task.lock_expires_at!) - LOCK_LEASE_MS).toISOString()
+        : null,
       task_number: task.task_number,
       slices: (slicesByTaskId.get(task.id) ?? []).map((slice) => ({
         id: slice.id,

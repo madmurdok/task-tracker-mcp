@@ -61,8 +61,36 @@ export interface ProjectStatus {
  */
 export type ReportedPlanStatus = PlanStatus | "drifted" | "none";
 
+/**
+ * The previous holder of a task get_next_task just reclaimed (TTM-78), read
+ * before the hand-out cleared it. Reclaim is automatic and runs on elapsed
+ * time alone, which cannot tell a dead session from a paused one (usage limit,
+ * overnight, waiting on the owner) - so the answer says it happened and leaves
+ * the receiver to confirm the previous holder is gone before working on it.
+ *
+ * `last_activity_at` is the latest tracker write about the task: its own
+ * `updated_at`, its slices' `created_at`/`started_at`/`completed_at`, and its
+ * handoff notes' `created_at`. The slice stamps are included because
+ * renewLease (the slice heartbeat) deliberately leaves `updated_at` alone, so
+ * `updated_at` by itself would miss exactly the activity that keeps a lease
+ * alive; `created_at` covers set/revise_task_slices, which renew it too.
+ * Handoff notes do not renew the lease but are counted: a note written after
+ * the last slice event is still a sign of a worker. Never null - `updated_at`
+ * is always set.
+ */
+export interface ReclaimedFrom {
+  owner_session_id: string | null;
+  lock_expires_at: string;
+  last_activity_at: string;
+}
+
 type NextTaskOutcome =
-  | { task: TaskDetail }
+  /**
+   * `reclaimed_from` only when the task was in_progress under a lapsed lease;
+   * absent (no key) on a fresh hand-out of a pending task, so that answer stays
+   * exactly what it always was.
+   */
+  | { task: TaskDetail; reclaimed_from?: ReclaimedFrom }
   | { task: null; reason: "all_done" }
   | { task: null; reason: "all_blocked"; blocked_on: string[] }
   /**
@@ -148,12 +176,46 @@ function handOut(
   candidate: Task,
   nowIso: string,
   ownerSessionId: string | null,
-): NextTaskOutcome {
+): { task: TaskDetail } {
   const lockExpiresAt = withLease(nowIso);
   db.prepare(
     `UPDATE tasks SET status = 'in_progress', owner_session_id = ?, lock_expires_at = ?, updated_at = ? WHERE id = ?`,
   ).run(ownerSessionId, lockExpiresAt, nowIso, candidate.id);
   return { task: getTaskDetail(db, candidate.id) };
+}
+
+/** See `ReclaimedFrom` for which writes count as activity. */
+function lastActivityAt(db: DatabaseInstance, task: Task): string {
+  // Every timestamp here is `toISOString()` output (fixed-width UTC), so MAX
+  // over the strings is the chronological maximum. Aggregate MAX skips the
+  // NULL started_at/completed_at of slices not yet run.
+  const row = db
+    .prepare(
+      `SELECT MAX(t) AS last FROM (
+         SELECT created_at AS t FROM task_slices WHERE task_id = ?
+         UNION ALL SELECT started_at FROM task_slices WHERE task_id = ?
+         UNION ALL SELECT completed_at FROM task_slices WHERE task_id = ?
+         UNION ALL SELECT created_at FROM handoff_notes WHERE task_id = ?
+       )`,
+    )
+    .get(task.id, task.id, task.id, task.id) as { last: string | null };
+  return row.last !== null && row.last > task.updated_at ? row.last : task.updated_at;
+}
+
+/**
+ * Hands out an in_progress task whose lease has lapsed, with the owner cleared,
+ * and reports who held it. The one reclaim path for both selection strategies,
+ * so the two report it identically. `task` is the row as read before the
+ * hand-out: handOut overwrites its owner, lease and updated_at.
+ */
+function reclaim(db: DatabaseInstance, task: Task, nowIso: string): NextTaskOutcome {
+  const reclaimedFrom: ReclaimedFrom = {
+    owner_session_id: task.owner_session_id,
+    // Non-null: both callers select only tasks whose lease is set and lapsed.
+    lock_expires_at: task.lock_expires_at!,
+    last_activity_at: lastActivityAt(db, task),
+  };
+  return { ...handOut(db, task, nowIso, null), reclaimed_from: reclaimedFrom };
 }
 
 /**
@@ -214,8 +276,9 @@ function pickByPriority(db: DatabaseInstance, scope: HandOutScope, nowIso: strin
     }
   }
 
-  // No fresh pending work - see if an in_progress task's lock has expired
-  // (its session died or never completed) and can be automatically reclaimed.
+  // No fresh pending work - see if an in_progress task's lock has expired and
+  // can be automatically reclaimed. Its session may have died, or only paused
+  // (elapsed time cannot tell which), so the answer carries reclaimed_from.
   const reclaimable = db
     .prepare(
       `SELECT * FROM tasks
@@ -227,7 +290,7 @@ function pickByPriority(db: DatabaseInstance, scope: HandOutScope, nowIso: strin
     .get(scope.id, nowIso) as Task | undefined;
 
   if (reclaimable) {
-    return handOut(db, reclaimable, nowIso, null);
+    return reclaim(db, reclaimable, nowIso);
   }
 
   return exhausted(db, scope, pendingTasks);
@@ -258,6 +321,15 @@ function pickByPriority(db: DatabaseInstance, scope: HandOutScope, nowIso: strin
  * and left its sibling unclaimed while an agent worked on it (g-mesh 3.20.0,
  * step [GM-486, GM-490]). Across steps the order above is unchanged: a
  * reclaimable step-1 task still beats a pending step-2 one.
+ *
+ * So the two paths differ only in order: pickByPriority reclaims nothing while
+ * any pending task in the pool is unblocked, and then takes the oldest lapsed
+ * lease; this walker reclaims within the first step that has no unclaimed
+ * pending task, in position order. Whichever path reclaims, it goes through
+ * `reclaim`, so the answer carries the same `reclaimed_from` marker (TTM-78)
+ * naming the previous holder - the receiver confirms that holder is gone
+ * before working on it, because a lapsed lease may be a paused session rather
+ * than a dead one.
  *
  * A task held under a live lease is never handed out again, including when
  * every task of its step is so held: get_next_task hands out work nobody holds,
@@ -327,9 +399,9 @@ function pickByPlan(
 
     // In position order, not pickByPriority's oldest-lease-first: the plan's
     // order is the one being followed here.
-    const reclaim = reclaimable[0];
-    if (reclaim) {
-      return handOut(db, reclaim, nowIso, null);
+    const reclaimCandidate = reclaimable[0];
+    if (reclaimCandidate) {
+      return reclaim(db, reclaimCandidate, nowIso);
     }
   }
 
@@ -338,6 +410,8 @@ function pickByPlan(
 
 /**
  * Hands out the next task to work, marking it in_progress under a fresh lease.
+ * A task reclaimed from a lapsed lease, on either path, carries
+ * `reclaimed_from` (see `ReclaimedFrom`).
  *
  * Unscoped (no `releaseRef`) it behaves as it always has: project-wide,
  * priority order, the stale-lock reclaim, all_done/all_blocked. It gains one

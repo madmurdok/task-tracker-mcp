@@ -467,7 +467,9 @@ Status values: `proposed` (idea only) -> `planned` (approach agreed) -> `in-prog
   - An `in_progress` card whose `lock_expires_at` has already passed is
     highlighted as **stale** — it's about to be auto-reclaimed by the next
     `get_next_task` call (existing lease behavior), and that's an early signal
-    the session behind it likely died.
+    the session behind it likely died. *Revised by TTM-78:* the lease is 2 h,
+    renewed by slice writes, and the badge reads "no activity since HH:MM" - a
+    signal for a human, not a verdict, since a paused session looks the same.
   - `cancelled` cards stay visible but visually de-emphasized (muted/greyed),
     not hidden — same "visible, not hidden from the stats" principle Item 6
     already applied to status aggregation.
@@ -610,9 +612,11 @@ is just an index.
   `split_task` replaces a task with subtasks and rewires its edges onto them; a
   Context Budget Estimator flags oversized tasks (`over_budget`) from `create_task`.
 - **v2 — ownership & locking** (`claim_task`, `release_task`, auto-reclaim): `get_next_task`
-  atomically hands out and locks a task (30 min lease); a second session gets a
-  `conflict` error while the lock is live; an expired lock is auto-reclaimed by the
-  next `get_next_task` call instead of staying stuck.
+  atomically hands out and locks a task (30 min lease; 2 h since TTM-78, renewed
+  by slice writes); a second session gets a `conflict` error while the lock is
+  live; an expired lock is auto-reclaimed by the next `get_next_task` call instead
+  of staying stuck (since TTM-78 the answer carries `reclaimed_from`, naming the
+  previous holder, so the receiver checks it is gone before working on it).
 - **v2 — completion verification** (`complete_task`, `add_handoff_note`): a
   `CompletionVerifier` (git-diff based) rejects `complete_task` unless the task's
   declared files actually changed and any `test_command` exits zero, unless

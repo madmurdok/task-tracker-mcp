@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
 import { addDependency } from "../src/domain/dependencies.js";
@@ -14,7 +14,7 @@ import {
   startSlice,
 } from "../src/domain/slices.js";
 import { getTaskDetail } from "../src/domain/status.js";
-import { LOCK_LEASE_MS } from "../src/domain/taskStatus.js";
+import { LOCK_LEASE_MS, renewLease } from "../src/domain/taskStatus.js";
 import { createTask, withCode, type Task } from "../src/domain/tasks.js";
 import type { CompletionVerifier } from "../src/domain/verification.js";
 
@@ -203,7 +203,7 @@ describe("start_slice starts its task (TTM-98)", () => {
     expect(storedTask(db, task.id)).toMatchObject({ status: "pending", lock_expires_at: null });
   });
 
-  it("leaves an in_progress task's owner and lease untouched", () => {
+  it("keeps an in_progress task's owner and renews its lease (TTM-78)", () => {
     const { db, task } = setup();
     setTaskSlices(db, task.code, [{ phase: "implement", title: "a" }]);
     claimTask(db, task.code, "holder");
@@ -211,13 +211,15 @@ describe("start_slice starts its task (TTM-98)", () => {
     const held = new Date(Date.now() + 5 * 60 * 1000).toISOString();
     db.prepare(`UPDATE tasks SET lock_expires_at = ? WHERE id = ?`).run(held, task.id);
 
+    const before = Date.now();
     expect(startSlice(db, `${task.code}/S1`).status).toBe("in_progress");
+    const after = Date.now();
 
-    expect(storedTask(db, task.id)).toEqual({
-      status: "in_progress",
-      owner_session_id: "holder",
-      lock_expires_at: held,
-    });
+    const stored = storedTask(db, task.id);
+    expect(stored).toMatchObject({ status: "in_progress", owner_session_id: "holder" });
+    const lease = Date.parse(stored.lock_expires_at!);
+    expect(lease).toBeGreaterThanOrEqual(before + LOCK_LEASE_MS);
+    expect(lease).toBeLessThanOrEqual(after + LOCK_LEASE_MS);
   });
 });
 
@@ -553,5 +555,162 @@ describe("complete_task's open-slices guard", () => {
   it("does not affect a task with no slicing", () => {
     const { db, task } = setup();
     expect(() => completeTask(db, noopVerifier, { task_id: task.code })).not.toThrow();
+  });
+});
+
+/**
+ * TTM-78: the slice writes are the lease's heartbeat. Time moves with
+ * vi.setSystemTime and leases are written by claim_task and renewLease
+ * themselves; the only direct writes below set a task's *status* to build a
+ * row renewLease must leave alone.
+ */
+describe("lease renewal (TTM-78)", () => {
+  const T0 = Date.parse("2026-10-04T09:00:00.000Z");
+  const MINUTE = 60 * 1000;
+  const at = (offsetMs: number) => vi.setSystemTime(T0 + offsetMs);
+  const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString();
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    at(0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function lease(db: DatabaseInstance, taskId: string) {
+    return db
+      .prepare(`SELECT status, owner_session_id, lock_expires_at FROM tasks WHERE id = ?`)
+      .get(taskId) as { status: string; owner_session_id: string | null; lock_expires_at: string | null };
+  }
+
+  describe("renewLease", () => {
+    it("pushes an in_progress lease to now + LOCK_LEASE_MS, keeping the owner", () => {
+      const { db, task } = setup();
+      claimTask(db, task.code, "holder");
+
+      renewLease(db, task.id, iso(60 * MINUTE));
+
+      expect(lease(db, task.id)).toEqual({
+        status: "in_progress",
+        owner_session_id: "holder",
+        lock_expires_at: iso(60 * MINUTE + LOCK_LEASE_MS),
+      });
+    });
+
+    it("never shortens a later lease", () => {
+      const { db, task } = setup();
+      claimTask(db, task.code, "holder");
+
+      // A renewal stamped before the claim would move the lease earlier.
+      renewLease(db, task.id, iso(-30 * MINUTE));
+
+      expect(lease(db, task.id).lock_expires_at).toBe(iso(LOCK_LEASE_MS));
+    });
+
+    it("renews a lease that has already lapsed (a resumed session)", () => {
+      const { db, task } = setup();
+      claimTask(db, task.code, "holder");
+
+      renewLease(db, task.id, iso(3 * LOCK_LEASE_MS));
+
+      expect(lease(db, task.id)).toEqual({
+        status: "in_progress",
+        owner_session_id: "holder",
+        lock_expires_at: iso(4 * LOCK_LEASE_MS),
+      });
+    });
+
+    it("never creates a lease on an in_progress row that has none", () => {
+      const { db, task } = setup();
+      db.prepare(`UPDATE tasks SET status = 'in_progress' WHERE id = ?`).run(task.id);
+
+      renewLease(db, task.id, iso(0));
+
+      expect(lease(db, task.id)).toMatchObject({ status: "in_progress", lock_expires_at: null });
+    });
+
+    it("never touches a pending, done or cancelled task, even one still carrying a lease", () => {
+      for (const status of ["pending", "done", "cancelled"]) {
+        const { db, task } = setup();
+        claimTask(db, task.code, "holder");
+        // Keeps the claim's lease, so only the status guard can stop a renewal.
+        db.prepare(`UPDATE tasks SET status = ? WHERE id = ?`).run(status, task.id);
+
+        renewLease(db, task.id, iso(60 * MINUTE));
+
+        expect(lease(db, task.id).lock_expires_at, status).toBe(iso(LOCK_LEASE_MS));
+        db.close();
+      }
+    });
+  });
+
+  describe("each slice write renews an in_progress task's lease", () => {
+    it("claim_task stamps now + LOCK_LEASE_MS", () => {
+      const { db, task } = setup();
+      at(5 * MINUTE);
+      claimTask(db, task.code, "holder");
+      expect(lease(db, task.id).lock_expires_at).toBe(iso(5 * MINUTE + LOCK_LEASE_MS));
+    });
+
+    it("set_task_slices", () => {
+      const { db, task } = setup();
+      claimTask(db, task.code, "holder");
+      at(60 * MINUTE);
+
+      setTaskSlices(db, task.code, [{ phase: "implement", title: "a" }]);
+
+      expect(lease(db, task.id)).toMatchObject({
+        owner_session_id: "holder",
+        lock_expires_at: iso(60 * MINUTE + LOCK_LEASE_MS),
+      });
+    });
+
+    it("revise_task_slices", () => {
+      const { db, task } = setup();
+      setTaskSlices(db, task.code, [
+        { phase: "implement", title: "a" },
+        { phase: "verify", title: "b" },
+      ]);
+      claimTask(db, task.code, "holder");
+      startSlice(db, `${task.code}/S1`);
+      at(60 * MINUTE);
+
+      reviseTaskSlices(db, task.code, [{ phase: "verify", title: "b2" }], "re-cut");
+
+      expect(lease(db, task.id)).toMatchObject({
+        owner_session_id: "holder",
+        lock_expires_at: iso(60 * MINUTE + LOCK_LEASE_MS),
+      });
+    });
+
+    it("start_slice on a task already in_progress", () => {
+      const { db, task } = setup();
+      setTaskSlices(db, task.code, [{ phase: "implement", title: "a" }]);
+      claimTask(db, task.code, "holder");
+      at(60 * MINUTE);
+
+      startSlice(db, `${task.code}/S1`);
+
+      expect(lease(db, task.id)).toMatchObject({
+        owner_session_id: "holder",
+        lock_expires_at: iso(60 * MINUTE + LOCK_LEASE_MS),
+      });
+    });
+
+    it("complete_slice", () => {
+      const { db, task } = setup();
+      setTaskSlices(db, task.code, [{ phase: "implement", title: "a" }]);
+      claimTask(db, task.code, "holder");
+      startSlice(db, `${task.code}/S1`);
+      at(60 * MINUTE);
+
+      completeSlice(db, `${task.code}/S1`, { status: "done", result: "ok" });
+
+      expect(lease(db, task.id)).toMatchObject({
+        owner_session_id: "holder",
+        lock_expires_at: iso(60 * MINUTE + LOCK_LEASE_MS),
+      });
+    });
   });
 });
