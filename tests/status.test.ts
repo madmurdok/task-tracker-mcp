@@ -337,6 +337,125 @@ describe("getNextTask scoped to a release batch with an approved plan", () => {
     expect(reclaimed.task?.owner_session_id).toBeNull();
   });
 
+  describe("a parallel step (TTM-98)", () => {
+    /** An approved plan whose steps are `titles`, each group one (parallel) step. */
+    function planWithSteps(titles: string[][]) {
+      const { db, project, release, makeTask } = setupBatch();
+      const tasks = titles.map((group) => group.map((title) => makeTask(title)));
+      upsertPlan(db, project.id, release.version, { steps: tasks.map((group) => group.map((t) => t.id)) });
+      sliceAll(db, ...tasks.flat());
+      approvePlan(db, project.id, release.version, { approved_by: "owner" });
+      const next = () => getNextTask(db, project.id, release.version);
+      return { db, tasks, next };
+    }
+
+    it("hands out each task of the step once: A, then B, never A again", () => {
+      const { db, tasks, next } = planWithSteps([["A", "B"]]);
+      const [a, b] = tasks[0]!;
+
+      expect(next().task?.id).toBe(a!.id);
+      expect(next().task?.id).toBe(b!.id);
+      expect(storedTask(db, a!.id).status).toBe("in_progress");
+      expect(storedTask(db, b!.id).status).toBe("in_progress");
+    });
+
+    it("hands out B before reclaiming A when A's lease lapsed between the calls", () => {
+      // The g-mesh 3.20.0 failure: an orchestrator outran A's lease, and the
+      // second call handed A out again while B was never claimed.
+      const { db, tasks, next } = planWithSteps([["A", "B"]]);
+      const [a, b] = tasks[0]!;
+
+      expect(next().task?.id).toBe(a!.id);
+      db.prepare(`UPDATE tasks SET owner_session_id = ? WHERE id = ?`).run("orchestrator", a!.id);
+      expireLease(db, a!.id);
+
+      const second = next();
+      expect(second.task?.id).toBe(b!.id);
+      // A was left as it was on the way past: still the orchestrator's.
+      expect(storedTask(db, a!.id)).toEqual({ status: "in_progress", owner_session_id: "orchestrator" });
+
+      // Only once the step has no unclaimed task left is the lapsed one reclaimed,
+      // owner cleared exactly as any reclaim does.
+      const third = next();
+      expect(third.task?.id).toBe(a!.id);
+      expect(third.task?.owner_session_id).toBeNull();
+      expect(storedTask(db, a!.id).owner_session_id).toBeNull();
+    });
+
+    it("reclaims a step's lapsed tasks in plan position order, not oldest lease first", () => {
+      const { db, tasks, next } = planWithSteps([["A", "B", "C"]]);
+      const [a, b, c] = tasks[0]!;
+      expect([next().task?.id, next().task?.id, next().task?.id]).toEqual([a!.id, b!.id, c!.id]);
+
+      // C's lease lapsed long before B's, so an oldest-lease-first reclaim
+      // (pickByPriority's order) would take C; position order takes B.
+      const setLease = db.prepare(`UPDATE tasks SET lock_expires_at = ? WHERE id = ?`);
+      setLease.run(new Date(Date.now() - 1000).toISOString(), b!.id);
+      setLease.run(new Date(Date.now() - 60 * 60 * 1000).toISOString(), c!.id);
+
+      expect(next().task?.id).toBe(b!.id);
+      expect(next().task?.id).toBe(c!.id);
+    });
+
+    it("never re-hands out a task under a live lease, even when its whole step is held", () => {
+      const { db, tasks, next } = planWithSteps([["A", "B"], ["C"]]);
+      const [a, b] = tasks[0]!;
+      const [c] = tasks[1]!;
+
+      expect(next().task?.id).toBe(a!.id);
+      expect(next().task?.id).toBe(b!.id);
+      // Step 1 is wholly held: it yields nothing and the walk moves to step 2.
+      expect(next().task?.id).toBe(c!.id);
+
+      // Nothing left anywhere: the exhausted answer, naming no held task as blocked.
+      const exhausted = next();
+      expect(exhausted.task).toBeNull();
+      if (exhausted.task === null) {
+        expect(exhausted.reason).toBe("all_blocked");
+        if (exhausted.reason === "all_blocked") {
+          expect(exhausted.blocked_on).toEqual([]);
+        }
+      }
+      for (const t of [a!, b!, c!]) {
+        expect(storedTask(db, t.id).status).toBe("in_progress");
+      }
+    });
+
+    it("with a held step and a blocked later task, all_blocked lists only the blocked task", () => {
+      const { db, tasks, next } = planWithSteps([["A", "B"], ["C"]]);
+      const [a, b] = tasks[0]!;
+      const [c] = tasks[1]!;
+      // C waits on A, which is held - so C stays pending and blocked.
+      addDependency(db, c!.id, a!.id);
+
+      expect(next().task?.id).toBe(a!.id);
+      expect(next().task?.id).toBe(b!.id);
+
+      const exhausted = next();
+      expect(exhausted.task).toBeNull();
+      if (exhausted.task === null) {
+        expect(exhausted.reason).toBe("all_blocked");
+        if (exhausted.reason === "all_blocked") {
+          expect(exhausted.blocked_on).toEqual([c!.id]);
+        }
+      }
+      expect(storedTask(db, c!.id).status).toBe("pending");
+    });
+
+    it("reports all_done once every task of the step is finished", () => {
+      const { db, tasks, next } = planWithSteps([["A", "B"]]);
+      next();
+      next();
+      for (const t of tasks[0]!) markStatus(db, t.id, "done");
+
+      const result = next();
+      expect(result.task).toBeNull();
+      if (result.task === null) {
+        expect(result.reason).toBe("all_done");
+      }
+    });
+  });
+
   it("reports all_blocked over the batch alone, ignoring unblocked work outside it", () => {
     const { db, project, release, makeTask, makeBacklogTask } = setupBatch();
     const prerequisite = makeBacklogTask("prerequisite, outside the batch");

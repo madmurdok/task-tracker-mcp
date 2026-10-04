@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import type { BudgetEstimator } from "../src/domain/budget.js";
-import { cancelTask, completeTask, OpenSlicesError } from "../src/domain/lifecycle.js";
+import { addDependency } from "../src/domain/dependencies.js";
+import { cancelTask, claimTask, completeTask, OpenSlicesError } from "../src/domain/lifecycle.js";
 import { createProject } from "../src/domain/projects.js";
 import {
   completeSlice,
@@ -13,6 +14,7 @@ import {
   startSlice,
 } from "../src/domain/slices.js";
 import { getTaskDetail } from "../src/domain/status.js";
+import { LOCK_LEASE_MS } from "../src/domain/taskStatus.js";
 import { createTask, withCode, type Task } from "../src/domain/tasks.js";
 import type { CompletionVerifier } from "../src/domain/verification.js";
 
@@ -156,6 +158,66 @@ describe("set_task_slices / start_slice / complete_slice", () => {
       /Slice step 2 has no slices/,
     );
     expect(listTaskSlices(db, task.code)).toEqual([]);
+  });
+});
+
+describe("start_slice starts its task (TTM-98)", () => {
+  function storedTask(db: DatabaseInstance, taskId: string) {
+    return db
+      .prepare(`SELECT status, owner_session_id, lock_expires_at FROM tasks WHERE id = ?`)
+      .get(taskId) as { status: string; owner_session_id: string | null; lock_expires_at: string | null };
+  }
+
+  it("moves a pending task to in_progress under a fresh lease, keeping its owner", () => {
+    const { db, task } = setup();
+    setTaskSlices(db, task.code, [{ phase: "implement", title: "a" }]);
+    db.prepare(`UPDATE tasks SET owner_session_id = ? WHERE id = ?`).run("orchestrator", task.id);
+    expect(storedTask(db, task.id)).toMatchObject({ status: "pending", lock_expires_at: null });
+
+    const before = Date.now();
+    const started = startSlice(db, `${task.code}/S1`);
+    const after = Date.now();
+
+    expect(started.status).toBe("in_progress");
+    const stored = storedTask(db, task.id);
+    expect(stored.status).toBe("in_progress");
+    expect(stored.owner_session_id).toBe("orchestrator");
+    const lease = Date.parse(stored.lock_expires_at!);
+    expect(lease).toBeGreaterThanOrEqual(before + LOCK_LEASE_MS);
+    expect(lease).toBeLessThanOrEqual(after + LOCK_LEASE_MS);
+  });
+
+  it("refuses a pending task with unmet dependencies, leaving slice and task pending", () => {
+    const { db, task } = setup();
+    const prerequisite = createTask(db, noopEstimator, {
+      project_id: task.project_id,
+      title: "prerequisite",
+      complexity_hint: "normal",
+    }).task;
+    addDependency(db, task.id, prerequisite.id);
+    setTaskSlices(db, task.code, [{ phase: "implement", title: "a" }]);
+
+    expect(() => startSlice(db, `${task.code}/S1`)).toThrow(/unmet dependencies/);
+
+    expect(requireSlice(db, `${task.code}/S1`)).toMatchObject({ status: "pending", started_at: null });
+    expect(storedTask(db, task.id)).toMatchObject({ status: "pending", lock_expires_at: null });
+  });
+
+  it("leaves an in_progress task's owner and lease untouched", () => {
+    const { db, task } = setup();
+    setTaskSlices(db, task.code, [{ phase: "implement", title: "a" }]);
+    claimTask(db, task.code, "holder");
+    // A lease distinct from anything start_slice could write now.
+    const held = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+    db.prepare(`UPDATE tasks SET lock_expires_at = ? WHERE id = ?`).run(held, task.id);
+
+    expect(startSlice(db, `${task.code}/S1`).status).toBe("in_progress");
+
+    expect(storedTask(db, task.id)).toEqual({
+      status: "in_progress",
+      owner_session_id: "holder",
+      lock_expires_at: held,
+    });
   });
 });
 
