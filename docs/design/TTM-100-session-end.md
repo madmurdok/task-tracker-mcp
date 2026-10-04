@@ -1,6 +1,9 @@
 # TTM-100: a SessionEnd hook expires the ending session's leases
 
-Status: design, awaiting owner decision. On top of TTM-78 (2 h lease,
+Status: approved by the owner, 2026-10-04: expire-now, every `reason`, the
+hook script and settings snippet as in section 5 - with one change: the log is
+split by month, `session-end-YYYY-MM.log` ("логи лучше наверное дробить по
+месяцам хотя бы"). On top of TTM-78 (2 h lease,
 `renewLease`, `reclaimed_from`; TTM-78-lease.md "Owner decision" point 4).
 Problem: every "session gone" signal is time-based; paused and dead look alike.
 
@@ -89,7 +92,7 @@ the same `dist`.
    table rebuild can hold the 1.5 s budget). Open with
    `new Database(path, { fileMustExist: true })`, `busy_timeout = 1000`.
 3. Call the domain function `expireSessionLeases(db, sessionId, nowIso)`.
-4. Append one line to `~/.task-tracker/session-end.log` (dirname of the DB path):
+4. Append one line to `~/.task-tracker/session-end-YYYY-MM.log` (dirname of the DB path; one file per UTC month, owner's decision):
    ISO time, session id, reason, expired task refs or the error message.
 5. Whole body in try/catch; nothing on stdout/stderr (stderr would be shown to
    the user on exit); `process.exitCode = 0` always. A log-write failure is
@@ -174,5 +177,5 @@ exit 0
 
 1. Expire-now, not release (section 2).
 2. All `reason` values, `clear` and `resume` included (no matcher).
-3. Log file `~/.task-tracker/session-end.log`, no rotation.
+3. Log file per month, `~/.task-tracker/session-end-YYYY-MM.log` (owner's change).
 4. The script and settings snippet in section 5, installed in S5.
