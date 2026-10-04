@@ -1,3 +1,4 @@
+import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -576,6 +577,51 @@ describe("MCP server smoke test", () => {
     });
     expect(forced.isError).toBeFalsy();
     expect(forced.payload.ok).toBe(true);
+  });
+
+  it("adds unverified_paths to complete_task's JSON only when a declared path is outside the repository", async () => {
+    const repo = mkdtempSync(path.join(tmpdir(), "ttmcp-smoke-repo-"));
+    const outside = mkdtempSync(path.join(tmpdir(), "ttmcp-smoke-outside-"));
+    try {
+      execSync("git init -q && git config user.email t@example.com && git config user.name T", { cwd: repo });
+      writeFileSync(path.join(repo, "README.md"), "init\n");
+      execSync("git add . && git commit -q -m init", { cwd: repo });
+      const ext = path.join(outside, "CLAUDE.md");
+      writeFileSync(ext, "global\n");
+
+      const client = await connectedClient(db);
+      const call = async (name: string, args: Record<string, unknown>) => {
+        const result = await client.callTool({ name, arguments: args });
+        const content = result.content as Array<{ type: string; text: string }>;
+        return { isError: result.isError, payload: JSON.parse(content[0].text) };
+      };
+
+      const { payload: project } = await call("create_project", { name: "Demo", root_path: repo });
+      const { payload: mixed } = await call("create_task", {
+        project_id: project.project_id,
+        title: "Repo file plus a global one",
+        file_paths: ["config.json", ext],
+        complexity_hint: "normal",
+      });
+      const { payload: inRepo } = await call("create_task", {
+        project_id: project.project_id,
+        title: "Repo file only",
+        file_paths: ["config.json"],
+        complexity_hint: "normal",
+      });
+      writeFileSync(path.join(repo, "config.json"), "{}\n");
+
+      const withExternal = await call("complete_task", { task_id: mixed.task_id, summary: "done" });
+      expect(withExternal.isError).toBeFalsy();
+      expect(withExternal.payload).toEqual({ ok: true, unblocked_task_ids: [], unverified_paths: [ext] });
+
+      const allInRepo = await call("complete_task", { task_id: inRepo.task_id, summary: "done" });
+      expect(allInRepo.isError).toBeFalsy();
+      expect(allInRepo.payload).toEqual({ ok: true, unblocked_task_ids: [] });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   it("carries task slices end to end by task code, and complete_task's open_slices refusal with its names intact", async () => {
