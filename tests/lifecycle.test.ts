@@ -237,6 +237,17 @@ describe("ownership conflicts (A3)", () => {
       /already done/,
     );
   });
+
+  it("release_task refuses a cancelled task and leaves it cancelled with its reason", () => {
+    const { db, task } = setup();
+    cancelTask(db, { task_id: task.id, reason: "descoped", force: true });
+
+    expect(() => releaseTask(db, { task_id: task.id, session_id: "session-1" })).toThrow(
+      /cancelled/,
+    );
+    const row = db.prepare(`SELECT status, cancellation_reason FROM tasks WHERE id = ?`).get(task.id);
+    expect(row).toMatchObject({ status: "cancelled", cancellation_reason: "descoped" });
+  });
 });
 
 describe("completion verification (B2)", () => {
