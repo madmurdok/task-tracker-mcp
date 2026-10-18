@@ -84,6 +84,20 @@ export interface ReclaimedFrom {
   last_activity_at: string;
 }
 
+/**
+ * An in_progress task under a live lease, reported when nothing could be
+ * handed out so the caller knows whom it is waiting for and until when.
+ * `id` matches `blocked_on`'s uuids; `code` is the `PREFIX-N` form people and
+ * orchestrators use. `lock_expires_at` is null only on legacy rows;
+ * `owner_session_id` is null for a get_next_task hand-out (TTM-78).
+ */
+export interface HeldTask {
+  id: string;
+  code: string;
+  lock_expires_at: string | null;
+  owner_session_id: string | null;
+}
+
 type NextTaskOutcome =
   /**
    * `reclaimed_from` only when the task was in_progress under a lapsed lease;
@@ -92,7 +106,14 @@ type NextTaskOutcome =
    */
   | { task: TaskDetail; reclaimed_from?: ReclaimedFrom }
   | { task: null; reason: "all_done" }
-  | { task: null; reason: "all_blocked"; blocked_on: string[] }
+  /**
+   * Work remains but none can be handed out. `all_blocked` when some pending
+   * task waits on a dependency (`blocked_on`), `all_held` when every remaining
+   * task is in progress under a live lease - wait for the holders. `held` is on
+   * both, possibly empty, soonest-lapsing lease first.
+   */
+  | { task: null; reason: "all_blocked"; blocked_on: string[]; held: HeldTask[] }
+  | { task: null; reason: "all_held"; blocked_on: []; held: HeldTask[] }
   /**
    * A batch was named, but its plan is a draft or has drifted, so there is no
    * approved order to work it in. `drift` names the disagreeing tasks whenever
@@ -235,11 +256,22 @@ interface HandOutScope {
 
 /**
  * The answer when nothing could be handed out: all_done only when the pool
- * holds no unfinished work at all, otherwise all_blocked naming the pending
- * tasks that were passed over. Shared by both selection strategies so the two
- * cannot disagree about what an exhausted pool is called.
+ * holds no unfinished work at all; otherwise all_blocked naming the pending
+ * tasks that were passed over, or all_held when there are none and everything
+ * left is in progress under a live lease. Both carry `held`. Shared by both
+ * selection strategies so the two cannot disagree about what an exhausted pool
+ * is called.
+ *
+ * `held` is queried here with the live-lease predicate written out rather than
+ * inferred from the pickers having reclaimed every lapsed lease, so a lapsed
+ * lease can never be reported as held even if a picker changes.
  */
-function exhausted(db: DatabaseInstance, scope: HandOutScope, skipped: Task[]): NextTaskOutcome {
+function exhausted(
+  db: DatabaseInstance,
+  scope: HandOutScope,
+  skipped: Task[],
+  nowIso: string,
+): NextTaskOutcome {
   const remaining = db
     .prepare(
       `SELECT COUNT(*) AS cnt FROM tasks WHERE ${scope.column} = ? AND status NOT IN ('done', 'cancelled')`,
@@ -250,7 +282,34 @@ function exhausted(db: DatabaseInstance, scope: HandOutScope, skipped: Task[]): 
     return { task: null, reason: "all_done" };
   }
 
-  return { task: null, reason: "all_blocked", blocked_on: skipped.map((t) => t.id) };
+  // Soonest lease to lapse first; a NULL (legacy) lease never lapses, so it
+  // goes last - SQLite would otherwise sort NULL first in ASC order.
+  const heldRows = db
+    .prepare(
+      `SELECT t.id, p.code_prefix, t.task_number, t.lock_expires_at, t.owner_session_id
+       FROM tasks t JOIN projects p ON p.id = t.project_id
+       WHERE t.${scope.column} = ? AND t.status = 'in_progress'
+         AND (t.lock_expires_at IS NULL OR t.lock_expires_at >= ?)
+       ORDER BY t.lock_expires_at IS NULL, t.lock_expires_at ASC, t.created_at ASC`,
+    )
+    .all(scope.id, nowIso) as {
+    id: string;
+    code_prefix: string;
+    task_number: number;
+    lock_expires_at: string | null;
+    owner_session_id: string | null;
+  }[];
+  const held: HeldTask[] = heldRows.map((r) => ({
+    id: r.id,
+    code: taskCode(r.code_prefix, r.task_number),
+    lock_expires_at: r.lock_expires_at,
+    owner_session_id: r.owner_session_id,
+  }));
+
+  if (skipped.length === 0) {
+    return { task: null, reason: "all_held", blocked_on: [], held };
+  }
+  return { task: null, reason: "all_blocked", blocked_on: skipped.map((t) => t.id), held };
 }
 
 /**
@@ -293,7 +352,7 @@ function pickByPriority(db: DatabaseInstance, scope: HandOutScope, nowIso: strin
     return reclaim(db, reclaimable, nowIso);
   }
 
-  return exhausted(db, scope, pendingTasks);
+  return exhausted(db, scope, pendingTasks, nowIso);
 }
 
 /**
@@ -338,7 +397,8 @@ function pickByPriority(db: DatabaseInstance, scope: HandOutScope, nowIso: strin
  * duplicate hand-out above, to whichever session asked next. Such a step
  * contributes no candidate and the walk moves on to the next step, exactly as
  * it always has for a held task; if no step has a candidate the answer is the
- * same all_done/all_blocked any exhausted pool gets.
+ * same all_done/all_blocked/all_held any exhausted pool gets (all_held when
+ * every remaining task is so held).
  *
  * A task in the batch but absent from the plan is not a candidate and is not
  * looked for here: that set being non-empty *is* drift, so the caller has
@@ -405,7 +465,7 @@ function pickByPlan(
     }
   }
 
-  return exhausted(db, scope, blocked);
+  return exhausted(db, scope, blocked, nowIso);
 }
 
 /**
@@ -414,7 +474,7 @@ function pickByPlan(
  * `reclaimed_from` (see `ReclaimedFrom`).
  *
  * Unscoped (no `releaseRef`) it behaves as it always has: project-wide,
- * priority order, the stale-lock reclaim, all_done/all_blocked. It gains one
+ * priority order, the stale-lock reclaim, all_done/all_blocked/all_held. It gains one
  * reported field, `plan_pending`, so that handing out a task from a batch whose
  * plan nobody approved is visible in the answer rather than silent.
  *
