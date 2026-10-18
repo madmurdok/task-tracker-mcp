@@ -125,6 +125,19 @@ function createBlockedByRow(task) {
   return row;
 }
 
+// "Slices N/M[ · F failed][ · S skipped]" (TTM-102): N = done slices,
+// M = all slices minus failed minus skipped. Suffixes only when non-zero.
+function sliceProgressLabel(slices) {
+  const count = (status) => slices.filter((slice) => slice.status === status).length;
+  const done = count("done");
+  const failed = count("failed");
+  const skipped = count("skipped");
+  let label = `Slices ${done}/${slices.length - failed - skipped}`;
+  if (failed > 0) label += ` \u00b7 ${failed} failed`;
+  if (skipped > 0) label += ` \u00b7 ${skipped} skipped`;
+  return label;
+}
+
 function createCard(task, statusLabel, codePrefix) {
   const card = document.createElement("article");
   card.className = "card";
@@ -228,15 +241,15 @@ function createCard(task, statusLabel, codePrefix) {
 
   // No button at all for an unsliced task (TTM-84) - same "nothing to show,
   // nothing to click" rule the description toggle above already follows.
-  // N counts only "done": a "failed" or "skipped" slice is finished but not
-  // successfully so, and the button is meant to answer "how much of this is
-  // actually done", not "how much is no longer open".
+  // N counts only "done"; M is every slice still in play, i.e. minus the
+  // finished-but-not-successfully "failed" and "skipped" ones (a revised
+  // task keeps its failed slices, which are not remaining work). Both are
+  // shown as separate suffixes so rework stays visible (TTM-102).
   if (task.slices && task.slices.length > 0) {
-    const done = task.slices.filter((slice) => slice.status === "done").length;
     const slicesButton = document.createElement("button");
     slicesButton.type = "button";
     slicesButton.className = "card-slices-button";
-    slicesButton.textContent = `Slices ${done}/${task.slices.length}`;
+    slicesButton.textContent = sliceProgressLabel(task.slices);
     slicesButton.addEventListener("click", () => showSliceDialog(task, codePrefix));
     card.appendChild(slicesButton);
   }
