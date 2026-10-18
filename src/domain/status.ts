@@ -282,13 +282,15 @@ function exhausted(
     return { task: null, reason: "all_done" };
   }
 
+  // Soonest lease to lapse first; a NULL (legacy) lease never lapses, so it
+  // goes last - SQLite would otherwise sort NULL first in ASC order.
   const heldRows = db
     .prepare(
       `SELECT t.id, p.code_prefix, t.task_number, t.lock_expires_at, t.owner_session_id
        FROM tasks t JOIN projects p ON p.id = t.project_id
        WHERE t.${scope.column} = ? AND t.status = 'in_progress'
          AND (t.lock_expires_at IS NULL OR t.lock_expires_at >= ?)
-       ORDER BY t.lock_expires_at ASC, t.created_at ASC`,
+       ORDER BY t.lock_expires_at IS NULL, t.lock_expires_at ASC, t.created_at ASC`,
     )
     .all(scope.id, nowIso) as {
     id: string;
