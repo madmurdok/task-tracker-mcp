@@ -10,7 +10,9 @@ import { execFileSync } from "node:child_process";
  * typed; the CLI reports more. Observed shapes (design note, experiment d):
  * a background session carries `id`, `sessionId`, `name`, `kind`, `state`
  * (`blocked`, `stopped`, ...) and, while it waits, `status: "waiting"` with
- * `waitingFor: "input needed" | "permission prompt"`.
+ * `waitingFor: "input needed" | "permission prompt"`. A session that finished
+ * its turn reports `state: "done", status: "idle"` (TTM-95/S20 probe), and
+ * `state: "done"` with no status after `claude stop`.
  */
 export interface AgentEntry {
   id?: string;
@@ -109,16 +111,25 @@ const IDLE_MARKERS = new Set(["idle", "done", "completed", "finished", "waiting-
 /**
  * Collapses the CLI's `state`/`status`/`waitingFor` into the four cases the
  * stop table needs. A missing row is `dead` (the stop table's "session
- * missing"). `blocked` is checked before `idle` so that a session waiting on
- * a form or a permission prompt is never mistaken for one that ended.
+ * missing"). `blocked` means a question for the owner, and only an explicit
+ * one counts: `waitingFor` set or `status: "waiting"`. It is checked before
+ * `idle` so that a session waiting on a form or a permission prompt is never
+ * mistaken for one that ended. A bare `state: "blocked"` with neither (seen on
+ * a pid-less row, meaning unknown) is `idle`: it then gets the bounded
+ * "ended without finishing" path (notify, stop the loop after grace, session
+ * left alive) rather than an unbounded wait with the clock paused.
  */
 export function classifyAgent(agent: AgentEntry | undefined): SessionState {
   if (agent === undefined) return "dead";
   const state = agent.state?.toLowerCase();
   const status = agent.status?.toLowerCase();
   if (state !== undefined && DEAD_STATES.has(state)) return "dead";
-  if (state === "blocked" || status === "waiting" || (agent.waitingFor ?? "") !== "") return "blocked";
-  if ((state !== undefined && IDLE_MARKERS.has(state)) || (status !== undefined && IDLE_MARKERS.has(status))) {
+  if (status === "waiting" || (agent.waitingFor ?? "") !== "") return "blocked";
+  if (
+    state === "blocked" ||
+    (state !== undefined && IDLE_MARKERS.has(state)) ||
+    (status !== undefined && IDLE_MARKERS.has(status))
+  ) {
     return "idle";
   }
   return "working";

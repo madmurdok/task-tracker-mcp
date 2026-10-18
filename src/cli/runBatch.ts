@@ -21,7 +21,7 @@ import { releaseTask } from "../domain/lifecycle.js";
 import { getPlan } from "../domain/plans.js";
 import { requireProject, type Project } from "../domain/projects.js";
 import { requireRelease, type Release } from "../domain/releases.js";
-import { getNextTask, getTaskDetail, listTasks, type GetNextTaskResult } from "../domain/status.js";
+import { getNextTask, getTaskDetail, listTasks, type GetNextTaskResult, type HeldTask } from "../domain/status.js";
 import { renewLease } from "../domain/taskStatus.js";
 import { classifyAgent, createClaudeBg, type AgentEntry, type ClaudeBg, type SessionState } from "./claudeBg.js";
 
@@ -159,6 +159,9 @@ export const DENY_LIST: readonly string[] = [
 /** Flags that would remove AskUserQuestion or every permission check. */
 const FORBIDDEN_FLAGS = ["--permission-prompts", "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions"];
 
+/** The session id the runner writes under when no task session exists. */
+const RUNNER_SESSION = "task-tracker-run";
+
 export function sessionName(code: string): string {
   return `${code} runner`;
 }
@@ -258,6 +261,7 @@ function subagentTranscripts(mainTranscript: string): string[] {
 export type StopCause =
   | "all_done"
   | "all_blocked"
+  | "all_held"
   | "plan_not_approved"
   | "doc_drift"
   | "preflight"
@@ -311,8 +315,26 @@ export function preflight(ctx: PreflightContext, deps: RunnerDeps): string[] {
     failures.push(`approved plan of ${release.version} has drifted`);
   }
 
+  // --resume names a task by uuid or code (any case, as everywhere else in
+  // the tracker); it must be an in_progress task of this very batch.
+  let resumeId: string | undefined;
+  if (ctx.resume !== undefined) {
+    try {
+      const t = getTaskDetail(db, ctx.resume);
+      if (t.release_id !== release.id) {
+        failures.push(`--resume ${ctx.resume}: ${t.code} is not in release ${release.version}`);
+      } else if (t.status !== "in_progress") {
+        failures.push(`--resume ${ctx.resume}: ${t.code} is ${t.status}, not in_progress`);
+      } else {
+        resumeId = t.id;
+      }
+    } catch (error) {
+      failures.push(`--resume ${ctx.resume}: ${message(error)}`);
+    }
+  }
+
   const inProgress = listTasks(db, project.id, "in_progress", undefined, release.id);
-  const others = inProgress.filter((t) => t.code !== ctx.resume);
+  const others = inProgress.filter((t) => t.id !== resumeId);
   if (others.length > 0) {
     failures.push(
       `in_progress in the batch: ${others.map((t) => t.code).join(", ")}` +
@@ -380,6 +402,7 @@ async function watch(r: Running): Promise<WatchOutcome> {
   let blockedSince: number | null = null;
   let idleSince: number | null = null;
   let idleNotified = false;
+  let doneSince: number | null = null;
 
   for (;;) {
     let agents: AgentEntry[];
@@ -399,7 +422,29 @@ async function watch(r: Running): Promise<WatchOutcome> {
     else if (prev !== null) ws.workingMs += elapsed;
 
     if (state !== prev) {
-      log.line(`${r.code} ${r.bgId} state ${prev ?? "-"} -> ${state}${agent?.waitingFor ? ` (${agent.waitingFor})` : ""}`);
+      const raw = agent ? ` [state ${agent.state ?? "-"}, status ${agent.status ?? "-"}]` : "";
+      log.line(`${r.code} ${r.bgId} state ${prev ?? "-"} -> ${state}${agent?.waitingFor ? ` (${agent.waitingFor})` : ""}${raw}`);
+    }
+
+    // The DB is the truth and is read first: a done task always advances,
+    // whatever the session reports. A session still writing its last turn
+    // (cleanup after complete_task) gets up to the grace period, then is
+    // stopped; the git check after done catches anything it left. No timeout
+    // and no owner notification apply to a done task.
+    if (task.status === "done") {
+      if (state === "working") {
+        doneSince ??= now;
+        if (now - doneSince < opts.graceMs) {
+          prev = state;
+          await deps.sleep(opts.pollMs);
+          continue;
+        }
+        log.line(`${r.code} done but still working after ${fmtMin(now - doneSince)}; stopping it`);
+      } else if (state === "blocked") {
+        log.line(`${r.code} done while waiting (${agent?.waitingFor ?? "waiting"}); stopping it`);
+      }
+      if (state !== "dead") stopQuietly(r);
+      return { kind: "done" };
     }
 
     // Blocked-episode bookkeeping: one notification per episode.
@@ -413,13 +458,7 @@ async function watch(r: Running): Promise<WatchOutcome> {
       blockedSince = null;
     }
 
-    if (task.status === "done") {
-      if (state === "idle" || state === "dead") {
-        if (state === "idle") stopQuietly(r);
-        return { kind: "done" };
-      }
-      // Still writing its last turn (or asking something): wait for idle.
-    } else if (task.status === "cancelled") {
+    if (task.status === "cancelled") {
       if (state !== "dead") stopQuietly(r);
       return { kind: "stop", cause: "task_cancelled", detail: `${r.code} was cancelled` };
     } else if (state === "dead") {
@@ -432,7 +471,7 @@ async function watch(r: Running): Promise<WatchOutcome> {
       renewLease(db, r.taskId, new Date(now).toISOString());
     }
 
-    if (state === "idle" && task.status !== "done") {
+    if (state === "idle") {
       if (idleSince === null) idleSince = now;
       if (!idleNotified) {
         idleNotified = true;
@@ -443,7 +482,7 @@ async function watch(r: Running): Promise<WatchOutcome> {
         return {
           kind: "stop",
           cause: "ended_without_finishing",
-          detail: `idle ${Math.round((now - idleSince) / 60000)} min with ${r.code} ${task.status}`,
+          detail: `idle ${Math.round((now - idleSince) / 60000)} min with ${r.code} ${task.status} (session state ${agent?.state ?? "-"})`,
         };
       }
     } else {
@@ -517,6 +556,70 @@ export function peekNextTask(db: DatabaseInstance, projectId: string, releaseId:
   }
 }
 
+/**
+ * A stop before the session claimed its task leaves the runner's hand-out
+ * behind: in_progress, owner NULL, a live lease. Nothing can resume that (no
+ * session owns it) and preflight refuses the batch over it, so it goes back to
+ * pending, as on spawn_failed. A task the session did claim stays with it for
+ * --resume. Returns whether the task was released.
+ */
+function releaseIfUnclaimed(db: DatabaseInstance, taskId: string): boolean {
+  const t = getTaskDetail(db, taskId);
+  if (t.status !== "in_progress" || t.owner_session_id !== null) return false;
+  releaseTask(db, { task_id: taskId, session_id: RUNNER_SESSION });
+  return true;
+}
+
+function assertNever(value: never): never {
+  throw new Error(`unhandled get_next_task answer: ${JSON.stringify(value)}`);
+}
+
+function fmtHeld(held: HeldTask[]): string {
+  if (held.length === 0) return "-";
+  return held
+    .map((h) => `${h.code} (owner ${h.owner_session_id ?? "unclaimed hand-out"}, lease until ${h.lock_expires_at ?? "-"})`)
+    .join(", ");
+}
+
+function codeOf(db: DatabaseInstance, taskId: string): string {
+  try {
+    return getTaskDetail(db, taskId).code;
+  } catch {
+    return taskId;
+  }
+}
+
+type NoTask = Extract<GetNextTaskResult, { task: null }>;
+
+/**
+ * The stop for each "nothing to hand out" answer. Exhaustive over `reason`:
+ * a reason get_next_task gains later is a compile error here, not a silent
+ * fallthrough. `all_held` stops rather than waits: in a sequential runner it
+ * means someone else is working the batch, and nothing here can tell a live
+ * holder from a forgotten one - the owner decides.
+ */
+function noTaskStop(
+  db: DatabaseInstance,
+  next: NoTask,
+  doneThisRun: number,
+): { cause: StopCause; exitCode: number; detail: string } {
+  switch (next.reason) {
+    case "all_done":
+      return { cause: "all_done", exitCode: 0, detail: `batch done (${doneThisRun} this run)` };
+    case "all_blocked": {
+      const on = next.blocked_on.map((id) => codeOf(db, id)).join(", ") || "-";
+      const held = next.held.length > 0 ? `; held: ${fmtHeld(next.held)}` : "";
+      return { cause: "all_blocked", exitCode: 1, detail: `blocked: ${on}${held}` };
+    }
+    case "all_held":
+      return { cause: "all_held", exitCode: 1, detail: `held by other sessions: ${fmtHeld(next.held)}` };
+    case "plan_not_approved":
+      return { cause: "plan_not_approved", exitCode: 1, detail: `plan ${next.plan_status ?? "-"}` };
+    default:
+      return assertNever(next);
+  }
+}
+
 function fmtMin(ms: number): string {
   return `${(ms / 60000).toFixed(1)} min`;
 }
@@ -533,8 +636,8 @@ export async function runBatch(db: DatabaseInstance, opts: RunOptions, deps: Run
     if (failures.length === 0) deps.out("preflight: ok");
     const peek = peekNextTask(db, project.id, release.id);
     if (peek.task === null) {
-      const on = peek.reason === "all_blocked" ? `: ${peek.blocked_on.join(", ") || "-"}` : "";
-      deps.out(`next: none (${peek.reason}${on})`);
+      const stop = noTaskStop(db, peek, 0);
+      deps.out(`next: none (${stop.cause}: ${stop.detail})`);
     } else {
       const t = peek.task;
       deps.out(`next: ${t.code} "${t.title}" (plan ${peek.plan_status ?? "-"}, doc_drift ${peek.doc_drift})`);
@@ -575,7 +678,15 @@ export async function runBatch(db: DatabaseInstance, opts: RunOptions, deps: Run
       code = task.code;
       const agent = findRunnerSession(deps.claude.listAgents(), code);
       if (!agent?.id) {
-        return finish({ cause: "session_failed", exitCode: 1, task: code, detail: `no session named "${sessionName(code)}"` });
+        const detail = `no session named "${sessionName(code)}"`;
+        if (releaseIfUnclaimed(db, taskId)) {
+          addHandoffNote(db, {
+            task_id: taskId,
+            session_id: RUNNER_SESSION,
+            remaining_work: `Batch runner --resume: ${detail} and no session ever claimed ${code}; released back to pending.`,
+          });
+        }
+        return finish({ cause: "session_failed", exitCode: 1, task: code, detail });
       }
       bgId = agent.id;
       ws.sessionId = agent.sessionId;
@@ -583,18 +694,12 @@ export async function runBatch(db: DatabaseInstance, opts: RunOptions, deps: Run
     } else {
       const next = getNextTask(db, project.id, release.id);
       if (next.task === null) {
-        if (next.reason === "all_done") {
-          return finish({ cause: "all_done", exitCode: 0, detail: `batch done (${completed.length} this run)` });
-        }
-        if (next.reason === "all_blocked") {
-          return finish({ cause: "all_blocked", exitCode: 1, detail: `blocked: ${next.blocked_on.join(", ") || "-"}` });
-        }
-        return finish({ cause: "plan_not_approved", exitCode: 1, detail: `plan ${next.plan_status ?? "-"}` });
+        return finish(noTaskStop(db, next, completed.length));
       }
       taskId = next.task.id;
       code = next.task.code;
       if (next.doc_drift || next.plan_status !== "approved") {
-        releaseTask(db, { task_id: taskId, session_id: "task-tracker-run" });
+        releaseTask(db, { task_id: taskId, session_id: RUNNER_SESSION });
         const cause: StopCause = next.doc_drift ? "doc_drift" : "plan_not_approved";
         return finish({ cause, exitCode: 1, task: code, detail: `${code} released back (plan ${next.plan_status ?? "-"}, doc_drift ${next.doc_drift})` });
       }
@@ -602,7 +707,7 @@ export async function runBatch(db: DatabaseInstance, opts: RunOptions, deps: Run
       try {
         bgId = deps.claude.spawnBg(args, repo);
       } catch (error) {
-        releaseTask(db, { task_id: taskId, session_id: "task-tracker-run" });
+        releaseTask(db, { task_id: taskId, session_id: RUNNER_SESSION });
         return finish({ cause: "spawn_failed", exitCode: 1, task: code, detail: message(error) });
       }
       log.line(`${code} spawned ${bgId}`);
@@ -615,10 +720,14 @@ export async function runBatch(db: DatabaseInstance, opts: RunOptions, deps: Run
     writeTaskSummary(log, deps, repo, code, outcome, ws);
 
     if (outcome.kind === "stop") {
+      const released = outcome.cause !== "task_cancelled" && releaseIfUnclaimed(db, taskId);
+      const next = released
+        ? `The session never claimed ${code}; the runner released it back to pending.`
+        : `Resume with task-tracker-run --resume ${code}.`;
       addHandoffNote(db, {
         task_id: taskId,
-        session_id: sid ?? `task-tracker-run:${bgId}`,
-        remaining_work: `Batch runner stopped: ${outcome.cause}. ${outcome.detail}. Session ${bgId} (claude attach ${bgId}); resume with task-tracker-run --resume ${code}.`,
+        session_id: sid ?? `${RUNNER_SESSION}:${bgId}`,
+        remaining_work: `Batch runner stopped: ${outcome.cause}. ${outcome.detail}. Session ${bgId} (claude attach ${bgId}). ${next}`,
         discoveries: `runner log: ${log.dir}`,
       });
       return finish({ cause: outcome.cause, exitCode: 1, task: code, bgId, sessionId: sid, detail: outcome.detail });

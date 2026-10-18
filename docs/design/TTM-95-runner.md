@@ -116,8 +116,8 @@ runBatch(project, release, repo, opts):
     sid = agentsJson()[id].sessionId
     watch every 30 s (script poll, no model cost):
       a = agentsJson()[id]; t = getTaskDetail(task.id)
-      if t.status == done and a.status in (idle, waiting-for-prompt) : claude stop id; checks; next
-      if a.state == blocked: first time -> notify owner (print + osascript), log since;
+      if t.status == done (checked first): claude stop id (after grace if still working); checks; next
+      if a.waitingFor or a.status == waiting: first time -> notify owner (print + osascript), log since;
                              renewLease(task, sid) each poll   # 30-min lease must not lapse while waiting
                              (wall timer paused)
       if a.state in (failed, stopped) or a missing: note under sid; stop
@@ -163,14 +163,17 @@ fallback for a session that ends without finishing.
 | Event | Detected by | Runner does |
 |---|---|---|
 | batch done | `getNextTask` -> `all_done` | summary, exit 0 |
-| all blocked | -> `all_blocked`, `blocked_on` | summary lists codes, exit |
+| all blocked | -> `all_blocked`, `blocked_on` | summary lists codes (and `held`, if any), exit |
+| all held | -> `all_held`, `held` (TTM-99) | summary lists each held code, owner and lease end, exit; no waiting: in a sequential runner it means another worker has the batch, and the runner cannot tell a live holder from a forgotten one |
 | plan draft/drifted | -> `plan_not_approved` (+`drift`) | summary, exit |
 | doc drift | `doc_drift: true` on a hand-out | `releaseTask`, summary, exit |
 | owner question | `state: blocked`, `waitingFor: input needed` | **not a stop**: notify, renew lease, wait |
 | permission prompt | `waitingFor: permission prompt` | same as a question (the owner approves in agent view) |
-| ended without finishing | idle, task not done, no question | notify; stop after grace; runner note under `sid` |
+| task done | DB `status == done`, read before the session state on every poll | stop the session (a still-`working` one gets the grace period first), git check, next task; never a timeout or an owner notification |
+| ended without finishing | idle (`state: done`, `status: idle`, observed TTM-95/S20), or a bare `state: blocked` with no `waitingFor`/`status: waiting`; task not done | notify; stop after grace; runner note under `sid`; session left alive |
 | crash / usage limit | `state: failed`/`stopped`, or session missing | runner note with the cause, exit |
-| timeout (working time) | timer excluding blocked time | `claude stop`, note, exit |
+| timeout (working time) | timer excluding blocked time, task not done | `claude stop`, note, exit |
+| any stop before the session claimed | task `in_progress` with `owner_session_id` NULL | `releaseTask` back to pending, note says so (else preflight and `--resume` are wedged until the lease lapses) |
 | dirty tree / wrong branch after done | `git status`, `git rev-parse` | summary, exit |
 
 Every stop prints: cause, task code, session id, `claude attach <id>`, log path.
