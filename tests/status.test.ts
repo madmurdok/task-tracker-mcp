@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openDatabase, type DatabaseInstance } from "../src/db/connection.js";
 import { createProject } from "../src/domain/projects.js";
-import { createTask } from "../src/domain/tasks.js";
+import { createTask, taskCode } from "../src/domain/tasks.js";
 import { addDependency } from "../src/domain/dependencies.js";
 import { approvePlan, upsertPlan } from "../src/domain/plans.js";
 import { createRelease } from "../src/domain/releases.js";
@@ -189,12 +189,13 @@ describe("getNextTask", () => {
     expect(result.task).toBeNull();
     if (result.task === null) {
       expect(result.reason).toBe("all_done");
+      expect("held" in result).toBe(false);
     }
   });
 
   it("does not reclaim an in_progress task before its lock expires", () => {
     const { db, project, makeTask } = setup();
-    makeTask("A");
+    const a = makeTask("A");
 
     getNextTask(db, project.id); // hand out A, lock ~30min out
 
@@ -202,6 +203,54 @@ describe("getNextTask", () => {
     expect(second.task).toBeNull();
     if (second.task === null) {
       expect(second.reason).toBe("all_held");
+      if (second.reason === "all_held") {
+        expect(second.blocked_on).toEqual([]);
+        const row = db.prepare(`SELECT lock_expires_at FROM tasks WHERE id = ?`).get(a.id) as {
+          lock_expires_at: string;
+        };
+        expect(second.held).toEqual([
+          { id: a.id, code: taskCode(project.code_prefix, a.task_number), lock_expires_at: row.lock_expires_at, owner_session_id: null },
+        ]);
+      }
+    }
+  });
+
+  it("with one live and one lapsed in_progress task, reclaims the lapsed one and is not all_held", () => {
+    const { db, project, makeTask } = setup();
+    const a = makeTask("A");
+    const b = makeTask("B");
+    getNextTask(db, project.id);
+    getNextTask(db, project.id);
+    expireLease(db, a.id);
+
+    const result = getNextTask(db, project.id);
+    expect(result.task?.id).toBe(a.id);
+    expect(result).toHaveProperty("reclaimed_from");
+    expect("reason" in result).toBe(false);
+    expect(storedTask(db, b.id).status).toBe("in_progress");
+  });
+
+  it("orders held by soonest lease first, a NULL (legacy) lease last", () => {
+    const { db, project, makeTask } = setup();
+    const a = makeTask("A");
+    const b = makeTask("B");
+    const c = makeTask("C");
+    const d = makeTask("D");
+    for (let i = 0; i < 4; i++) getNextTask(db, project.id);
+    const setLease = db.prepare(`UPDATE tasks SET lock_expires_at = ? WHERE id = ?`);
+    const at = (minutes: number) => new Date(Date.now() + minutes * 60 * 1000).toISOString();
+    setLease.run(at(20), a.id);
+    setLease.run(null, b.id);
+    setLease.run(at(5), c.id);
+    setLease.run(at(10), d.id);
+
+    const result = getNextTask(db, project.id);
+    expect(result.task).toBeNull();
+    if (result.task === null && result.reason === "all_held") {
+      expect(result.held.map((h) => h.id)).toEqual([c.id, d.id, a.id, b.id]);
+      expect(result.held[3]!.lock_expires_at).toBeNull();
+    } else {
+      expect.unreachable("expected all_held");
     }
   });
 
@@ -416,6 +465,7 @@ describe("getNextTask scoped to a release batch with an approved plan", () => {
         expect(exhausted.reason).toBe("all_held");
         if (exhausted.reason === "all_held") {
           expect(exhausted.blocked_on).toEqual([]);
+          expect(exhausted.held.map((h) => h.id).sort()).toEqual([a!.id, b!.id, c!.id].sort());
         }
       }
       for (const t of [a!, b!, c!]) {
@@ -439,6 +489,7 @@ describe("getNextTask scoped to a release batch with an approved plan", () => {
         expect(exhausted.reason).toBe("all_blocked");
         if (exhausted.reason === "all_blocked") {
           expect(exhausted.blocked_on).toEqual([c!.id]);
+          expect(exhausted.held.map((h) => h.id).sort()).toEqual([a!.id, b!.id].sort());
         }
       }
       expect(storedTask(db, c!.id).status).toBe("pending");
@@ -474,11 +525,35 @@ describe("getNextTask scoped to a release batch with an approved plan", () => {
       expect(result.reason).toBe("all_blocked");
       if (result.reason === "all_blocked") {
         expect(result.blocked_on).toEqual([blocked.id]);
+        expect(result.held).toEqual([]);
       }
     }
     // The prerequisite is pending and unblocked, and an unscoped call would
     // have handed it out - being outside the batch is the only reason it wasn't.
     expect(storedTask(db, prerequisite.id).status).toBe("pending");
+  });
+
+  it("does not list a held task of the project that is outside the batch", () => {
+    const { db, project, release, makeTask, makeBacklogTask } = setupBatch();
+    const outside = makeBacklogTask("held, outside the batch");
+    const inside = makeTask("held, inside the batch");
+    upsertPlan(db, project.id, release.version, { steps: [inside.id] });
+    sliceAll(db, inside);
+    approvePlan(db, project.id, release.version, { approved_by: "owner" });
+    expect(getNextTask(db, project.id, release.version).task?.id).toBe(inside.id);
+    markStatus(db, outside.id, "in_progress");
+    db.prepare(`UPDATE tasks SET lock_expires_at = ? WHERE id = ?`).run(
+      new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      outside.id,
+    );
+
+    const result = getNextTask(db, project.id, release.version);
+    expect(result.task).toBeNull();
+    if (result.task === null && result.reason === "all_held") {
+      expect(result.held.map((h) => h.id)).toEqual([inside.id]);
+    } else {
+      expect.unreachable("expected all_held");
+    }
   });
 
   it("reports all_done once the batch is finished, whatever is left elsewhere", () => {
