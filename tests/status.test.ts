@@ -201,7 +201,7 @@ describe("getNextTask", () => {
     const second = getNextTask(db, project.id);
     expect(second.task).toBeNull();
     if (second.task === null) {
-      expect(second.reason).toBe("all_blocked");
+      expect(second.reason).toBe("all_held");
     }
   });
 
@@ -409,12 +409,12 @@ describe("getNextTask scoped to a release batch with an approved plan", () => {
       // Step 1 is wholly held: it yields nothing and the walk moves to step 2.
       expect(next().task?.id).toBe(c!.id);
 
-      // Nothing left anywhere: the exhausted answer, naming no held task as blocked.
+      // Nothing left anywhere: all_held, naming no held task as blocked.
       const exhausted = next();
       expect(exhausted.task).toBeNull();
       if (exhausted.task === null) {
-        expect(exhausted.reason).toBe("all_blocked");
-        if (exhausted.reason === "all_blocked") {
+        expect(exhausted.reason).toBe("all_held");
+        if (exhausted.reason === "all_held") {
           expect(exhausted.blocked_on).toEqual([]);
         }
       }
