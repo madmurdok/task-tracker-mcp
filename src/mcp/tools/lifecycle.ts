@@ -65,7 +65,7 @@ export function registerLifecycleTools(
     "release_task",
     {
       description:
-        "Release ownership of a task so it's immediately available again, instead of waiting for its lock to expire. Pass force to override another session's still-active lock. Accepts a task's uuid or its code (`TTM-63`).",
+        "Release ownership of a task so it's immediately available again, instead of waiting for its lock to expire. Pass force to override another session's still-active lock. Refuses a done or cancelled task. Accepts a task's uuid or its code (`TTM-63`).",
       inputSchema: {
         task_id: z.string().min(1),
         session_id: z.string().min(1),
