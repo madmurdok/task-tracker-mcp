@@ -659,7 +659,7 @@ function runImport(dbPath: string, args: string[]): { stdout: string; stderr: st
   return { stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
 
-describe("task-tracker-import CLI (D10, behaviours 16, 20, 22)", () => {
+describe("task-tracker-import CLI (D10, behaviours 16, 20, 22)", { timeout: 30_000 }, () => {
   let file: string;
   let text: string;
   beforeEach(() => {

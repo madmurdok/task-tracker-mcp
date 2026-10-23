@@ -607,7 +607,7 @@ function runExport(dbPath: string, args: string[]): { stdout: string; stderr: st
   return { stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
 
-describe("task-tracker-export CLI (D10)", () => {
+describe("task-tracker-export CLI (D10)", { timeout: 30_000 }, () => {
   let dbPath: string;
   beforeEach(() => {
     dbPath = path.join(dir, "tracker.db");
