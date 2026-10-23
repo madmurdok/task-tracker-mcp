@@ -108,9 +108,43 @@ runtime hash of `sqlite_master.sql` differs between a fresh and a migrated DB
 (column order, rebuilt CHECK text) at the same logical schema, so it would
 refuse valid imports.
 
-Import rule: `schema_version > SCHEMA_VERSION` -> refuse "file is newer than
-this build"; `< SCHEMA_VERSION` -> refuse "older schema, no upgrade path yet"
-(see Must confirm 1). Both before any write.
+Import rule (owner, Resolved 1), all before any write:
+
+- `schema_version` not a positive integer -> refuse (`unsupported_format`).
+- `schema_version > SCHEMA_VERSION` -> refuse "file is newer than this build"
+  (`schema_mismatch`).
+- `schema_version == SCHEMA_VERSION` -> **exact** column check: per table, each
+  row's key set equals the target's column set. A mismatch at the same version
+  means a forged or buggy file.
+- `schema_version < SCHEMA_VERSION` -> **subset** check, the compatibility
+  rule:
+  - every table key in `rows` must exist in the target registry (an unknown
+    table is refused); a registry table absent from the file is read as empty;
+  - every key of every row must be a column of the target table (an unknown
+    column is refused, naming `table.column`);
+  - every target column missing from a row must have `notnull = 0` or a
+    non-NULL `dflt_value` in `PRAGMA table_info`; otherwise refuse, naming
+    `table.column` ("required by this build, absent from the file");
+  - the insert names only the columns the row carries, so SQLite fills the
+    rest with NULL or their DEFAULT.
+
+  With `SCHEMA_VERSION = 1` no older version exists yet, so the rule is
+  written and tested now but first applies at the first bump. `checkColumns(db,
+  doc, mode: "exact" | "subset")` is a separate function, and
+  `importProjects` takes `currentSchemaVersion` (default `SCHEMA_VERSION`) so a
+  test can import a `schema_version: 1` file as "older" against
+  `currentSchemaVersion: 2`.
+
+Interaction with the fingerprint test and future bumps: the fingerprint
+test forces the bump; the subset rule decides automatically whether old files
+still import. An additive change (new table, new nullable or defaulted column)
+keeps them importable; a rename, drop, or new NOT NULL column without DEFAULT
+makes the rule refuse them, naming the column. No per-version upgrade code.
+The fingerprint test's comment tells whoever bumps to add
+`tests/fixtures/backup/schema-v<old>.json` (an export made before the bump) and
+a test that imports it, so the promise is checked and does not just hold on
+paper. Round-trip byte-identity is promised only at equal versions (an older
+file gains the new columns' defaults on re-export).
 
 ### D3. Table registry and the guard test
 
@@ -189,8 +223,21 @@ buys a file where one project's data can be read or cut out on its own.
 Resolve the selection first (unknown project -> `Unknown project: <ref>`,
 non-zero exit, no file touched), run the read transaction, serialise, then
 write `<out>.tmp-<pid>` in the same directory and `rename` it over `<out>`. A
-failure at any step leaves no file and no partial file.
-Trade-off: overwrites an existing `<out>` silently (see Must confirm 3).
+failure at any step leaves no file and no partial file. An existing `<out>`
+is replaced atomically (owner, Resolved 3).
+
+Forbidden targets (owner, Resolved 5), checked first, before the read, in
+`exportToFile` so the CLI and the MCP tool share it: refuse
+(`forbidden_out_path`) when the resolved out path equals the open DB's file
+(`db.name`) or that path plus `-wal` or `-shm`. Comparison is on
+`path.join(fs.realpathSync(dirname), basename)` for both sides (the parent
+directory exists by then; a missing one is an ordinary write error), so a
+symlinked directory or a relative path cannot slip past it. Skipped for
+`:memory:`.
+
+Trade-off: an existing backup at `<out>` is replaced without asking; scripted
+backups reuse names, and the forbidden list protects the one file that must
+never be overwritten.
 
 ### D7. Import
 
@@ -199,9 +246,9 @@ Order of operations - everything up to step 5 runs before any write:
 1. Parse JSON; refuse non-object / missing `format` / `format !==
    "task-tracker-export"` / `format_version !== 1` (`unsupported_format`).
 2. `schema_version` against `SCHEMA_VERSION` (D2) (`schema_mismatch`).
-3. Shape: each project entry has `project` and `rows`; `rows` keys equal the
-   registry minus `projects`; each row's key set equals the target table's
-   column set (`schema_mismatch`, naming table and column).
+3. Shape: each project entry has `project` and `rows`; then the column check
+   of D2, `exact` at equal version and `subset` at an older one
+   (`schema_mismatch`, naming table and column).
 4. Root-path map (D8) applied in memory; malformed `old=new` -> usage error.
 5. Clash: every file project's `id`, `name` and `code_prefix` checked against
    the target `projects` table, and against each other inside the file; any
@@ -242,16 +289,48 @@ guarantee nothing was written.
 ### D8. Root-path map scope
 
 `--root-path-map old=new` (repeatable; split on the first `=`; both sides
-`path.resolve`d, trailing slash stripped). For each project, the longest `old`
-that equals `root_path` or is a prefix of it at a `/` boundary is replaced by
-`new`. Also rewritten: `design_doc_path` only when it is absolute and under
-`old` (relative ones, the normal case, follow the root automatically). Not
-rewritten: `task_files.file_path`, `task_slices.artifacts`, any free text -
-they are history, not live locations. A map entry that matches no project is
-reported in the result (`unused_root_path_maps`), not refused.
+must be absolute, are `path.resolve`d and have any trailing `/` stripped;
+otherwise a usage error). Owner, Resolved 4: absolute paths in task files and
+artifacts are rewritten too.
 
-Trade-off: absolute paths inside task files/artifacts keep pointing at the
-old machine; rewriting free text was judged riskier than stale history.
+Match rule, one function `rewritePath(p, maps)` used for every column:
+
+- only an absolute `p` (`path.isAbsolute`) is considered; relative paths are
+  never touched;
+- `old` matches when `p === old` or `p.startsWith(old + "/")`, a whole
+  path-segment prefix, so `/a/b` matches `/a/b` and `/a/b/x` but not `/a/bc`;
+- among matching entries, the longest `old` wins;
+- the result is `new + p.slice(old.length)`; the rest of `p` is kept byte for
+  byte (no normalisation of `..`, `//` or case).
+
+Columns rewritten, exactly:
+
+| column | how |
+|---|---|
+| `projects.root_path` | `rewritePath` |
+| `projects.design_doc_path` | `rewritePath` (only matters when absolute; the normal relative value follows the root on its own) |
+| `task_files.file_path` | `rewritePath` |
+| `task_slices.artifacts` | `JSON.parse`; when the result is an array, `rewritePath` each string element and leave non-strings as they are; when any element changed, store `JSON.stringify(array)` (compact, like the domain writes it), else keep the original text byte for byte. Text that does not parse, or parses to a non-array, is left unchanged and its slice id listed in `artifacts_not_rewritten`. |
+
+Not rewritten: `task_amendments.previous_value` (a `file_paths` amendment
+holds the old value as written then: it is a quote, and the trail's value is
+that it is unchanged), `task_slices.result`/`brief`/`metrics`, handoff notes,
+descriptions and every other free text.
+
+Hashes: no change. `design_doc_hash` is a sha256 of the doc's content
+(projects.ts:76-83), not of its path, and it is the reconciled baseline;
+import never re-hashes. No other column holds a hash.
+
+Result: `root_path_rewrites: { "projects.root_path": n,
+"projects.design_doc_path": n, "task_files.file_path": n,
+"task_slices.artifacts": n }` (rows changed), and `unused_root_path_maps` for
+entries that matched nothing (reported, not refused). The map is applied in
+memory before the clash check, so the check sees the rows as they will be
+written.
+
+Trade-off: rewriting history columns means an imported trail no longer shows
+the source machine's paths; the owner preferred live, resolvable paths.
+The segment-prefix rule keeps that from touching a sibling directory.
 
 ### D9. Cross-project dependency edges (the GMB-22 -> GM-79 case)
 
@@ -264,7 +343,7 @@ target DB or the file; otherwise it is skipped and listed in the result
 (`skipped_dependencies: [{ task_id, depends_on_task_id }]`), not refused.
 Recommended because a dependency on another project's task is an annotation,
 and refusing would make a single-project backup of GMB unrestorable into an
-empty DB. Any other dangling reference is refused (step 6). See Must confirm 2.
+empty DB. Any other dangling reference is refused (step 6). Owner, Resolved 2.
 
 ### D10. Bins
 
@@ -290,13 +369,14 @@ path.
   `{ path, projects: [{ id, name }], counts, external_dependencies }`.
 - `import_projects { path: string, root_path_map?: Record<string, string> }` ->
   `{ path, projects: [{ id, name, code_prefix }], counts,
-  skipped_dependencies, unused_root_path_maps }`.
+  skipped_dependencies, root_path_rewrites, unused_root_path_maps,
+  artifacts_not_rewritten }`.
 - Never the JSON body in a result.
 - `out_path`/`path` must be absolute (the server's cwd is whatever the client
   launched it in) -> `errorResult` otherwise. Exactly one of `project_id`/`all`.
 - Refusals: domain throws `BackupRefusal` with `code` in
   `unsupported_format | schema_mismatch | clash | dangling_reference |
-  unknown_project`; the tool maps it to
+  unknown_project | forbidden_out_path`; the tool maps it to
   `{ error: code, message, details }` with `isError: true` (new
   `backupRefusalResult` in toolResult.ts, same style as `conflictResult`). The
   CLI prints the same message. Same refusals, one source.
@@ -316,7 +396,8 @@ chat, but remove any guess about which directory a relative path means.
   `resolveSelection(db, ref | { all: true })` (uses `requireProject`,
   projects.ts:101-107, throwing `BackupRefusal("unknown_project")`),
   `exportProjects(db, selection, { now })` (one read transaction),
-  `serializeExport(doc)` (canonical JSON), `writeExportFile(outPath, text)`
+  `serializeExport(doc)` (canonical JSON), `assertOutPathAllowed(db, outPath)`
+  (D6 forbidden targets), `writeExportFile(outPath, text)`
   (tmp + rename), `exportToFile(db, selection, outPath, { now })` returning
   `{ path, projects, counts, external_dependencies }` (the one entry point the
   CLI and MCP tool both call).
@@ -330,11 +411,18 @@ chat, but remove any guess about which directory a relative path means.
 
 ### TTM-107 code slice (import)
 
-- src/domain/backup.ts: `parseExport(text)` (steps 1-3),
-  `parseRootPathMap(entries)`, `applyRootPathMap(doc, map)` (D8),
+- src/domain/backup.ts: `parseExport(text)` (steps 1-2),
+  `checkColumns(db, doc, mode)` (step 3, D2 exact/subset),
+  `parseRootPathMap(entries)`, `rewritePath(p, maps)`,
+  `applyRootPathMap(doc, map)` (D8: the four columns, artifacts via
+  JSON.parse/stringify; returns the rewrite counts),
   `findClashes(db, doc)` (step 5), `checkReferences(db, doc)` (step 6, D9),
-  `importProjects(db, doc, { rootPathMap })` (step 7), `importFromFile(db,
-  path, opts)` - the shared entry point.
+  `importProjects(db, doc, { rootPathMap, currentSchemaVersion })` (step 7;
+  inserts name only the row's own columns), `importFromFile(db, path, opts)` -
+  the shared entry point.
+- tests/schema-version.test.ts (from TTM-106): extend its comment with the
+  bump procedure (D2: add `tests/fixtures/backup/schema-v<old>.json` plus an
+  import test).
 - src/cli/import.ts (new); package.json `bin` add `task-tracker-import`;
   README.
 - tests: tests/backup-import.test.ts, round trip in the same file, CLI cases.
@@ -366,9 +454,13 @@ chat, but remove any guess about which directory a relative path means.
    fails the guard (control: add `CREATE TABLE extra(...)` to SCHEMA_SQL).
 6. Fingerprint: `{SCHEMA_VERSION, fingerprint}` equals the literal; a migrated
    legacy DB has the same fingerprint as a fresh one.
-7. Unknown project -> exit 1, stderr names it, `--out` path does not exist
-   afterwards (also when it did not exist before; and an existing file is not
-   modified - only if Must confirm 3 picks refuse/keep).
+7. Unknown project -> exit 1, stderr names it, a non-existent `--out` path
+   still does not exist afterwards, and an existing `--out` file is unchanged.
+   On success an existing `--out` is replaced and no `*.tmp-*` file remains.
+11. `--out` equal to the DB path, `<db>-wal` or `<db>-shm` (also reached
+    through a symlinked directory or a relative path) -> `forbidden_out_path`,
+    exit 1, DB files unchanged; an unrelated path in the same directory is
+    allowed.
 8. Consistency under a concurrent writer: rows written by a second connection
    after the export's transaction started are absent from the file (one
    snapshot).
@@ -385,44 +477,56 @@ chat, but remove any guess about which directory a relative path means.
    a cancelled release).
 2. Clash on id, on name, on code_prefix: non-zero exit naming the clash; target
    DB byte-for-byte unchanged (compare a full export before/after).
-3. `format_version` unknown, `format` missing, newer `schema_version`, older
-   `schema_version`, extra/missing column: refused before any write.
+3. `format_version` unknown, `format` missing, non-integer or newer
+   `schema_version`, and at equal version any extra or missing column: refused
+   before any write, naming the cause.
+3a. Older `schema_version` (file `1` against `currentSchemaVersion: 2`):
+    a row missing a nullable or defaulted column (e.g. `tasks.completion_summary`,
+    `tasks.priority`) imports with NULL/default; a row missing a NOT NULL
+    column without DEFAULT (e.g. `tasks.title`) is refused naming
+    `tasks.title`; an unknown column or table is refused; a missing table is
+    imported as empty. Every refusal leaves the target unchanged.
 4. Imported DB answers `get_project_status`, `list_tasks`, `get_next_task` the
    same as the source (same root_path, so doc drift matches too).
 5. After import, `create_task` gets `MAX(task_number)+1` and `create_release`
    gets the next `sequence` (counters continue, not restart).
-6. `--root-path-map`: root_path rewritten at prefix boundary only
-   (`/a/b` does not match `/a/bc`); relative `design_doc_path` untouched;
-   `design_doc_hash` untouched; unused map reported.
+6. `--root-path-map`: `root_path`, absolute `design_doc_path`,
+   `task_files.file_path` and each absolute string in `task_slices.artifacts`
+   rewritten at a whole-segment prefix only (`/a/b` -> rewrites `/a/b` and
+   `/a/b/x`, not `/a/bc`); longest `old` wins; relative paths untouched;
+   artifacts with no matching element keep their original text byte for byte;
+   unparseable/non-array artifacts left as-is and listed;
+   `task_amendments.previous_value` and `design_doc_hash` untouched; counts in
+   `root_path_rewrites`; unused map entries reported; a non-absolute side is a
+   usage error.
 7. Mid-transaction failure (e.g. a forged PK clash in `handoff_notes`) leaves
    the target unchanged.
 8. Cross-project edge: inserted when the target task exists, skipped and
-   listed when not (per Must confirm 2's answer).
+   listed in `skipped_dependencies` when not; the rest of the import succeeds.
 
 ### TTM-108
 
 1. Both tools in the exact smoke list; results contain path and counts and no
    row data (assert result text length is small / has no `rows` key).
-2. Relative paths refused; both or neither of `project_id`/`all` refused.
+2. Relative paths refused; both or neither of `project_id`/`all` refused;
+   `out_path` equal to the server's own DB, `-wal` or `-shm` refused with
+   `forbidden_out_path`.
 3. Each `BackupRefusal` code reaches the client as `isError` with the same
    message the CLI prints.
 4. Export -> import over the transport into a second DB matches the CLI round
    trip.
 
-## Must confirm (owner)
+## Resolved (owner, 2026-10-23)
 
-1. Older `schema_version` in the file: refuse (recommended for v1: no upgrade
-   path is written yet, and an import that relies on column defaults could
-   silently invent values) vs. accept when the file's columns are a subset and
-   the missing ones have defaults.
-2. Cross-project dependency edges on import (live case GMB-22 -> GM-79/80):
-   skip-and-report (recommended) vs. refuse the import vs. a flag.
-3. Existing `--out` file: overwrite atomically (recommended; scripted backups
-   reuse names) vs. refuse unless `--force`.
-4. `--root-path-map` leaves `task_files` and `artifacts` absolute paths
-   unchanged (recommended) - or should prefix-matching absolute paths there be
-   rewritten too?
-5. Export via MCP writes a file on the server's host with the server's
-   permissions; is any directory restriction wanted (e.g. refuse writing into
-   `~/.task-tracker/` itself, so a backup cannot overwrite `tracker.db`)?
-   Recommended: refuse `out_path` equal to the DB path or its `-wal`/`-shm`.
+1. Older `schema_version`: "Принимать, если колонки — подмножество" - the
+   subset rule of D2 (unknown table/column refused; a missing column must be
+   nullable or have a DEFAULT, else refused naming `table.column`; newer
+   versions still refused).
+2. Cross-project dependency edges on import: "Пропускать с отчётом
+   (Recommended)" - D9 as written.
+3. Existing `--out` file: "Перезаписывать атомарно (Recommended)" - D6.
+4. Paths in task files and artifacts: "--root-path-map и в task_files/artifacts"
+   - D8 (whole-segment prefix rule; `task_files.file_path` and string elements
+   of `task_slices.artifacts`; hashes unchanged).
+5. Export target: "Запрет out_path = БД/-wal/-shm (Recommended)" - D6
+   forbidden targets, shared by the CLI and `export_projects`.
