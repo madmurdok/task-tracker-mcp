@@ -1,9 +1,9 @@
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { claudeBin, classifyAgent, createClaudeBg, parseBgId } from "../src/cli/claudeBg.js";
+import { claudeBin, classifyAgent, createClaudeBg, findTrust, parseBgId, SpawnError } from "../src/cli/claudeBg.js";
 
 /**
  * TTM-95: the `claude` CLI wrapper behind the batch runner
@@ -60,7 +60,14 @@ describe("createClaudeBg over a fake claude binary", () => {
   let logFile: string;
   let agentsFile: string;
   const saved: Record<string, string | undefined> = {};
-  const envKeys = ["FAKE_CLAUDE_LOG", "FAKE_CLAUDE_BG_OUT", "FAKE_CLAUDE_AGENTS", "FAKE_CLAUDE_EXIT", "CLAUDE_BIN"];
+  const envKeys = [
+    "FAKE_CLAUDE_LOG",
+    "FAKE_CLAUDE_BG_OUT",
+    "FAKE_CLAUDE_BG_ERR",
+    "FAKE_CLAUDE_AGENTS",
+    "FAKE_CLAUDE_EXIT",
+    "CLAUDE_BIN",
+  ];
 
   beforeEach(() => {
     dir = realpathSync(mkdtempSync(path.join(tmpdir(), "ttm95-claude-")));
@@ -69,6 +76,7 @@ describe("createClaudeBg over a fake claude binary", () => {
     for (const k of envKeys) saved[k] = process.env[k];
     process.env.FAKE_CLAUDE_LOG = logFile;
     delete process.env.FAKE_CLAUDE_EXIT;
+    delete process.env.FAKE_CLAUDE_BG_ERR;
   });
 
   afterEach(() => {
@@ -139,5 +147,163 @@ describe("createClaudeBg over a fake claude binary", () => {
   it("stopBg runs `claude stop <id>`", () => {
     createClaudeBg(fakeClaude).stopBg("1a2b3c4d");
     expect(calls()[0].args).toEqual(["stop", "1a2b3c4d"]);
+  });
+});
+
+// ------------------------------------------------ TTM-104: the CLI's words
+
+describe("spawnBg failures keep the CLI's stderr (TTM-104 behaviour 15)", () => {
+  let dir: string;
+  const saved: Record<string, string | undefined> = {};
+  const envKeys = ["FAKE_CLAUDE_LOG", "FAKE_CLAUDE_BG_OUT", "FAKE_CLAUDE_BG_ERR", "FAKE_CLAUDE_EXIT"];
+
+  beforeEach(() => {
+    dir = realpathSync(mkdtempSync(path.join(tmpdir(), "ttm104-spawn-")));
+    for (const k of envKeys) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+  });
+
+  afterEach(() => {
+    for (const k of envKeys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function spawnError(): SpawnError {
+    try {
+      createClaudeBg(fakeClaude).spawnBg(["p"], dir);
+    } catch (error) {
+      expect(error).toBeInstanceOf(SpawnError);
+      return error as SpawnError;
+    }
+    throw new Error("spawnBg did not throw");
+  }
+
+  it("a non-zero exit: the whole multi-line stderr, ANSI stripped (private-mode too), with the exit status", () => {
+    process.env.FAKE_CLAUDE_BG_OUT = "starting";
+    process.env.FAKE_CLAUDE_BG_ERR =
+      "\u001b[?25l\u001b[31mError:\u001b[0m could not start\nWorkspace not trusted: run claude here first\u001b[?25h";
+    process.env.FAKE_CLAUDE_EXIT = "2";
+    const e = spawnError();
+    expect(e.status).toBe(2);
+    expect(e.stderr).toBe("Error: could not start\nWorkspace not trusted: run claude here first");
+    expect(e.stdout).toBe("starting");
+    expect(e.message).toBe("claude --bg failed (exit 2): Error: could not start\nWorkspace not trusted: run claude here first");
+  });
+
+  it("a non-zero exit with empty stderr names stdout", () => {
+    process.env.FAKE_CLAUDE_BG_OUT = "only stdout here";
+    process.env.FAKE_CLAUDE_EXIT = "1";
+    const e = spawnError();
+    expect(e.stderr).toBe("");
+    expect(e.message).toBe("claude --bg failed (exit 1): only stdout here");
+  });
+
+  it("no session id printed: a SpawnError with status 0 and the stdout", () => {
+    process.env.FAKE_CLAUDE_BG_OUT = "\u001b[1msomething went wrong\u001b[0m";
+    const e = spawnError();
+    expect(e.status).toBe(0);
+    expect(e.stdout).toBe("something went wrong");
+    expect(e.message).toMatch(/^claude --bg printed no session id: something went wrong$/);
+  });
+
+  it("SpawnError.from: a missing binary has no status and keeps the original message", () => {
+    const e = SpawnError.from(Object.assign(new Error("spawn /nope ENOENT"), { code: "ENOENT" }));
+    expect(e.status).toBeNull();
+    expect(e.message).toBe("claude --bg failed (exit -): spawn /nope ENOENT");
+    expect(SpawnError.from(e)).toBe(e);
+  });
+});
+
+describe("workspace trust from Claude Code's config (TTM-104 behaviour 16)", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = realpathSync(mkdtempSync(path.join(tmpdir(), "ttm104-trust-")));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const trusted = (...paths: string[]) => ({
+    projects: Object.fromEntries(paths.map((p) => [p, { hasTrustDialogAccepted: true }])),
+  });
+
+  describe("findTrust", () => {
+    it("trusted by the exact path", () => {
+      expect(findTrust(trusted("/a/b/repo"), "/a/b/repo")).toBe(true);
+    });
+
+    it("trusted through an ancestor entry", () => {
+      expect(findTrust(trusted("/a"), "/a/b/repo")).toBe(true);
+    });
+
+    it("an explicit false on the repo does not hide a trusted ancestor", () => {
+      const config = { projects: { "/a/b/repo": { hasTrustDialogAccepted: false }, "/a": { hasTrustDialogAccepted: true } } };
+      expect(findTrust(config, "/a/b/repo")).toBe(true);
+    });
+
+    it("false with no trusted entry on the way up (siblings, descendants and non-true flags do not count)", () => {
+      const config = {
+        projects: {
+          "/a/b/other": { hasTrustDialogAccepted: true },
+          "/a/b/repo/sub": { hasTrustDialogAccepted: true },
+          "/a/b/repo": { hasTrustDialogAccepted: "true" },
+          "/a/b": {},
+        },
+      };
+      expect(findTrust(config, "/a/b/repo")).toBe(false);
+    });
+
+    it("a relative dir is resolved against the cwd", () => {
+      expect(findTrust(trusted(process.cwd()), "some/rel/dir")).toBe(true);
+    });
+
+    it("trusted through the real path of a symlinked dir", () => {
+      const real = path.join(dir, "real", "repo");
+      mkdirSync(real, { recursive: true });
+      const link = path.join(dir, "link");
+      symlinkSync(path.join(dir, "real"), link);
+      expect(findTrust(trusted(path.join(dir, "real")), path.join(link, "repo"))).toBe(true);
+    });
+
+    it.each([
+      ["not an object", "nope"],
+      ["null", null],
+      ["no projects", { other: 1 }],
+      ["projects not an object", { projects: "x" }],
+      ["projects an array", { projects: [] }],
+    ] as const)("null when the config is %s", (_label, config) => {
+      expect(findTrust(config, "/a/b/repo")).toBeNull();
+    });
+  });
+
+  describe("createClaudeBg().workspaceTrusted over a temp config file", () => {
+    function bg(content?: string) {
+      const file = path.join(dir, ".claude.json");
+      if (content !== undefined) writeFileSync(file, content);
+      return createClaudeBg(fakeClaude, () => file);
+    }
+
+    it("true for a repo under a trusted ancestor", () => {
+      expect(bg(JSON.stringify(trusted(dir))).workspaceTrusted(path.join(dir, "repo"))).toBe(true);
+    });
+
+    it("false with no trusted ancestor", () => {
+      expect(bg(JSON.stringify(trusted("/elsewhere"))).workspaceTrusted(path.join(dir, "repo"))).toBe(false);
+    });
+
+    it.each([
+      ["missing", undefined],
+      ["malformed JSON", "{ not json"],
+      ["without projects", JSON.stringify({ numStartups: 3 })],
+    ] as const)("null when the config is %s", (_label, content) => {
+      expect(bg(content).workspaceTrusted(dir)).toBeNull();
+    });
   });
 });
