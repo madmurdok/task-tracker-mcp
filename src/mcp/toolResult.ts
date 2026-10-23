@@ -56,3 +56,11 @@ export function openSlicesResult(details: {
     isError: true,
   };
 }
+
+export function backupRefusalResult(details: { code: string; message: string; details?: unknown }): CallToolResult {
+  const { code, ...rest } = details;
+  return {
+    content: [{ type: "text", text: JSON.stringify({ error: code, ...rest }) }],
+    isError: true,
+  };
+}

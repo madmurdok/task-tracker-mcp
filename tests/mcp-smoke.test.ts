@@ -100,6 +100,8 @@ describe("MCP server smoke test", () => {
         "revise_task_slices",
         "start_slice",
         "complete_slice",
+        "export_projects",
+        "import_projects",
       ].sort(),
     );
 

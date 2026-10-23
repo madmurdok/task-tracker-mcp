@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DatabaseInstance } from "../db/connection.js";
 import { HeuristicBudgetEstimator } from "../domain/budget.js";
 import { GitDiffCompletionVerifier } from "../domain/verification.js";
+import { registerBackupTools } from "./tools/backup.js";
 import { registerDependencyTools } from "./tools/dependencies.js";
 import { registerEpicTools } from "./tools/epics.js";
 import { registerLifecycleTools } from "./tools/lifecycle.js";
@@ -31,6 +32,7 @@ export function createServer(db: DatabaseInstance): McpServer {
   registerLifecycleTools(server, db, verifier);
   registerPlanTools(server, db);
   registerSliceTools(server, db);
+  registerBackupTools(server, db);
 
   return server;
 }
