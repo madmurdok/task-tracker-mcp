@@ -189,7 +189,7 @@ describe("import_projects", () => {
     });
 
     expect(r.isError).toBe(true);
-    expect(r.json?.error).toBeUndefined();
+    expect(r.text).toMatch(/absolute/);
     expect(count(target, "projects")).toBe(0);
   });
 
