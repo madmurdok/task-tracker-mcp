@@ -103,6 +103,29 @@ npm run export -- --all --out all.json
 Exit codes: 0 ok (stdout: the out path and per-table row counts), 1 refusal or
 error (unknown project, forbidden out path; no file written), 2 usage error.
 
+## Import CLI
+
+`dist/cli/import.js` (bin `task-tracker-import`) restores the projects of an
+export file into the DB at `TASK_TRACKER_DB_PATH` (a missing path is created
+empty). Everything is checked before the one write transaction: the envelope
+and `schema_version` (a newer file is refused; an older one imports when its
+columns are a subset this build accepts), every column, a clash on project
+`id`, `name` or `code_prefix` (refuses the whole import), and every reference.
+A dependency on a task in neither the file nor the DB is skipped and listed.
+UUIDs, task numbers, sequences, timestamps and leases are kept as they are.
+`--root-path-map old=new` (repeatable, both sides absolute) rewrites
+`root_path`, an absolute `design_doc_path`, `task_files.file_path` and the
+paths in `task_slices.artifacts` at a whole path-segment prefix; hashes and
+history are left alone.
+
+```bash
+npm run import -- backup.json
+npm run import -- all.json --root-path-map /Users/old/Projects=/home/new/Projects
+```
+
+Exit codes: 0 ok (stdout: the file, imported projects, per-table row counts,
+skipped dependencies), 1 refusal or error (nothing written), 2 usage error.
+
 ## SessionEnd hook CLI
 
 `dist/cli/session-end.js` (bin `task-tracker-session-end`) is meant to run as a

@@ -123,8 +123,11 @@ Import rule (owner, Resolved 1), all before any write:
   - every key of every row must be a column of the target table (an unknown
     column is refused, naming `table.column`);
   - every target column missing from a row must have `notnull = 0` or a
-    non-NULL `dflt_value` in `PRAGMA table_info`; otherwise refuse, naming
-    `table.column` ("required by this build, absent from the file");
+    non-NULL `dflt_value` in `PRAGMA table_info`, and must not be part of the
+    primary key (`pk > 0`): SQLite reports `notnull = 0` for a `TEXT PRIMARY
+    KEY`, so without this an omitted `id` would insert NULL (TTM-107 review
+    F1); otherwise refuse, naming `table.column` ("required by this build,
+    absent from the file");
   - the insert names only the columns the row carries, so SQLite fills the
     rest with NULL or their DEFAULT.
 
