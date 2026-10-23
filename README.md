@@ -38,7 +38,9 @@ npm run dashboard  # read-only live web dashboard, see below
 `amend_task`, `cancel_task`, `delete_task`, `add_dependency`, `split_task`, `get_next_task`, `get_task`,
 `set_task_slices`, `revise_task_slices`, `start_slice`, `complete_slice`,
 `list_tasks`, `get_project_status`, `claim_task`, `release_task`, `check_doc_sync`, `set_design_doc`,
-`add_handoff_note`, `complete_task`, `create_plan`, `get_plan`, `approve_plan`.
+`add_handoff_note`, `complete_task`, `create_plan`, `get_plan`, `approve_plan`,
+`export_projects` (JSON backup of one or all projects to an absolute `out_path`),
+`import_projects` (restore such a file, optional `root_path_map`).
 
 Every tool that takes a `project_id` also accepts the project's unique `name`
 instead, so you don't have to keep its UUID around once it's been created.
@@ -82,6 +84,93 @@ Preflight: `claude --version`, a clean checkout on `release-<version>`, an
 approved plan without drift, and no `in_progress` batch task unless `--resume`.
 Overrides for tests: `CLAUDE_BIN` (the `claude` binary), `TTM_RUNNER_NOTIFY`
 (`off`, or a command called with title and message), `TASK_TRACKER_RUNS_DIR`.
+
+## Backup & restore
+
+JSON backup of one or all projects, restorable into another (or a fresh)
+database. Design and decisions: `docs/design/backup-restore.md`. Step-by-step
+for a reinstall: [`docs/runbooks/reinstall-backup-restore.md`](docs/runbooks/reinstall-backup-restore.md).
+
+### Export
+
+`dist/cli/export.js` (bin `task-tracker-export`) reads the DB at
+`TASK_TRACKER_DB_PATH` (default `~/.task-tracker/tracker.db`); every row of the
+project's twelve tables goes in, read in one transaction. Keys are sorted, so
+two exports of an unchanged DB differ only on the `exported_at` line.
+
+```bash
+npm run build
+npm run export -- <project_id_or_name> --out backup.json   # one project
+npm run export -- --all --out all.json                     # every project
+```
+
+- `<project_id_or_name>` and `--all` are mutually exclusive; one is required.
+- `--out <file>` is required. The file is written to `<out>.tmp-<pid>` and
+  renamed over `<out>`: an existing file is replaced atomically, and a failure
+  leaves no file.
+- Forbidden out paths: the DB file or its `-wal`/`-shm` (compared after
+  resolving symlinks) are refused (`forbidden_out_path`), nothing is written.
+- stdout: the out path, per-table row counts and `external_dependencies`
+  (dependency edges that point at tasks outside the export).
+- Exit codes: 0 ok, 1 refusal or error (unknown project, forbidden out path),
+  2 usage error.
+
+### Import
+
+`dist/cli/import.js` (bin `task-tracker-import`) restores the projects of an
+export file into the DB at `TASK_TRACKER_DB_PATH` (a missing DB is created).
+
+```bash
+npm run import -- backup.json
+npm run import -- all.json --root-path-map /Users/old/Projects=/home/new/Projects
+```
+
+- Everything is checked before the single write transaction; any refusal
+  writes nothing (a refused file does not even create or migrate the DB).
+- Clash rule: a project `id`, `name` or `code_prefix` already in the target
+  (or repeated inside the file) refuses the whole import. There is no merge.
+- UUIDs, task numbers, sequences, timestamps, leases and `design_doc_hash` are
+  kept as they are; the design doc is not re-hashed, so `check_doc_sync`
+  reports whether the doc at the new root still matches.
+- Cross-project dependencies: a dependency on a task that is in neither the
+  file nor the target DB is skipped and listed (`skipped_dependencies`); every
+  other reference must resolve inside the file or the import is refused
+  (`dangling_reference`).
+- `--root-path-map old=new` (repeatable, both sides absolute) rewrites
+  `projects.root_path`, an absolute `design_doc_path`, `task_files.file_path`
+  and string elements of `task_slices.artifacts` at a whole path-segment
+  prefix. Hashes and history are left alone. Unused maps and artifacts that
+  are not a JSON array are reported.
+- stdout: the file, imported projects, per-table row counts, skipped
+  dependencies, and rewrite counts when a map was given.
+- Exit codes: 0 ok, 1 refusal or error (nothing written), 2 usage error
+  (including a malformed `--root-path-map`).
+
+### File format and versions
+
+The file is `{ exported_at, format: "task-tracker-export", format_version,
+projects: [{ project, rows }], schema_version }`. Rows are column -> value
+objects, every column present; JSON-in-TEXT columns stay strings.
+
+- `format_version` (currently 1) versions the envelope; any other value is
+  refused (`unsupported_format`).
+- `schema_version` versions the rows (the DB schema this build exports). A
+  newer file is refused (`schema_mismatch`). An older file imports when its
+  columns are a subset of this build's: an unknown table or column is refused,
+  and a column missing from the file must be nullable or have a DEFAULT.
+  Refusals name the table and column.
+
+### MCP tools
+
+- `export_projects` - args: `project_id` (id or unique name) or `all: true`
+  (exactly one), `out_path` (absolute). Same forbidden-path rule as the CLI.
+- `import_projects` - args: `path` (absolute), optional `root_path_map`
+  (`{"/old/root": "/new/root"}`).
+
+Both return only the path, projects, per-table counts, and the
+dependency/rewrite reports, never the file's content. Refusals come back as
+`isError` with the refusal code (`unsupported_format`, `schema_mismatch`,
+`clash`, `dangling_reference`, `unknown_project`, `forbidden_out_path`).
 
 ## SessionEnd hook CLI
 
