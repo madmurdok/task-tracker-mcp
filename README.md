@@ -54,6 +54,35 @@ npm run status                        # list every registered project
 npm run status <project_id_or_name>   # that project's status + full task list
 ```
 
+## Batch runner
+
+`dist/cli/runBatch.js` (bin `task-tracker-run`) works one release batch task by
+task, each in a fresh `claude --bg` session that claims its own task
+(`docs/design/TTM-95-runner.md`). The runner hands out the next task, starts the
+session with `--permission-mode auto` and a deny list (no push, no
+`delete_task`, nothing that moves `main`/`master`), and watches
+`claude agents --json` plus the DB every `--poll`. When a session waits on a
+question or a permission prompt it prints a line, fires one macOS notification
+per episode, keeps the lease alive and pauses the working-time clock; answer in
+`claude agents` or `claude attach <id>`. It stops on: batch done, all blocked,
+plan not approved, doc drift, a failed/stopped/missing session, working time
+over `--timeout`, an idle session with an unfinished task past `--grace`, or a
+dirty tree / wrong branch after a task. Logs go to
+`~/.task-tracker/runs/<PREFIX>-<version>-<UTC stamp>/` (`runner.log`,
+`summary.md`).
+
+```bash
+npm run build
+npm run run-batch -- <project> <release> --dry-run   # preflight + next hand-out + command; writes nothing
+npm run run-batch -- <project> <release> [--repo <path>] [--timeout 4h] [--poll 30s] [--grace 15m] [--model <m>]
+npm run run-batch -- <project> <release> --resume <CODE>   # re-attach to "<CODE> runner" after the runner died
+```
+
+Preflight: `claude --version`, a clean checkout on `release-<version>`, an
+approved plan without drift, and no `in_progress` batch task unless `--resume`.
+Overrides for tests: `CLAUDE_BIN` (the `claude` binary), `TTM_RUNNER_NOTIFY`
+(`off`, or a command called with title and message), `TASK_TRACKER_RUNS_DIR`.
+
 ## SessionEnd hook CLI
 
 `dist/cli/session-end.js` (bin `task-tracker-session-end`) is meant to run as a
