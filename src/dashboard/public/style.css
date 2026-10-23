@@ -451,7 +451,13 @@ a {
   flex: 1 1 auto;
 }
 
+/* Always its own last line, right-aligned (TTM-112): inline it jumped between
+   the title line and the next one depending on the title's length. order puts
+   it after .slice-status, so the status stays on the title line. */
 .slice-model {
+  flex-basis: 100%;
+  order: 1;
+  text-align: right;
   font-size: 0.7rem;
   color: var(--muted);
 }
