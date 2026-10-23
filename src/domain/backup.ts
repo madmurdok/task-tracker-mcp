@@ -405,6 +405,7 @@ interface ColumnInfo {
   name: string;
   notnull: number;
   dflt_value: unknown;
+  pk: number;
 }
 
 function tableColumns(db: DatabaseInstance, table: string): ColumnInfo[] {
@@ -451,7 +452,10 @@ export function checkColumns(db: DatabaseInstance, doc: ExportDocument, mode: "e
           column: col.name,
         });
       }
-      if (col.notnull !== 0 && col.dflt_value === null) {
+      // A PK column is required even though SQLite reports `notnull = 0` for a
+      // non-INTEGER PRIMARY KEY (its legacy NULL-in-PK quirk): omitting it
+      // would insert id = NULL.
+      if ((col.notnull !== 0 || col.pk > 0) && col.dflt_value === null) {
         throw new BackupRefusal(
           "schema_mismatch",
           `Column ${table}.${col.name} is required by this build, absent from the file`,
@@ -839,14 +843,25 @@ export interface ImportFileOptions {
   currentSchemaVersion?: number;
 }
 
-/** The one import entry point for the CLI and the MCP tool. */
+/**
+ * Reads and validates an export file (steps 1-2 and the entry shape) without
+ * touching any database, so a caller can refuse a bad file before opening one.
+ */
+export function readExportFile(
+  filePath: string,
+  currentSchemaVersion: number = SCHEMA_VERSION,
+): { path: string; doc: ExportDocument } {
+  const target = path.resolve(filePath);
+  return { path: target, doc: parseExport(fs.readFileSync(target, "utf8"), currentSchemaVersion) };
+}
+
+/** The one import entry point for callers that already hold an open DB (the MCP tool). */
 export function importFromFile(
   db: DatabaseInstance,
   filePath: string,
   { rootPathMap = [], currentSchemaVersion = SCHEMA_VERSION }: ImportFileOptions = {},
 ): ImportResult & { path: string } {
   const maps = parseRootPathMap(rootPathMap);
-  const target = path.resolve(filePath);
-  const doc = parseExport(fs.readFileSync(target, "utf8"), currentSchemaVersion);
+  const { path: target, doc } = readExportFile(filePath, currentSchemaVersion);
   return { path: target, ...importProjects(db, doc, { rootPathMap: maps, currentSchemaVersion }) };
 }
