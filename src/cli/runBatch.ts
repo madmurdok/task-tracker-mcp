@@ -21,9 +21,23 @@ import { releaseTask } from "../domain/lifecycle.js";
 import { getPlan } from "../domain/plans.js";
 import { requireProject, type Project } from "../domain/projects.js";
 import { requireRelease, type Release } from "../domain/releases.js";
-import { getNextTask, getTaskDetail, listTasks, type GetNextTaskResult, type HeldTask } from "../domain/status.js";
+import {
+  getNextTask,
+  getTaskDetail,
+  listTasks,
+  type GetNextTaskResult,
+  type HeldTask,
+  type ReclaimedFrom,
+} from "../domain/status.js";
 import { renewLease } from "../domain/taskStatus.js";
-import { classifyAgent, createClaudeBg, type AgentEntry, type ClaudeBg, type SessionState } from "./claudeBg.js";
+import {
+  classifyAgent,
+  createClaudeBg,
+  SpawnError,
+  type AgentEntry,
+  type ClaudeBg,
+  type SessionState,
+} from "./claudeBg.js";
 
 // ---------------------------------------------------------------- options
 
@@ -270,6 +284,7 @@ export type StopCause =
   | "ended_without_finishing"
   | "timeout"
   | "task_cancelled"
+  | "task_reclaimed"
   | "git_state"
   | "dry_run";
 
@@ -303,6 +318,17 @@ export function preflight(ctx: PreflightContext, deps: RunnerDeps): string[] {
     deps.claude.version();
   } catch (error) {
     failures.push(`claude --version failed: ${message(error)}`);
+  }
+  // Best effort over Claude Code's internal config: null (unknown) says
+  // nothing; the spawn failure's stderr still names an untrusted workspace.
+  let trusted: boolean | null = null;
+  try {
+    trusted = deps.claude.workspaceTrusted(repo);
+  } catch {
+    trusted = null;
+  }
+  if (trusted === false) {
+    failures.push(`workspace not trusted: ${repo} (run claude there once and accept the trust prompt)`);
   }
   failures.push(...gitFailures(repo, release, deps));
 
@@ -360,6 +386,29 @@ function gitFailures(repo: string, release: Release, deps: RunnerDeps): string[]
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message.split("\n")[0] : String(error);
+}
+
+/** Longest detail the console line and a handoff note carry (TTM-104). */
+export const DETAIL_CAP = 4000;
+
+/** The first `DETAIL_CAP` chars plus a marker; the run log keeps it whole. */
+export function capDetail(text: string, cap = DETAIL_CAP): string {
+  if (text.length <= cap) return text;
+  return `${text.slice(0, cap)}... (${text.length - cap} more chars, see run log)`;
+}
+
+/**
+ * A failed spawn in the CLI's own words: `exit <status>: <full stderr>`
+ * (stdout when stderr is empty), named up front when the workspace is not
+ * trusted. Uncapped; callers cap it for the console and the note.
+ */
+export function spawnFailureDetail(error: unknown, repo: string): string {
+  if (!(error instanceof SpawnError)) return message(error);
+  const said = error.stderr || error.stdout;
+  const body = said ? `exit ${error.status ?? "-"}: ${said}` : error.message;
+  return /workspace not trusted/i.test(error.stderr)
+    ? `workspace not trusted: ${repo}; run claude there once and accept the trust prompt. ${body}`
+    : body;
 }
 
 // ------------------------------------------------------------------- watch
@@ -447,7 +496,17 @@ async function watch(r: Running): Promise<WatchOutcome> {
       return { kind: "done" };
     }
 
-    // Blocked-episode bookkeeping: one notification per episode.
+    if (task.status === "cancelled") {
+      if (state !== "dead") stopQuietly(r);
+      return { kind: "stop", cause: "task_cancelled", detail: `${r.code} was cancelled` };
+    } else if (state === "dead") {
+      const cause = agent === undefined ? "session missing from claude agents" : `session ${agent.state ?? agent.status}`;
+      return { kind: "stop", cause: "session_failed", detail: cause };
+    }
+
+    // Blocked-episode bookkeeping: one notification per episode. After the
+    // cancelled/dead stops, so a run that is about to stop never pings the
+    // owner (TTM-104).
     if (state === "blocked" && blockedSince === null) {
       blockedSince = now;
       const what = agent?.waitingFor ?? "input needed";
@@ -456,14 +515,6 @@ async function watch(r: Running): Promise<WatchOutcome> {
     } else if (state !== "blocked" && blockedSince !== null) {
       log.line(`${r.code} blocked ${Math.round((now - blockedSince) / 1000)}s, answered`);
       blockedSince = null;
-    }
-
-    if (task.status === "cancelled") {
-      if (state !== "dead") stopQuietly(r);
-      return { kind: "stop", cause: "task_cancelled", detail: `${r.code} was cancelled` };
-    } else if (state === "dead") {
-      const cause = agent === undefined ? "session missing from claude agents" : `session ${agent.state ?? agent.status}`;
-      return { kind: "stop", cause: "session_failed", detail: cause };
     }
 
     if (state === "blocked") {
@@ -624,6 +675,60 @@ function fmtMin(ms: number): string {
   return `${(ms / 60000).toFixed(1)} min`;
 }
 
+/**
+ * What `claude agents --json` says about a reclaimed task's previous owner,
+ * as one line for the note. Information only: nothing here decides whether
+ * the holder is gone (design note TTM-104, option B's false "gone"s).
+ */
+function describePreviousHolder(deps: RunnerDeps, owner: string | null): { line: string; row?: AgentEntry } {
+  if (owner === null) return { line: "no owner (unclaimed hand-out)" };
+  let agents: AgentEntry[];
+  try {
+    agents = deps.claude.listAgents();
+  } catch (error) {
+    return { line: `previous holder ${owner}: claude agents lookup failed (${message(error)})` };
+  }
+  const row = agents.find((a) => a.sessionId === owner);
+  if (row === undefined) return { line: `previous holder ${owner}: not listed on this machine` };
+  return {
+    line: `previous holder ${owner}: ${row.kind ?? "-"} ${row.state ?? row.status ?? "-"} in ${row.cwd ?? "-"}`,
+    row,
+  };
+}
+
+/**
+ * A hand-out that reclaimed a lapsed lease (TTM-78) may belong to a paused
+ * session that comes back: release it, leave a note, stop, so there are never
+ * two workers on one task. Returns the stop detail.
+ */
+function reclaimStop(
+  db: DatabaseInstance,
+  deps: RunnerDeps,
+  taskId: string,
+  code: string,
+  from: ReclaimedFrom,
+  logDir: string,
+): string {
+  // Release before the agents lookup: the lookup may take up to a minute, and
+  // an ownerless in_progress task can be claimed by anyone meanwhile.
+  releaseTask(db, { task_id: taskId, session_id: RUNNER_SESSION });
+  const holder = describePreviousHolder(deps, from.owner_session_id);
+  const detail =
+    `${code} was handed out again after a lapsed lease (previous owner ${from.owner_session_id ?? "none"}, ` +
+    `lease until ${from.lock_expires_at}, last activity ${from.last_activity_at}). ${holder.line}. ` +
+    "Released back to pending; confirm the previous holder is gone, then re-run.";
+  addHandoffNote(db, {
+    task_id: taskId,
+    session_id: RUNNER_SESSION,
+    remaining_work: `Batch runner stopped: task_reclaimed. ${capDetail(detail)}`,
+    discoveries: `runner log: ${logDir}`,
+  });
+  if (holder.row?.id) {
+    deps.out(`[${code}] previous holder is still listed: claude attach ${holder.row.id}`);
+  }
+  return detail;
+}
+
 export async function runBatch(db: DatabaseInstance, opts: RunOptions, deps: RunnerDeps): Promise<RunResult> {
   const project = requireProject(db, opts.project);
   const release = requireRelease(db, project.id, opts.release);
@@ -640,7 +745,8 @@ export async function runBatch(db: DatabaseInstance, opts: RunOptions, deps: Run
       deps.out(`next: none (${stop.cause}: ${stop.detail})`);
     } else {
       const t = peek.task;
-      deps.out(`next: ${t.code} "${t.title}" (plan ${peek.plan_status ?? "-"}, doc_drift ${peek.doc_drift})`);
+      const reclaimed = peek.reclaimed_from ? `, reclaimed from ${peek.reclaimed_from.owner_session_id ?? "none"}` : "";
+      deps.out(`next: ${t.code} "${t.title}" (plan ${peek.plan_status ?? "-"}, doc_drift ${peek.doc_drift}${reclaimed})`);
       const args = buildBgArgs(buildPrompt(t.code, t.title, release.version, project.code_prefix), t.code, opts.model);
       deps.out(`would run in ${repo}: ${["claude", "--bg", ...args.map(shellQuote)].join(" ")}`);
     }
@@ -651,7 +757,7 @@ export async function runBatch(db: DatabaseInstance, opts: RunOptions, deps: Run
   const finish = (res: Omit<RunResult, "logDir" | "completed">): RunResult => {
     const full: RunResult = { ...res, logDir: log.dir, completed };
     log.line(`stop ${full.cause}: ${full.detail}`);
-    deps.out(`stopped: ${full.cause} - ${full.detail}`);
+    deps.out(`stopped: ${full.cause} - ${capDetail(full.detail)}`);
     if (full.task) deps.out(`  task ${full.task}, session ${full.sessionId ?? "-"}`);
     if (full.bgId) deps.out(`  claude attach ${full.bgId}`);
     deps.out(`  log ${log.dir}`);
@@ -698,6 +804,10 @@ export async function runBatch(db: DatabaseInstance, opts: RunOptions, deps: Run
       }
       taskId = next.task.id;
       code = next.task.code;
+      if (next.reclaimed_from) {
+        const stop = reclaimStop(db, deps, taskId, code, next.reclaimed_from, log.dir);
+        return finish({ cause: "task_reclaimed", exitCode: 1, task: code, detail: stop });
+      }
       if (next.doc_drift || next.plan_status !== "approved") {
         releaseTask(db, { task_id: taskId, session_id: RUNNER_SESSION });
         const cause: StopCause = next.doc_drift ? "doc_drift" : "plan_not_approved";
@@ -708,7 +818,14 @@ export async function runBatch(db: DatabaseInstance, opts: RunOptions, deps: Run
         bgId = deps.claude.spawnBg(args, repo);
       } catch (error) {
         releaseTask(db, { task_id: taskId, session_id: RUNNER_SESSION });
-        return finish({ cause: "spawn_failed", exitCode: 1, task: code, detail: message(error) });
+        const detail = spawnFailureDetail(error, repo);
+        addHandoffNote(db, {
+          task_id: taskId,
+          session_id: RUNNER_SESSION,
+          remaining_work: `Batch runner stopped: spawn_failed. ${capDetail(detail)}. Released back to pending.`,
+          discoveries: `runner log: ${log.dir}`,
+        });
+        return finish({ cause: "spawn_failed", exitCode: 1, task: code, detail });
       }
       log.line(`${code} spawned ${bgId}`);
       deps.out(`[${code}] started: claude attach ${bgId}`);

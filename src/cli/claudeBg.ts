@@ -4,6 +4,9 @@
 // through one binary path so tests can point `CLAUDE_BIN` at a fake `claude`
 // and no test ever spends usage.
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 /**
  * One row of `claude agents --json`. Only the fields the runner reads are
@@ -35,6 +38,13 @@ export interface ClaudeBg {
   listAgents(): AgentEntry[];
   /** `claude stop <id>`. */
   stopBg(id: string): void;
+  /**
+   * Whether Claude Code has accepted the trust dialog for `dir` or one of its
+   * ancestors (TTM-104). `null` when the config file is missing, unreadable
+   * or has no `projects` object: the format is internal, so unknown is not
+   * "untrusted".
+   */
+  workspaceTrusted(dir: string): boolean | null;
 }
 
 export function claudeBin(): string {
@@ -55,6 +65,76 @@ export function parseBgId(output: string): string | null {
   return bare ? bare[1] : null;
 }
 
+// eslint-disable-next-line no-control-regex
+const ANSI = /\u001b\[[0-9;?]*[A-Za-z]/g;
+
+function plainText(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  const text = Buffer.isBuffer(value) ? value.toString("utf8") : String(value);
+  return text.replace(ANSI, "").trim();
+}
+
+/**
+ * A failed `claude --bg`: the CLI's own words (stderr, ANSI stripped) are
+ * kept whole, because the reason ("Workspace not trusted ...") is never on
+ * the first line of an execFileSync error (TTM-104).
+ */
+export class SpawnError extends Error {
+  readonly stderr: string;
+  readonly stdout: string;
+  /** Exit status; null when the process was killed or never started. */
+  readonly status: number | null;
+
+  constructor(message: string, stderr: string, stdout: string, status: number | null) {
+    super(message);
+    this.name = "SpawnError";
+    this.stderr = stderr;
+    this.stdout = stdout;
+    this.status = status;
+  }
+
+  static from(error: unknown): SpawnError {
+    if (error instanceof SpawnError) return error;
+    const e = (error ?? {}) as { stderr?: unknown; stdout?: unknown; status?: unknown; message?: unknown };
+    const status = typeof e.status === "number" ? e.status : null;
+    const stderr = plainText(e.stderr);
+    const stdout = plainText(e.stdout);
+    const said = stderr || stdout || (error instanceof Error ? error.message : String(error));
+    return new SpawnError(`claude --bg failed (exit ${status ?? "-"}): ${said}`, stderr, stdout, status);
+  }
+}
+
+/** Claude Code's global config: `$CLAUDE_CONFIG_DIR/.claude.json`, else `~/.claude.json`. */
+export function claudeConfigPath(): string {
+  const dir = process.env.CLAUDE_CONFIG_DIR;
+  return dir ? path.join(dir, ".claude.json") : path.join(os.homedir(), ".claude.json");
+}
+
+/**
+ * Walks from `dir` up to the root: trusted when any entry on the way has
+ * `hasTrustDialogAccepted: true` (trust is inherited from an ancestor).
+ * `null` when `config` has no `projects` object.
+ */
+export function findTrust(config: unknown, dir: string): boolean | null {
+  if (typeof config !== "object" || config === null) return null;
+  const projects = (config as { projects?: unknown }).projects;
+  if (typeof projects !== "object" || projects === null || Array.isArray(projects)) return null;
+  const table = projects as Record<string, { hasTrustDialogAccepted?: unknown } | undefined>;
+  const starts = new Set([path.resolve(dir)]);
+  try {
+    starts.add(fs.realpathSync(dir));
+  } catch {
+    // A missing dir still has its ancestors checked by the resolved path.
+  }
+  for (const start of starts) {
+    for (let at = start; ; at = path.dirname(at)) {
+      if (table[at]?.hasTrustDialogAccepted === true) return true;
+      if (path.dirname(at) === at) break;
+    }
+  }
+  return false;
+}
+
 function run(bin: string, args: string[], cwd?: string, timeoutMs = 60_000): string {
   return execFileSync(bin, args, {
     cwd,
@@ -64,16 +144,22 @@ function run(bin: string, args: string[], cwd?: string, timeoutMs = 60_000): str
   });
 }
 
-export function createClaudeBg(bin: string = claudeBin()): ClaudeBg {
+export function createClaudeBg(bin: string = claudeBin(), configPath: () => string = claudeConfigPath): ClaudeBg {
   return {
     version() {
       return run(bin, ["--version"]).trim();
     },
     spawnBg(args, cwd) {
-      const output = run(bin, ["--bg", ...args], cwd, 120_000);
+      let output: string;
+      try {
+        output = run(bin, ["--bg", ...args], cwd, 120_000);
+      } catch (error) {
+        throw SpawnError.from(error);
+      }
       const id = parseBgId(output);
       if (id === null) {
-        throw new Error(`claude --bg printed no session id: ${output.trim().slice(0, 200)}`);
+        const stdout = plainText(output);
+        throw new SpawnError(`claude --bg printed no session id: ${stdout.slice(0, 200)}`, "", stdout, 0);
       }
       return id;
     },
@@ -84,6 +170,15 @@ export function createClaudeBg(bin: string = claudeBin()): ClaudeBg {
     },
     stopBg(id) {
       run(bin, ["stop", id]);
+    },
+    workspaceTrusted(dir) {
+      let config: unknown;
+      try {
+        config = JSON.parse(fs.readFileSync(configPath(), "utf8"));
+      } catch {
+        return null;
+      }
+      return findTrust(config, dir);
     },
   };
 }

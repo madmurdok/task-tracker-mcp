@@ -2,12 +2,14 @@ import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { AgentEntry } from "../src/cli/claudeBg.js";
+import { SpawnError, type AgentEntry } from "../src/cli/claudeBg.js";
 import {
   assertSafeArgs,
   buildBgArgs,
   buildPrompt,
+  capDetail,
   DEFAULTS,
+  DETAIL_CAP,
   DENY_LIST,
   parseArgs,
   parseDuration,
@@ -146,6 +148,12 @@ interface HarnessOptions {
   /** Rows carry no sessionId (the runner never learns the uuid). */
   hideSessionId?: boolean;
   spawnThrows?: boolean;
+  /** What spawnBg throws (TTM-104: the CLI's stderr in a SpawnError). */
+  spawnError?: unknown;
+  /** Appended to every scenario-driven listAgents answer; may throw. */
+  extraAgents?: () => AgentEntry[];
+  /** workspaceTrusted's answer; "throw" makes it throw. Default null. */
+  trusted?: boolean | null | "throw";
   maxSleeps?: number;
 }
 
@@ -173,11 +181,18 @@ function harness(s: Seed, scenario: Scenario, h: HarnessOptions = {}) {
   const out: string[] = [];
   const git = { status: "", branch: "release-0.1" };
   const claimed = new Set<string>();
+  const trustAsked: string[] = [];
 
   const deps: RunnerDeps = {
     claude: {
       version: () => "9.9.9 (Claude Code)",
+      workspaceTrusted(dir) {
+        trustAsked.push(dir);
+        if (h.trusted === "throw") throw new Error("config exploded");
+        return h.trusted ?? null;
+      },
       spawnBg(args, cwd) {
+        if (h.spawnError !== undefined) throw h.spawnError;
         if (h.spawnThrows) throw new Error("claude --bg exploded");
         n++;
         const code = args[args.indexOf("-n") + 1].replace(/ runner$/, "");
@@ -207,7 +222,8 @@ function harness(s: Seed, scenario: Scenario, h: HarnessOptions = {}) {
           done: () => setDone(s.db, c.taskId),
         });
         c.call++;
-        if (row === null) return [];
+        const extra = h.extraAgents?.() ?? [];
+        if (row === null) return extra;
         return [
           {
             id: c.bgId,
@@ -215,6 +231,7 @@ function harness(s: Seed, scenario: Scenario, h: HarnessOptions = {}) {
             name: `${c.code} runner`,
             ...row,
           },
+          ...extra,
         ];
       },
       stopBg(id) {
@@ -235,7 +252,7 @@ function harness(s: Seed, scenario: Scenario, h: HarnessOptions = {}) {
     },
     metrics: () => null,
   };
-  return { deps, spawns, stops, notifies, out, git, start, now: () => t };
+  return { deps, spawns, stops, notifies, out, git, start, trustAsked, now: () => t };
 }
 
 const working = { state: "working" } as const;
@@ -980,5 +997,337 @@ describe("parseDuration / parseArgs (behaviour 16)", () => {
   it("parses --resume, --timeout, --dry-run", () => {
     const o = parseArgs(["Demo", "0.1", "--resume", "ttm-7", "--timeout", "2h", "--dry-run"]);
     expect(o).toMatchObject({ resume: "ttm-7", timeoutMs: 2 * 60 * MIN, dryRun: true });
+  });
+});
+
+// ------------------------------------------- TTM-104: a reclaimed hand-out
+
+/**
+ * TTM-104 (docs/design/TTM-104-runner-hardening.md, "Behaviours the tests
+ * must pin" 1-6, owner decisions 1-2). A reclaim needs an in_progress task
+ * under a lapsed lease and no pending work, and preflight refuses an
+ * in_progress batch task, so the lease lapses mid-batch: while the first
+ * task runs, the second is held under a lease already in the past.
+ */
+describe("a reclaimed hand-out stops the runner (TTM-104 behaviours 1-6)", () => {
+  const LAPSED = "2000-01-01T00:00:00.000Z";
+
+  /** Task 1 in_progress under `owner` with a lapsed lease, set on the first poll of task 0. */
+  function reclaimScenario(s: Seed, owner: string | null): Scenario {
+    return (c) => {
+      c.claim();
+      if (c.call === 0) {
+        if (owner !== null) claimTask(c.db, s.codes[1], owner);
+        c.db
+          .prepare("UPDATE tasks SET status = 'in_progress', owner_session_id = ?, lock_expires_at = ? WHERE id = ?")
+          .run(owner, LAPSED, s.tasks[1].id);
+        return working;
+      }
+      c.done();
+      return idle;
+    };
+  }
+
+  function lastActivity(detail: string): string {
+    const m = /last activity (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z)\)/.exec(detail);
+    expect(m).not.toBeNull();
+    return m![1];
+  }
+
+  function expectReleasedWithNote(s: Seed, res: Awaited<ReturnType<typeof runBatch>>): void {
+    expect(taskRow(s.db, s.tasks[1].id)).toMatchObject({ status: "pending", owner_session_id: null });
+    const notes = listHandoffNotes(s.db, s.tasks[1].id);
+    expect(notes).toHaveLength(1);
+    expect(notes[0].session_id).toBe("task-tracker-run");
+    expect(notes[0].remaining_work).toBe(`Batch runner stopped: task_reclaimed. ${res.detail}`);
+    expect(notes[0].discoveries).toBe(`runner log: ${res.logDir}`);
+  }
+
+  it("previous holder listed: no spawn, task_reclaimed exit 1, released with a note naming owner, lease, activity and the holder; claude attach printed", async () => {
+    const s = seed(2);
+    const holder: AgentEntry = {
+      id: "abcd1234",
+      sessionId: "other-worker",
+      kind: "background",
+      state: "working",
+      cwd: "/work/elsewhere",
+    };
+    const h = harness(s, reclaimScenario(s, "other-worker"), { extraAgents: () => [holder] });
+    const res = await runBatch(s.db, opts(s), h.deps);
+
+    expect(res.cause).toBe("task_reclaimed");
+    expect(res.exitCode).toBe(1);
+    expect(res.task).toBe(s.codes[1]);
+    expect(res.completed).toEqual([s.codes[0]]);
+    expect(h.spawns.map((x) => x.code)).toEqual([s.codes[0]]);
+    expect(res.detail).toBe(
+      `${s.codes[1]} was handed out again after a lapsed lease (previous owner other-worker, ` +
+        `lease until ${LAPSED}, last activity ${lastActivity(res.detail)}). ` +
+        "previous holder other-worker: background working in /work/elsewhere. " +
+        "Released back to pending; confirm the previous holder is gone, then re-run.",
+    );
+    expectReleasedWithNote(s, res);
+    expect(h.out).toContain(`[${s.codes[1]}] previous holder is still listed: claude attach abcd1234`);
+    expect(readFileSync(path.join(res.logDir!, "runner.log"), "utf8")).toContain(`stop task_reclaimed: ${res.detail}`);
+    expect(readFileSync(path.join(res.logDir!, "summary.md"), "utf8")).toContain(res.detail);
+  });
+
+  it("the holder's state falls back to its status when state is absent", async () => {
+    const s = seed(2);
+    const holder: AgentEntry = { id: "abcd1234", sessionId: "other-worker", kind: "interactive", status: "idle", cwd: "/w" };
+    const h = harness(s, reclaimScenario(s, "other-worker"), { extraAgents: () => [holder] });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.detail).toContain("previous holder other-worker: interactive idle in /w.");
+  });
+
+  it("previous holder not listed: the note says so, no claude attach line", async () => {
+    const s = seed(2);
+    const h = harness(s, reclaimScenario(s, "other-worker"));
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("task_reclaimed");
+    expect(res.detail).toContain("previous holder other-worker: not listed on this machine.");
+    expectReleasedWithNote(s, res);
+    expect(h.out.some((l) => l.includes("previous holder is still listed"))).toBe(false);
+  });
+
+  it("a listed holder row without an id (interactive) prints no claude attach line", async () => {
+    const s = seed(2);
+    const holder: AgentEntry = { sessionId: "other-worker", kind: "interactive", state: "working", cwd: "/w" };
+    const h = harness(s, reclaimScenario(s, "other-worker"), { extraAgents: () => [holder] });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.detail).toContain("previous holder other-worker: interactive working in /w.");
+    expect(h.out.some((l) => l.includes("previous holder is still listed"))).toBe(false);
+  });
+
+  it("no previous owner: 'no owner (unclaimed hand-out)', and claude agents is not asked", async () => {
+    const s = seed(2);
+    let lookups = 0;
+    const h = harness(s, reclaimScenario(s, null), {
+      extraAgents: () => {
+        // Task 0's session is stopped once it is done; any call after that is the reclaim lookup.
+        if (h.stops.length > 0) lookups++;
+        return [];
+      },
+    });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("task_reclaimed");
+    expect(res.detail).toContain("(previous owner none, ");
+    expect(res.detail).toContain("no owner (unclaimed hand-out).");
+    expect(lookups).toBe(0);
+    expectReleasedWithNote(s, res);
+  });
+
+  it("a claude agents failure still stops cleanly; the task is already released while the lookup runs", async () => {
+    const s = seed(2);
+    let duringLookup: ReturnType<typeof taskRow> | undefined;
+    const h = harness(s, reclaimScenario(s, "other-worker"), {
+      extraAgents: () => {
+        if (h.stops.length === 0) return [];
+        duringLookup = taskRow(s.db, s.tasks[1].id);
+        throw new Error("agents exploded\nsecond line of the error");
+      },
+    });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("task_reclaimed");
+    expect(res.exitCode).toBe(1);
+    expect(res.detail).toContain("previous holder other-worker: claude agents lookup failed (agents exploded).");
+    expect(duringLookup).toMatchObject({ status: "pending", owner_session_id: null });
+    expect(h.spawns).toHaveLength(1);
+    expectReleasedWithNote(s, res);
+  });
+
+  it("a plain pending hand-out (no reclaimed_from) still spawns", async () => {
+    const s = seed(2);
+    const h = harness(s, (c) => {
+      c.claim();
+      if (c.call === 0) return working;
+      c.done();
+      return idle;
+    });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("all_done");
+    expect(h.spawns.map((x) => x.code)).toEqual(s.codes);
+    expect(s.tasks.flatMap((t) => listHandoffNotes(s.db, t.id))).toEqual([]);
+  });
+
+  it("--dry-run prints the reclaim marker and leaves the DB unchanged", async () => {
+    const s = seed(1);
+    claimTask(s.db, s.codes[0], "other-worker");
+    s.db.prepare("UPDATE tasks SET lock_expires_at = ? WHERE id = ?").run(LAPSED, s.tasks[0].id);
+    const before = taskRow(s.db, s.tasks[0].id);
+    const h = harness(s, () => working);
+    const res = await runBatch(s.db, opts(s, { dryRun: true }), h.deps);
+    expect(res.cause).toBe("dry_run");
+    expect(h.spawns).toHaveLength(0);
+    const next = h.out.find((l) => l.startsWith("next: "));
+    expect(next).toMatch(new RegExp(`^next: ${s.codes[0]} "task 0" \\(plan \\S+, doc_drift false, reclaimed from other-worker\\)$`));
+    expect(taskRow(s.db, s.tasks[0].id)).toEqual(before);
+    expect(listHandoffNotes(s.db, s.tasks[0].id)).toEqual([]);
+    expect(readdirSync(s.runsDir)).toEqual([]);
+  });
+});
+
+// ------------------------------- TTM-104: no owner ping on a run about to stop
+
+describe("the owner is notified only after the cancelled/dead checks (TTM-104 behaviours 7-9)", () => {
+  it("cancelled task + blocked session on the same poll: no notify, task_cancelled", async () => {
+    const s = seed(1);
+    const h = harness(s, (c) => {
+      if (c.call < 2) return working;
+      if (c.call === 2) cancelTask(c.db, { task_id: c.taskId, reason: "owner changed their mind" });
+      return question;
+    });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("task_cancelled");
+    expect(h.notifies).toEqual([]);
+    expect(h.out.some((l) => l.includes("waiting on the owner"))).toBe(false);
+  });
+
+  it("dead session whose row still carries waitingFor: no notify, session_failed", async () => {
+    const s = seed(1);
+    const h = harness(s, (c) => {
+      c.claim();
+      return c.call < 2 ? working : { state: "failed", waitingFor: "input needed" };
+    });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("session_failed");
+    expect(h.notifies).toEqual([]);
+  });
+
+  it("blocked, alive, not cancelled: exactly one notify for the episode", async () => {
+    const s = seed(1);
+    const h = harness(s, (c) => {
+      c.claim();
+      if (c.elapsed < 30 * MIN) return question;
+      c.done();
+      return idle;
+    });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("all_done");
+    expect(h.notifies.map((x) => x.title)).toEqual([`${s.codes[0]} needs you`]);
+  });
+});
+
+// ----------------------------------------- TTM-104: the CLI's words on spawn
+
+describe("spawn_failed carries the CLI's full stderr (TTM-104 behaviours 10-12)", () => {
+  function runLog(res: Awaited<ReturnType<typeof runBatch>>): string {
+    return readFileSync(path.join(res.logDir!, "runner.log"), "utf8");
+  }
+
+  it("multi-line stderr: whole in RunResult.detail, the run log, the summary and the note; task released", async () => {
+    const s = seed(1);
+    const stderr = "Error: could not start\n  at step one\n  at step two";
+    const h = harness(s, () => working, {
+      spawnError: new SpawnError(`claude --bg failed (exit 2): ${stderr}`, stderr, "", 2),
+    });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("spawn_failed");
+    expect(res.exitCode).toBe(1);
+    expect(res.detail).toBe(`exit 2: ${stderr}`);
+    expect(runLog(res)).toContain(`stop spawn_failed: exit 2: ${stderr}`);
+    expect(readFileSync(path.join(res.logDir!, "summary.md"), "utf8")).toContain(stderr);
+    expect(h.out).toContain(`stopped: spawn_failed - exit 2: ${stderr}`);
+    expect(taskRow(s.db, s.tasks[0].id)).toMatchObject({ status: "pending", owner_session_id: null });
+    const notes = listHandoffNotes(s.db, s.tasks[0].id);
+    expect(notes).toHaveLength(1);
+    expect(notes[0].session_id).toBe("task-tracker-run");
+    expect(notes[0].remaining_work).toBe(`Batch runner stopped: spawn_failed. exit 2: ${stderr}. Released back to pending.`);
+    expect(notes[0].discoveries).toBe(`runner log: ${res.logDir}`);
+  });
+
+  it.each([
+    ["empty stderr falls back to stdout", new SpawnError("m", "", "only on stdout", 1), "exit 1: only on stdout"],
+    ["no exit status prints '-'", new SpawnError("m", "killed\nby signal", "", null), "exit -: killed\nby signal"],
+    ["both empty: the SpawnError's own message", new SpawnError("claude --bg failed (exit 3): boom", "", "", 3), "claude --bg failed (exit 3): boom"],
+    ["a plain Error: its first line", new Error("first line\nsecond line"), "first line"],
+  ] as const)("%s", async (_label, error, detail) => {
+    const s = seed(1);
+    const h = harness(s, () => working, { spawnError: error });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("spawn_failed");
+    expect(res.detail).toBe(detail);
+  });
+
+  it("stderr naming an untrusted workspace: the detail leads with the repo and the fix", async () => {
+    const s = seed(1);
+    const stderr = "Starting session...\nError: Workspace not trusted. Run claude in this directory first.";
+    const h = harness(s, () => working, { spawnError: new SpawnError("m", stderr, "", 1) });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.detail).toBe(
+      `workspace not trusted: ${s.dir}; run claude there once and accept the trust prompt. exit 1: ${stderr}`,
+    );
+    expect(listHandoffNotes(s.db, s.tasks[0].id)[0].remaining_work).toContain(`workspace not trusted: ${s.dir};`);
+  });
+
+  it("stderr over the cap: console line and note truncated with the marker, detail and run log whole", async () => {
+    const s = seed(1);
+    const stderr = `${"x".repeat(DETAIL_CAP)}TAIL-${"y".repeat(500)}`;
+    const h = harness(s, () => working, { spawnError: new SpawnError("m", stderr, "", 1) });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    const full = `exit 1: ${stderr}`;
+    const capped = `${full.slice(0, DETAIL_CAP)}... (${full.length - DETAIL_CAP} more chars, see run log)`;
+    expect(res.detail).toBe(full);
+    expect(runLog(res)).toContain(`stop spawn_failed: ${full}`);
+    expect(h.out).toContain(`stopped: spawn_failed - ${capped}`);
+    expect(h.out.some((l) => l.includes("TAIL-"))).toBe(false);
+    expect(listHandoffNotes(s.db, s.tasks[0].id)[0].remaining_work).toBe(
+      `Batch runner stopped: spawn_failed. ${capped}. Released back to pending.`,
+    );
+  });
+
+  it("capDetail keeps text up to the cap and marks what it drops", () => {
+    expect(DETAIL_CAP).toBe(4000);
+    const at = "a".repeat(DETAIL_CAP);
+    expect(capDetail(at)).toBe(at);
+    expect(capDetail(`${at}bc`)).toBe(`${at}... (2 more chars, see run log)`);
+    expect(capDetail("abcdef", 4)).toBe("abcd... (2 more chars, see run log)");
+  });
+});
+
+// --------------------------------------- TTM-104: untrusted workspace preflight
+
+describe("preflight checks workspace trust (TTM-104 behaviour 14)", () => {
+  it("workspaceTrusted false: preflight fails with the trust line, nothing spawned", async () => {
+    const s = seed(1);
+    const h = harness(s, () => working, { trusted: false });
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("preflight");
+    expect(res.exitCode).toBe(1);
+    expect(res.detail).toContain(
+      `workspace not trusted: ${s.dir} (run claude there once and accept the trust prompt)`,
+    );
+    expect(h.trustAsked).toEqual([s.dir]);
+    expect(h.spawns).toHaveLength(0);
+  });
+
+  it.each([
+    ["null (unknown)", null],
+    ["true", true],
+    ["a throw", "throw"],
+  ] as const)("workspaceTrusted %s: no preflight line, the batch runs", async (_label, trusted) => {
+    const s = seed(1);
+    const h = harness(
+      s,
+      (c) => {
+        c.claim();
+        c.done();
+        return idle;
+      },
+      { trusted },
+    );
+    const res = await runBatch(s.db, opts(s), h.deps);
+    expect(res.cause).toBe("all_done");
+    expect(h.spawns).toHaveLength(1);
+    expect(h.out.some((l) => /trust/i.test(l))).toBe(false);
+  });
+
+  it("--dry-run lists the trust failure as a preflight line", async () => {
+    const s = seed(1);
+    const h = harness(s, () => working, { trusted: false });
+    await runBatch(s.db, opts(s, { dryRun: true }), h.deps);
+    expect(h.out).toContain(
+      `preflight: workspace not trusted: ${s.dir} (run claude there once and accept the trust prompt)`,
+    );
   });
 });
