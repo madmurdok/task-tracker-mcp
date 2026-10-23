@@ -191,3 +191,12 @@ path (13).
 3. Untrusted workspace in preflight: hard failure (recommended) or a warning
    line, given `~/.claude.json` is an undocumented format?
 4. Stop cause name `task_reclaimed` and the 4000-char cap: OK?
+
+### Owner decisions (2026-10-23)
+
+1. "Release в pending (Recommended)": release to pending; the note is the guard.
+2. "Да, выводить (Recommended)": when the previous holder is listed in
+   `claude agents`, also print `claude attach <id>` to the console.
+3. "Ошибка (Recommended)": an untrusted workspace (`workspaceTrusted` is
+   `false`) is a preflight failure; `null` stays silent.
+4. "Да, как в ноте (Recommended)": cause `task_reclaimed`, 4000-char cap.
