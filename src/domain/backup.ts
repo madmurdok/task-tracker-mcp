@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { DatabaseInstance } from "../db/connection.js";
 import { SCHEMA_VERSION } from "../db/schema.js";
-import { requireProject } from "./projects.js";
+import { getProject } from "./projects.js";
 
 /**
  * Backup export (docs/design/backup-restore.md, TTM-106). The file is one
@@ -116,11 +116,13 @@ export function resolveSelection(db: DatabaseInstance, selection: ExportSelectio
     const rows = db.prepare(`SELECT id FROM projects ORDER BY created_at, id`).all() as Array<{ id: string }>;
     return rows.map((r) => r.id);
   }
-  try {
-    return [requireProject(db, selection).id];
-  } catch {
+  // getProject returns undefined only when nothing matches, so a DB error
+  // propagates instead of being reported as an unknown project.
+  const project = getProject(db, selection);
+  if (!project) {
     throw new BackupRefusal("unknown_project", `Unknown project: ${selection}`, { ref: selection });
   }
+  return [project.id];
 }
 
 export interface ExportOptions {
@@ -211,15 +213,28 @@ function sameExistingFile(a: string, b: string): boolean {
 /**
  * Refuses (`forbidden_out_path`) an out path that is the open database file or
  * its `-wal`/`-shm` companion, compared after resolving the parent directory
- * through symlinks (and by inode when both files exist). Skipped for an
+ * through symlinks (and by inode when both files exist). The DB side covers
+ * both its directory-resolved path and the fully resolved file (a symlinked
+ * DB file keeps its -wal/-shm beside the real file). Skipped for an
  * in-memory database. A missing parent directory is left to the write to fail.
  */
 export function assertOutPathAllowed(db: DatabaseInstance, outPath: string): void {
   if (db.memory || db.name === ":memory:" || db.name === "") return;
   const out = realTarget(outPath);
-  const dbFile = realTarget(db.name);
-  if (!out || !dbFile) return;
-  for (const forbidden of [dbFile, `${dbFile}-wal`, `${dbFile}-shm`]) {
+  if (!out) return;
+  // SQLite keeps -wal/-shm next to the file the DB path finally resolves to,
+  // so a symlinked DB file protects the real file's siblings; the symlink
+  // path's own siblings are kept as well.
+  const dbFiles = new Set<string>();
+  const viaDir = realTarget(db.name);
+  if (viaDir) dbFiles.add(viaDir);
+  try {
+    dbFiles.add(fs.realpathSync(db.name));
+  } catch {
+    // DB file not on disk (yet): the directory-resolved path is all there is.
+  }
+  const forbiddenPaths = [...dbFiles].flatMap((f) => [f, `${f}-wal`, `${f}-shm`]);
+  for (const forbidden of forbiddenPaths) {
     if (out === forbidden || sameExistingFile(out, forbidden)) {
       throw new BackupRefusal(
         "forbidden_out_path",

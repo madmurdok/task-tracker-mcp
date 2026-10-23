@@ -232,8 +232,10 @@ Forbidden targets (owner, Resolved 5), checked first, before the read, in
 (`db.name`) or that path plus `-wal` or `-shm`. Comparison is on
 `path.join(fs.realpathSync(dirname), basename)` for both sides (the parent
 directory exists by then; a missing one is an ordinary write error), so a
-symlinked directory or a relative path cannot slip past it. Skipped for
-`:memory:`.
+symlinked directory or a relative path cannot slip past it. The DB side also
+adds `fs.realpathSync(db.name)` and its `-wal`/`-shm`: when the DB path is a
+symlink to the file, SQLite keeps the WAL and SHM beside the real file, so
+those are the ones to protect (TTM-106 review F1). Skipped for `:memory:`.
 
 Trade-off: an existing backup at `<out>` is replaced without asking; scripted
 backups reuse names, and the forbidden list protects the one file that must
