@@ -177,6 +177,7 @@ function harness(s: Seed, scenario: Scenario, h: HarnessOptions = {}) {
   const deps: RunnerDeps = {
     claude: {
       version: () => "9.9.9 (Claude Code)",
+      workspaceTrusted: () => null,
       spawnBg(args, cwd) {
         if (h.spawnThrows) throw new Error("claude --bg exploded");
         n++;
