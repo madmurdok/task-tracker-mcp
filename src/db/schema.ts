@@ -229,6 +229,15 @@ CREATE TABLE IF NOT EXISTS task_slice_revisions (
 CREATE INDEX IF NOT EXISTS idx_task_slice_revisions_task_id ON task_slice_revisions(task_id);
 `;
 
+/**
+ * Version of the logical schema (tables and columns) that backup files carry
+ * as `schema_version` (docs/design/backup-restore.md D2). Bumped by hand:
+ * tests/schema-version.test.ts pins `{ SCHEMA_VERSION, fingerprint }` of a
+ * fresh database, so any table or column change fails it until this constant
+ * and the test's literal are updated in the same commit.
+ */
+export const SCHEMA_VERSION = 1;
+
 import type { DatabaseInstance } from "./connection.js";
 import { dedupePrefix, derivePrefix } from "../domain/projects.js";
 

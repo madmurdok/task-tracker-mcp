@@ -83,6 +83,26 @@ approved plan without drift, and no `in_progress` batch task unless `--resume`.
 Overrides for tests: `CLAUDE_BIN` (the `claude` binary), `TTM_RUNNER_NOTIFY`
 (`off`, or a command called with title and message), `TASK_TRACKER_RUNS_DIR`.
 
+## Export CLI
+
+`dist/cli/export.js` (bin `task-tracker-export`) writes a JSON backup of one
+project, or of every project with `--all`, from the DB at
+`TASK_TRACKER_DB_PATH` (default `~/.task-tracker/tracker.db`). Every row of the
+project's twelve tables goes in, read in one transaction; keys are sorted, so
+two exports of an unchanged DB differ only on the `exported_at` line. The file
+is written to `<out>.tmp-<pid>` and renamed over `<out>` (an existing file is
+replaced atomically); `--out` may not be the DB file or its `-wal`/`-shm`.
+Format and rules: `docs/design/backup-restore.md`.
+
+```bash
+npm run build
+npm run export -- <project_id_or_name> --out backup.json
+npm run export -- --all --out all.json
+```
+
+Exit codes: 0 ok (stdout: the out path and per-table row counts), 1 refusal or
+error (unknown project, forbidden out path; no file written), 2 usage error.
+
 ## SessionEnd hook CLI
 
 `dist/cli/session-end.js` (bin `task-tracker-session-end`) is meant to run as a

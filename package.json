@@ -8,7 +8,8 @@
   "bin": {
     "task-tracker-status": "dist/cli/status.js",
     "task-tracker-session-end": "dist/cli/session-end.js",
-    "task-tracker-run": "dist/cli/runBatch.js"
+    "task-tracker-run": "dist/cli/runBatch.js",
+    "task-tracker-export": "dist/cli/export.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -16,6 +17,7 @@
     "dev": "tsx src/index.ts",
     "status": "node dist/cli/status.js",
     "run-batch": "node dist/cli/runBatch.js",
+    "export": "node dist/cli/export.js",
     "dashboard": "tsx src/dashboard/server.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
