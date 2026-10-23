@@ -709,8 +709,10 @@ function reclaimStop(
   from: ReclaimedFrom,
   logDir: string,
 ): string {
-  const holder = describePreviousHolder(deps, from.owner_session_id);
+  // Release before the agents lookup: the lookup may take up to a minute, and
+  // an ownerless in_progress task can be claimed by anyone meanwhile.
   releaseTask(db, { task_id: taskId, session_id: RUNNER_SESSION });
+  const holder = describePreviousHolder(deps, from.owner_session_id);
   const detail =
     `${code} was handed out again after a lapsed lease (previous owner ${from.owner_session_id ?? "none"}, ` +
     `lease until ${from.lock_expires_at}, last activity ${from.last_activity_at}). ${holder.line}. ` +

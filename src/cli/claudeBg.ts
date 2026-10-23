@@ -66,7 +66,7 @@ export function parseBgId(output: string): string | null {
 }
 
 // eslint-disable-next-line no-control-regex
-const ANSI = /\u001b\[[0-9;]*[A-Za-z]/g;
+const ANSI = /\u001b\[[0-9;?]*[A-Za-z]/g;
 
 function plainText(value: unknown): string {
   if (value === undefined || value === null) return "";
