@@ -17,6 +17,15 @@ import { writeLegacyV1Db } from "./fixtures/legacyV1Db.js";
  * tests/fixtures/backup/schema-v<old>.json (an export made before the bump)
  * and a test that imports it, so the subset rule's promise that older files
  * still import is checked rather than assumed.
+ *
+ * Bump procedure, step by step:
+ *   1. Before changing the schema, export a DB that exercises every table
+ *      (`task-tracker-export --all`) to tests/fixtures/backup/schema-v<old>.json.
+ *   2. Change the schema, bump SCHEMA_VERSION, update EXPECTED below.
+ *   3. Add a test that imports the fixture with importFromFile/importProjects
+ *      (it now takes the `subset` column check of D2) and asserts it succeeds;
+ *      if it is refused, the change was not additive (rename, drop, or a new
+ *      NOT NULL column without DEFAULT) and old backups no longer restore.
  */
 const EXPECTED = {
   SCHEMA_VERSION: 1,
