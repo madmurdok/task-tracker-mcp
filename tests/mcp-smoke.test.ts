@@ -50,7 +50,7 @@ describe("MCP server smoke test", () => {
     expect(row).toMatchObject({ name: "Demo", root_path: "/tmp/demo" });
   });
 
-  it("exercises all 38 registered tools over the same transport", async () => {
+  it("exercises all 40 registered tools over the same transport", async () => {
     const client = await connectedClient(db);
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
@@ -100,6 +100,8 @@ describe("MCP server smoke test", () => {
         "revise_task_slices",
         "start_slice",
         "complete_slice",
+        "export_projects",
+        "import_projects",
       ].sort(),
     );
 
