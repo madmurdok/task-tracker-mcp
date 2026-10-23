@@ -141,8 +141,10 @@ export function releaseTask(db: DatabaseInstance, input: ReleaseTaskInput): void
     if (!task) {
       throw new Error(`Unknown task_id: ${taskId}`);
     }
-    if (task.status === "done") {
-      throw new Error(`Task ${taskId} is already done, nothing to release`);
+    // A cancelled task is as finished as a done one: moving it back to pending
+    // would silently undo the cancellation and orphan its cancellation_reason.
+    if (task.status === "done" || task.status === "cancelled") {
+      throw new Error(`Task ${taskId} is already ${task.status}, nothing to release`);
     }
 
     if (

@@ -1093,6 +1093,73 @@ describe("board.js Blocked by chips (TTM-97, client-side, via DOM shim)", () => 
   });
 });
 
+describe("board.js slice progress (TTM-102, via DOM shim)", () => {
+  const sl = (status: string, i = 0) => ({ id: `s-${status}-${i}`, label: `S${i}`, title: "x", status });
+  const many = (status: string, n: number) => Array.from({ length: n }, (_, i) => sl(status, i));
+  function sliced(slices: any[]): any {
+    return {
+      id: "t-sliced",
+      title: "Sliced one",
+      description: "",
+      status: "in_progress",
+      priority: 0,
+      epic_id: null,
+      epic_name: null,
+      owner_session_id: null,
+      is_stale: false,
+      stale_since: null,
+      task_number: 7,
+      slices,
+      blocked_by: [],
+    };
+  }
+  function slicesButton(card: any): any {
+    return card.children.find((c: any) => c.className === "card-slices-button");
+  }
+  const gm352 = (last: string) => [...many("done", 17), ...many("failed", 3), sl(last, 99)];
+
+  // Control (C1/C2): denominator back to slices.length, or drop the failed suffix.
+  it("GM-352 shape through createCard: failed slices leave the denominator and show as a suffix", () => {
+    const { createCard } = loadBoardScript();
+    expect(slicesButton(createCard(sliced(gm352("in_progress")), "In progress", "DEM")).textContent).toBe(
+      "Slices 17/18 \u00b7 3 failed",
+    );
+  });
+
+  it("GM-352 shape with the last slice done reads 18/18 and keeps the failed suffix", () => {
+    const { sliceProgressLabel } = loadBoardScript();
+    expect(sliceProgressLabel(gm352("done"))).toBe("Slices 18/18 \u00b7 3 failed");
+  });
+
+  // Control (C3/C4): merge skipped into failed, or keep skipped in M.
+  it("skipped slices leave the denominator and get their own suffix after failed", () => {
+    const { sliceProgressLabel } = loadBoardScript();
+    expect(sliceProgressLabel([...many("done", 2), ...many("pending", 1), ...many("skipped", 2)])).toBe(
+      "Slices 2/3 \u00b7 2 skipped",
+    );
+    expect(sliceProgressLabel([...many("done", 2), sl("pending", 5), sl("failed", 6), ...many("skipped", 2)])).toBe(
+      "Slices 2/3 \u00b7 1 failed \u00b7 2 skipped",
+    );
+  });
+
+  it("has no suffix when nothing failed or was skipped", () => {
+    const { sliceProgressLabel } = loadBoardScript();
+    expect(sliceProgressLabel([...many("done", 3), sl("in_progress", 8), sl("pending", 9)])).toBe("Slices 3/5");
+  });
+
+  it("all-failed task reads 0/0 with the failed suffix and still renders the button", () => {
+    const { createCard } = loadBoardScript();
+    const button = slicesButton(createCard(sliced(many("failed", 2)), "In progress", "DEM"));
+    expect(button).toBeDefined();
+    expect(button.textContent).toBe("Slices 0/0 \u00b7 2 failed");
+  });
+
+  it("renders no slices button for an unsliced task (TTM-84)", () => {
+    const { createCard } = loadBoardScript();
+    expect(slicesButton(createCard(sliced([]), "In progress", "DEM"))).toBeUndefined();
+  });
+});
+
 describe("getBoardData stale_since (TTM-78)", () => {
   const T0 = Date.parse("2026-10-04T09:00:00.000Z");
   const MINUTE = 60 * 1000;
