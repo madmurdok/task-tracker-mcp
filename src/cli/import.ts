@@ -16,6 +16,7 @@ const USAGE = `Usage: task-tracker-import <file> [--root-path-map <old>=<new>]..
 Restores the projects of a task-tracker-export file into the database. A
 project whose id, name or code_prefix already exists refuses the whole import;
 nothing is written on any refusal. --root-path-map (repeatable, absolute paths)
+splits each entry at the '=' before the absolute new path; it
 rewrites root_path, design_doc_path, task file paths and slice artifacts.
 Exit codes: 0 ok, 1 refusal or error, 2 usage.`;
 

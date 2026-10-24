@@ -193,6 +193,33 @@ describe("import_projects", () => {
     expect(count(target, "projects")).toBe(0);
   });
 
+  it("names the root_path_map argument, not the CLI flag, for a bad map", async () => {
+    const out = await exportAll();
+    const r = await call(await clientFor(target), "import_projects", { path: out, root_path_map: { relative: "/new/root" } });
+
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("root_path_map");
+    expect(r.text).not.toContain("--root-path-map");
+  });
+
+  it("refuses a bad root_path_map before the file is read", async () => {
+    const missing = path.join(dir, "does-not-exist.json");
+    const r = await call(await clientFor(target), "import_projects", { path: missing, root_path_map: { relative: "/new/root" } });
+
+    expect(r.isError).toBe(true);
+    expect(r.text).toContain("root_path_map");
+    expect(r.text).not.toMatch(/not.found|ENOENT|no such file/i);
+  });
+
+  it("maps a root whose old and new prefixes contain '=' (key/value, no splitting)", async () => {
+    source.prepare("UPDATE projects SET root_path = '/old=dir/alpha' WHERE id = 'alpha'").run();
+    const out = await exportAll();
+    const r = await call(await clientFor(target), "import_projects", { path: out, root_path_map: { "/old=dir": "/new=/x" } });
+
+    expect(r.isError).toBe(false);
+    expect(target.prepare("SELECT root_path FROM projects WHERE id = 'alpha'").get()).toEqual({ root_path: "/new=/x/alpha" });
+  });
+
   it("applies root_path_map to project root paths", async () => {
     const out = await exportAll();
     const r = await call(await clientFor(target), "import_projects", {
