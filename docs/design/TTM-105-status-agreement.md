@@ -1,7 +1,7 @@
 # TTM-105: one status per task, and dependency links in get_task
 
-Status: draft for owner review, 2026-10-24.
-Branch `fix/TTM-105-status-agreement`, off `main` at 7c85f52 (0.17.0).
+Status: approved by the owner 2026-10-24 ("Утверждаю как есть (Recommended)").
+Branch `fix/TTM-105-status-agreement`, off `release-0.17.0` at 7c85f52.
 
 ## Diagnosis
 
