@@ -17,6 +17,7 @@ import {
   importProjects,
   parseExport,
   parseRootPathMap,
+  rootPathMapFromRecord,
   rewritePath,
   serializeExport,
   type ExportDocument,
@@ -528,6 +529,54 @@ describe("--root-path-map (D8, behaviours 15-19)", () => {
     expect(parseRootPathMap(["/a=/b=c"])).toEqual([{ old: "/a", new: "/b=c" }]);
     for (const bad of ["rel=/x", "/x=rel", "/x", "=/x", "/x="]) {
       expect(() => parseRootPathMap([bad]), bad).toThrow(RootPathMapError);
+    }
+  });
+
+  it("parseRootPathMap: an old prefix containing '=' splits at the '=' before the absolute new path", () => {
+    expect(parseRootPathMap(["/a=b=/c"])).toEqual([{ old: "/a=b", new: "/c" }]);
+  });
+
+  it("parseRootPathMap: more than one '=/' is refused as ambiguous, naming the entry", () => {
+    let error: unknown;
+    try {
+      parseRootPathMap(["/a=/b=/c"]);
+    } catch (e) {
+      error = e;
+    }
+    expect(error).toBeInstanceOf(RootPathMapError);
+    expect((error as Error).message).toContain("/a=/b=/c");
+    expect((error as Error).message).toContain("ambiguous");
+  });
+
+  it("parseRootPathMap: error messages keep the --root-path-map prefix and say what is wrong", () => {
+    const message = (entry: string) => {
+      try {
+        parseRootPathMap([entry]);
+      } catch (e) {
+        return (e as Error).message;
+      }
+      return "";
+    };
+    expect(message("/x")).toBe("--root-path-map /x: expected old=new");
+    expect(message("rel=/x")).toBe("--root-path-map rel=/x: both sides must be absolute paths");
+  });
+
+  it("rootPathMapFromRecord: keys and values are kept whole, '=' included", () => {
+    expect(rootPathMapFromRecord({ "/a=b": "/c" })).toEqual([{ old: "/a=b", new: "/c" }]);
+    expect(rootPathMapFromRecord({ "/a": "/b=/c" })).toEqual([{ old: "/a", new: "/b=/c" }]);
+  });
+
+  it("rootPathMapFromRecord: a relative key or value names root_path_map, not the CLI flag", () => {
+    for (const record of [{ rel: "/x" }, { "/x": "rel" }] as Record<string, string>[]) {
+      let error: unknown;
+      try {
+        rootPathMapFromRecord(record);
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBeInstanceOf(RootPathMapError);
+      expect((error as Error).message.startsWith("root_path_map")).toBe(true);
+      expect((error as Error).message).not.toContain("--root-path-map");
     }
   });
 
