@@ -211,13 +211,13 @@ describe("import_projects", () => {
     expect(r.text).not.toMatch(/not.found|ENOENT|no such file/i);
   });
 
-  it("maps a root whose old prefix contains '=' (key/value, no splitting)", async () => {
+  it("maps a root whose old and new prefixes contain '=' (key/value, no splitting)", async () => {
     source.prepare("UPDATE projects SET root_path = '/old=dir/alpha' WHERE id = 'alpha'").run();
     const out = await exportAll();
-    const r = await call(await clientFor(target), "import_projects", { path: out, root_path_map: { "/old=dir": "/new" } });
+    const r = await call(await clientFor(target), "import_projects", { path: out, root_path_map: { "/old=dir": "/new=/x" } });
 
     expect(r.isError).toBe(false);
-    expect(target.prepare("SELECT root_path FROM projects WHERE id = 'alpha'").get()).toEqual({ root_path: "/new/alpha" });
+    expect(target.prepare("SELECT root_path FROM projects WHERE id = 'alpha'").get()).toEqual({ root_path: "/new=/x/alpha" });
   });
 
   it("applies root_path_map to project root paths", async () => {
