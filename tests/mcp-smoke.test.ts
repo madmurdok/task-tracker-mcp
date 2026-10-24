@@ -156,6 +156,17 @@ describe("MCP server smoke test", () => {
     const listed = await call("list_tasks", { project_id });
     expect(listed.tasks).toHaveLength(3); // prereq + 2 subtasks (original was replaced)
 
+    // TTM-105: get_task reports the same derived status as list_tasks, and
+    // carries the subtask's inherited dependency link on the unfinished prereq.
+    const listedPart1 = listed.tasks.find((t: { id: string }) => t.id === new_task_ids[0]);
+    const listedPrereq = listed.tasks.find((t: { id: string }) => t.id === prereqId);
+    expect(listedPart1.status).toBe("blocked");
+    expect(prioritized.status).toBe(listedPart1.status);
+    expect(prioritized.depends_on).toEqual([
+      { code: listedPrereq.code, title: listedPrereq.title, status: "pending", met: false },
+    ]);
+    expect(prioritized.dependents).toEqual([]);
+
     const listedByEpic = await call("list_tasks", { project_id, epic_id });
     expect(listedByEpic.tasks).toHaveLength(3); // all of them stayed under the epic
 

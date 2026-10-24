@@ -823,6 +823,168 @@ describe("getTaskDetail", () => {
     const db = openDatabase(":memory:");
     expect(() => getTaskDetail(db, "missing")).toThrow(/Unknown task_id: missing/);
   });
+
+  describe("status agreement with listTasks (TTM-105)", () => {
+    const listedStatus = (db: DatabaseInstance, projectId: string, taskId: string) =>
+      listTasks(db, projectId).find((s) => s.id === taskId)?.status;
+
+    it("reports blocked for a pending task with an unmet dependency, then pending once it is done", () => {
+      const { db, project, makeTask } = setup();
+      const a = makeTask("A");
+      const b = makeTask("B");
+      addDependency(db, b.id, a.id);
+
+      expect(storedTask(db, b.id).status).toBe("pending");
+      expect(getTaskDetail(db, b.id).status).toBe("blocked");
+      expect(listedStatus(db, project.id, b.id)).toBe("blocked");
+
+      markStatus(db, a.id, "done");
+      expect(getTaskDetail(db, b.id).status).toBe("pending");
+      expect(listedStatus(db, project.id, b.id)).toBe("pending");
+    });
+
+    it("reports pending in both once the dependency is cancelled", () => {
+      const { db, project, makeTask } = setup();
+      const a = makeTask("A");
+      const b = makeTask("B");
+      addDependency(db, b.id, a.id);
+
+      markStatus(db, a.id, "cancelled");
+      expect(getTaskDetail(db, b.id).status).toBe("pending");
+      expect(listedStatus(db, project.id, b.id)).toBe("pending");
+    });
+
+    it("keeps an in_progress task with an unmet dependency in_progress", () => {
+      const { db, project, makeTask } = setup();
+      const a = makeTask("A");
+      const b = makeTask("B");
+      addDependency(db, b.id, a.id);
+      markStatus(db, b.id, "in_progress");
+
+      expect(getTaskDetail(db, b.id).status).toBe("in_progress");
+      expect(listedStatus(db, project.id, b.id)).toBe("in_progress");
+    });
+
+    it("agrees with listTasks for every task of a mixed fixture", () => {
+      const { db, project, makeTask } = setup();
+      const root = makeTask("Root (pending)");
+      const blocked = makeTask("Blocked");
+      const working = makeTask("In progress with unmet dep");
+      const done = makeTask("Done");
+      const cancelled = makeTask("Cancelled");
+      addDependency(db, blocked.id, root.id);
+      addDependency(db, working.id, root.id);
+      markStatus(db, working.id, "in_progress");
+      markStatus(db, done.id, "done");
+      markStatus(db, cancelled.id, "cancelled");
+
+      const listed = listTasks(db, project.id);
+      expect(listed.map((s) => s.status).sort()).toEqual(
+        ["blocked", "cancelled", "done", "in_progress", "pending"],
+      );
+      for (const summary of listed) {
+        expect(getTaskDetail(db, summary.id).status, summary.title).toBe(summary.status);
+      }
+    });
+  });
+
+  describe("dependency links (TTM-105)", () => {
+    it("lists met and unmet dependencies, a blocked dependency showing blocked", () => {
+      const { db, project, makeTask } = setup();
+      const root = makeTask("Root");
+      const mid = makeTask("Mid");
+      const finished = makeTask("Finished");
+      const top = makeTask("Top");
+      addDependency(db, mid.id, root.id);
+      addDependency(db, top.id, mid.id);
+      addDependency(db, top.id, finished.id);
+      markStatus(db, finished.id, "done");
+
+      const code = (t: Task) => taskCode(project.code_prefix, t.task_number);
+      expect(getTaskDetail(db, top.id).depends_on).toEqual([
+        { code: code(mid), title: "Mid", status: "blocked", met: false },
+        { code: code(finished), title: "Finished", status: "done", met: true },
+      ]);
+    });
+
+    it("counts a cancelled dependency as met", () => {
+      const { db, project, makeTask } = setup();
+      const a = makeTask("A");
+      const b = makeTask("B");
+      addDependency(db, b.id, a.id);
+      markStatus(db, a.id, "cancelled");
+
+      expect(getTaskDetail(db, b.id).depends_on).toEqual([
+        { code: taskCode(project.code_prefix, a.task_number), title: "A", status: "cancelled", met: true },
+      ]);
+    });
+
+    it("orders links by prefix, then by number numerically, across projects", () => {
+      const { db, project, makeTask } = setup();
+      const other = createProject(db, { name: "Alpha", root_path: "/tmp/alpha" });
+      // The fixture relies on these prefixes sorting Alpha's first, and on
+      // textual order of the codes disagreeing with numeric order.
+      expect(other.code_prefix < project.code_prefix).toBe(true);
+      const tasks = Array.from({ length: 10 }, (_, i) => makeTask(`T${i + 1}`));
+      const second = tasks[1];
+      const tenth = tasks[9];
+      expect([second.task_number, tenth.task_number]).toEqual([2, 10]);
+      const foreign = createTask(db, noopEstimator, {
+        project_id: other.id,
+        title: "Foreign",
+        complexity_hint: "normal",
+      }).task;
+      const hub = tasks[0];
+
+      // Inserted in the reverse of the expected order.
+      addDependency(db, hub.id, tenth.id);
+      addDependency(db, hub.id, second.id);
+      addDependency(db, hub.id, foreign.id);
+      addDependency(db, tenth.id, foreign.id);
+      addDependency(db, second.id, foreign.id);
+
+      const expected = [
+        taskCode(other.code_prefix, foreign.task_number),
+        taskCode(project.code_prefix, 2),
+        taskCode(project.code_prefix, 10),
+      ];
+      expect(getTaskDetail(db, hub.id).depends_on.map((l) => l.code)).toEqual(expected);
+
+      // Foreign's dependents, same ordering rule, from the other side of the
+      // project boundary.
+      expect(getTaskDetail(db, foreign.id).dependents.map((l) => l.code)).toEqual([
+        taskCode(project.code_prefix, 1),
+        taskCode(project.code_prefix, 2),
+        taskCode(project.code_prefix, 10),
+      ]);
+    });
+
+    it("lists dependents with their derived status", () => {
+      const { db, project, makeTask } = setup();
+      const a = makeTask("A");
+      const waiting = makeTask("Waiting");
+      const working = makeTask("Working");
+      addDependency(db, waiting.id, a.id);
+      addDependency(db, working.id, a.id);
+      markStatus(db, working.id, "in_progress");
+
+      const code = (t: Task) => taskCode(project.code_prefix, t.task_number);
+      expect(getTaskDetail(db, a.id).dependents).toEqual([
+        { code: code(waiting), title: "Waiting", status: "blocked" },
+        { code: code(working), title: "Working", status: "in_progress" },
+      ]);
+      expect(getTaskDetail(db, a.id).depends_on).toEqual([]);
+    });
+
+    it("returns [] for both directions when a task has no links", () => {
+      const { db, makeTask } = setup();
+      const solo = makeTask("Solo");
+
+      const detail = getTaskDetail(db, solo.id);
+      expect(detail.depends_on).toEqual([]);
+      expect(detail.dependents).toEqual([]);
+    });
+  });
 });
 
 /**
