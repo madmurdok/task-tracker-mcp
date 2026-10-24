@@ -13,7 +13,15 @@ import {
 import { isDocDrifted, requireProject } from "./projects.js";
 import { listReleases, requireRelease, type Release } from "./releases.js";
 import { listSliceRevisions, listTaskSlices, type TaskSlice, type TaskSliceRevision } from "./slices.js";
-import { displayStatus, hasUnmetDependencies, LOCK_LEASE_MS, type DisplayStatus } from "./taskStatus.js";
+import {
+  displayStatus,
+  hasUnmetDependencies,
+  listDependencyLinks,
+  LOCK_LEASE_MS,
+  type DependencyLink,
+  type DependentLink,
+  type DisplayStatus,
+} from "./taskStatus.js";
 import { listTaskFilePaths, requireTask, type Task, withCode, taskCode} from "./tasks.js";
 
 // Re-exported, not redefined: `DisplayStatus` moved to the taskStatus.ts leaf
@@ -139,7 +147,13 @@ export type GetNextTaskResult = NextTaskOutcome & {
   plan_status?: ReportedPlanStatus;
 };
 
-export interface TaskDetail extends Task {
+export type TaskDetail = Omit<Task, "status"> & {
+  /**
+   * The derived status (TTM-105): `blocked` for a stored-pending task with an
+   * unmet dependency, as list_tasks and every aggregate report it - never the
+   * raw stored value, so get_task cannot disagree with them.
+   */
+  status: DisplayStatus;
   /** How a person refers to this task: `TTM-63`. See tasks.ts's `withCodes`. */
   code: string;
   file_paths: string[];
@@ -161,7 +175,14 @@ export interface TaskDetail extends Task {
    * and the pending slices it replaced. Empty for a task never revised.
    */
   slice_revisions: TaskSliceRevision[];
-}
+  /**
+   * Every task this one depends on (TTM-105), met or not, code-ordered. The
+   * task is `blocked` iff it is stored pending and some entry has `met: false`.
+   */
+  depends_on: DependencyLink[];
+  /** Every task that depends on this one (TTM-105), code-ordered. */
+  dependents: DependentLink[];
+};
 
 /**
  * The "compact task packet" the architecture doc's data flow promises from
@@ -176,11 +197,13 @@ export function getTaskDetail(db: DatabaseInstance, taskId: string): TaskDetail 
   // by its code, and everything below addresses rows by uuid.
   return {
     ...withCode(db, task),
+    status: displayStatus(db, task),
     file_paths: listTaskFilePaths(db, task.id),
     handoff_notes: listHandoffNotes(db, task.id),
     amendments: listTaskAmendments(db, task.id),
     slices: listTaskSlices(db, task.id),
     slice_revisions: listSliceRevisions(db, task.id),
+    ...listDependencyLinks(db, task.id),
   };
 }
 

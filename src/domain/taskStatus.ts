@@ -116,3 +116,67 @@ export function displayStatus(db: DatabaseInstance, task: Pick<Task, "id" | "sta
   if (task.status !== "pending") return task.status;
   return hasUnmetDependencies(db, task.id) ? "blocked" : "pending";
 }
+
+/** One of the tasks this task depends on, as get_task reports it (TTM-105). */
+export type DependencyLink = {
+  code: string;
+  title: string;
+  status: DisplayStatus;
+  /** The dependency is done or cancelled - the negation of UNMET_DEPENDENCY_SQL. */
+  met: boolean;
+};
+
+/** One of the tasks that depend on this task, as get_task reports it (TTM-105). */
+export type DependentLink = { code: string; title: string; status: DisplayStatus };
+
+/**
+ * Both directions of a task's dependency edges, each ordered by code (prefix,
+ * then number). Each linked task's `status` is its displayStatus, so a link
+ * never contradicts list_tasks; `code` carries the linked task's own project
+ * prefix (dependencies may cross projects).
+ *
+ * The code is spelled in SQL (`prefix || '-' || number`, the same form as
+ * tasks.ts's `taskCode`) rather than by importing `taskCode`: this module is a
+ * leaf that imports nothing but types (see the header above `DisplayStatus`).
+ */
+export function listDependencyLinks(
+  db: DatabaseInstance,
+  taskId: string,
+): { depends_on: DependencyLink[]; dependents: DependentLink[] } {
+  const dependsOn = db
+    .prepare(
+      `SELECT t.id, t.status, t.title, p.code_prefix || '-' || t.task_number AS code,
+              NOT (${UNMET_DEPENDENCY_SQL}) AS met
+       FROM task_dependencies td
+       JOIN tasks t ON t.id = td.depends_on_task_id
+       JOIN projects p ON p.id = t.project_id
+       WHERE td.task_id = ?
+       ORDER BY p.code_prefix ASC, t.task_number ASC`,
+    )
+    .all(taskId) as Array<{ id: string; status: Task["status"]; title: string; code: string; met: number }>;
+
+  const dependents = db
+    .prepare(
+      `SELECT t.id, t.status, t.title, p.code_prefix || '-' || t.task_number AS code
+       FROM task_dependencies td
+       JOIN tasks t ON t.id = td.task_id
+       JOIN projects p ON p.id = t.project_id
+       WHERE td.depends_on_task_id = ?
+       ORDER BY p.code_prefix ASC, t.task_number ASC`,
+    )
+    .all(taskId) as Array<{ id: string; status: Task["status"]; title: string; code: string }>;
+
+  return {
+    depends_on: dependsOn.map((row) => ({
+      code: row.code,
+      title: row.title,
+      status: displayStatus(db, row),
+      met: row.met === 1,
+    })),
+    dependents: dependents.map((row) => ({
+      code: row.code,
+      title: row.title,
+      status: displayStatus(db, row),
+    })),
+  };
+}
