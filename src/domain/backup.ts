@@ -499,23 +499,43 @@ export class RootPathMapError extends Error {
   }
 }
 
-function normalizeMapSide(side: string, entry: string): string {
+function normalizeMapSide(side: string, subject: string): string {
   if (!side || !path.isAbsolute(side)) {
-    throw new RootPathMapError(`--root-path-map ${entry}: both sides must be absolute paths`);
+    throw new RootPathMapError(`${subject}: both sides must be absolute paths`);
   }
   const resolved = path.resolve(side);
   return resolved.length > 1 ? resolved.replace(/\/+$/, "") : resolved;
 }
 
-/** Parses `old=new` entries (split on the first `=`; D8). */
+/**
+ * Parses CLI `old=new` entries (D8). `new` must be absolute, so the split is at
+ * the one `=` immediately followed by `/`; two or more such places are refused
+ * as ambiguous. With none, the first `=` splits (and the side checks refuse it).
+ */
 export function parseRootPathMap(entries: readonly string[]): RootPathMapEntry[] {
   return entries.map((entry) => {
-    const eq = entry.indexOf("=");
-    if (eq < 0) throw new RootPathMapError(`--root-path-map ${entry}: expected old=new`);
+    const subject = `--root-path-map ${entry}`;
+    const marks: number[] = [];
+    for (let i = entry.indexOf("=/"); i >= 0; i = entry.indexOf("=/", i + 1)) marks.push(i);
+    if (marks.length > 1) {
+      throw new RootPathMapError(
+        `${subject}: ambiguous, more than one '=/'; the split is at the '=' before the absolute new path`,
+      );
+    }
+    const eq = marks.length === 1 ? marks[0]! : entry.indexOf("=");
+    if (eq < 0) throw new RootPathMapError(`${subject}: expected old=new`);
     return {
-      old: normalizeMapSide(entry.slice(0, eq), entry),
-      new: normalizeMapSide(entry.slice(eq + 1), entry),
+      old: normalizeMapSide(entry.slice(0, eq), subject),
+      new: normalizeMapSide(entry.slice(eq + 1), subject),
     };
+  });
+}
+
+/** Builds entries from the MCP `root_path_map` object; keys and values are already separate, no `=` splitting. */
+export function rootPathMapFromRecord(record: Readonly<Record<string, string>>): RootPathMapEntry[] {
+  return Object.entries(record).map(([from, to]) => {
+    const subject = `root_path_map ${JSON.stringify({ [from]: to })}`;
+    return { old: normalizeMapSide(from, subject), new: normalizeMapSide(to, subject) };
   });
 }
 
@@ -838,8 +858,8 @@ export function importProjects(
 }
 
 export interface ImportFileOptions {
-  /** Raw `old=new` entries; a malformed one throws RootPathMapError before the file is read. */
-  rootPathMap?: readonly string[];
+  /** Already-parsed entries (parseRootPathMap / rootPathMapFromRecord), so a malformed map is refused before the file is read. */
+  rootPathMap?: readonly RootPathMapEntry[];
   currentSchemaVersion?: number;
 }
 
@@ -861,7 +881,6 @@ export function importFromFile(
   filePath: string,
   { rootPathMap = [], currentSchemaVersion = SCHEMA_VERSION }: ImportFileOptions = {},
 ): ImportResult & { path: string } {
-  const maps = parseRootPathMap(rootPathMap);
   const { path: target, doc } = readExportFile(filePath, currentSchemaVersion);
-  return { path: target, ...importProjects(db, doc, { rootPathMap: maps, currentSchemaVersion }) };
+  return { path: target, ...importProjects(db, doc, { rootPathMap, currentSchemaVersion }) };
 }

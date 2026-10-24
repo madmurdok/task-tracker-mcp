@@ -254,7 +254,9 @@ Order of operations - everything up to step 5 runs before any write:
 3. Shape: each project entry has `project` and `rows`; then the column check
    of D2, `exact` at equal version and `subset` at an older one
    (`schema_mismatch`, naming table and column).
-4. Root-path map (D8) applied in memory; malformed `old=new` -> usage error.
+4. Root-path map (D8) applied in memory; malformed or ambiguous `old=new`
+   -> usage error (CLI); a bad `root_path_map` object -> tool error naming
+   `root_path_map` (MCP).
 5. Clash: every file project's `id`, `name` and `code_prefix` checked against
    the target `projects` table, and against each other inside the file; any
    hit refuses the whole import naming each clash (`clash`, e.g.
@@ -293,9 +295,14 @@ guarantee nothing was written.
 
 ### D8. Root-path map scope
 
-`--root-path-map old=new` (repeatable; split on the first `=`; both sides
-must be absolute, are `path.resolve`d and have any trailing `/` stripped;
-otherwise a usage error). Owner, Resolved 4: absolute paths in task files and
+`--root-path-map old=new` (repeatable). `new` must be absolute, so the entry
+is split at the `=` immediately followed by `/` (`/a=b=/c` -> old `/a=b`, new
+`/c`); more than one `=/` is refused as ambiguous (usage error naming the
+entry); with no `=/` the first `=` splits and the side check refuses it. Both
+sides must be absolute, are `path.resolve`d and have any trailing `/`
+stripped; otherwise a usage error. The MCP `root_path_map` is a key/value
+object: no `=` splitting at all, and its errors name `root_path_map`, never
+`--root-path-map`. Owner, Resolved 4: absolute paths in task files and
 artifacts are rewritten too.
 
 Match rule, one function `rewritePath(p, maps)` used for every column:

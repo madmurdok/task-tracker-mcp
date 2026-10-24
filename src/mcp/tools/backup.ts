@@ -2,7 +2,7 @@ import path from "node:path";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { DatabaseInstance } from "../../db/connection.js";
-import { BackupRefusal, exportToFile, importFromFile, RootPathMapError } from "../../domain/backup.js";
+import { BackupRefusal, exportToFile, importFromFile, RootPathMapError, rootPathMapFromRecord } from "../../domain/backup.js";
 import { backupRefusalResult, errorResult, jsonResult } from "../toolResult.js";
 
 export function registerBackupTools(server: McpServer, db: DatabaseInstance): void {
@@ -46,8 +46,8 @@ export function registerBackupTools(server: McpServer, db: DatabaseInstance): vo
     },
     async ({ path: filePath, root_path_map }) => {
       if (!path.isAbsolute(filePath)) return errorResult(`path must be an absolute path: ${filePath}`);
-      const entries = Object.entries(root_path_map ?? {}).map(([from, to]) => `${from}=${to}`);
       try {
+        const entries = rootPathMapFromRecord(root_path_map ?? {});
         return jsonResult(importFromFile(db, filePath, { rootPathMap: entries }));
       } catch (error) {
         if (error instanceof BackupRefusal) {
