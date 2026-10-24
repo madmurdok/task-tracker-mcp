@@ -633,12 +633,12 @@ describe("--root-path-map (D8, behaviours 15-19)", () => {
 
   it("importFromFile: a malformed map is refused before the file is read; the result carries the resolved path", () => {
     const target = open("target.db");
-    expect(() => importFromFile(target, path.join(dir, "missing.json"), { rootPathMap: ["rel=/x"] })).toThrow(
+    expect(() => importFromFile(target, path.join(dir, "missing.json"), { rootPathMap: parseRootPathMap(["rel=/x"]) })).toThrow(
       RootPathMapError,
     );
     const file = path.join(dir, "p1.json");
     fs.writeFileSync(file, serializeExport(sourceExport("p1")));
-    const result = importFromFile(target, path.relative(process.cwd(), file), { rootPathMap: ["/repo/p1=/new"] });
+    const result = importFromFile(target, path.relative(process.cwd(), file), { rootPathMap: parseRootPathMap(["/repo/p1=/new"]) });
     expect(result.path).toBe(file);
     expect(result.root_path_rewrites["projects.root_path"]).toBe(1);
     target.close();
