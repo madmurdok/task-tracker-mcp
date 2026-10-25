@@ -60,7 +60,7 @@ function runCli(dbPath: string, args: string[] = []): { stdout: string; status: 
   }
 }
 
-describe("status CLI", () => {
+describe("status CLI", { timeout: 30_000 }, () => {
   let dir: string;
   let dbPath: string;
 

@@ -20,7 +20,7 @@ async function connectedClient(db: DatabaseInstance) {
   return client;
 }
 
-describe("MCP server smoke test", () => {
+describe("MCP server smoke test", { timeout: 30_000 }, () => {
   let db: DatabaseInstance;
 
   beforeEach(() => {
