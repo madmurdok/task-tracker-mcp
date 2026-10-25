@@ -25,5 +25,8 @@ export default defineConfig({
     // vitest ships, and their absence would only show up as something
     // stranger later.
     exclude: [...defaultExclude, "**/.claude/**"],
+    // A file of synchronous tests longer than 60 s fails the whole run on a
+    // vitest RPC timeout unless the worker yields between tests; see the file.
+    setupFiles: ["tests/setup/yield-event-loop.ts"],
   },
 });
